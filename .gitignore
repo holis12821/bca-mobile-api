@@ -1,0 +1,34 @@
+keys/
+.env
+.env.*
+!.env.example
+bin/
+tmp/
+coverage.out
+coverage.html
+*.pem
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output
+*.out
+
+# Dependency/cache
+vendor/
+
+# IDE
+
+.idea/
+
+.vscode/
+
+# macOS
+.DS_Store

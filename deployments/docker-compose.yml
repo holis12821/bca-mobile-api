@@ -1,0 +1,66 @@
+# deployments/docker-compose.yml — local development infra only.
+# The API itself runs on the host via `make dev` (air hot reload).
+#
+# Two Redis instances, not one with multiple DBs: Redis Cluster supports only
+# DB 0, and maxmemory-policy is instance-wide, so a single instance cannot hold
+# both never-evict sessions and LRU cache. Losing a cache key is fine; losing a
+# session is not.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bca-postgres
+    environment:
+      POSTGRES_DB: bcamobile
+      POSTGRES_USER: bcamobile
+      POSTGRES_PASSWORD: localdev_password_123
+      # Container clock in UTC; the application supplies WIB dates explicitly.
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bcamobile"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis-session:
+    image: redis:7-alpine
+    container_name: bca-redis-session
+    command: >
+      redis-server
+      --requirepass localdev_redis_123
+      --maxmemory-policy noeviction
+      --appendonly yes
+      --appendfsync everysec
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_session_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "localdev_redis_123", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis-cache:
+    image: redis:7-alpine
+    container_name: bca-redis-cache
+    command: >
+      redis-server
+      --requirepass localdev_redis_123
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "localdev_redis_123", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_session_data:
