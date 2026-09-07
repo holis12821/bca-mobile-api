@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/auth"
+	"github.com/holis12821/bca-mobile-api/internal/domain/transaction"
 	"github.com/holis12821/bca-mobile-api/internal/middleware"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/response"
@@ -18,10 +19,16 @@ import (
 
 type AuthHandler struct {
 	authService *auth.Service
+	txnService  *transaction.Service // for PIN verify → verification token issuance
 }
 
 func NewAuthHandler(authService *auth.Service) *AuthHandler {
 	return &AuthHandler{authService: authService}
+}
+
+// SetTransactionService sets the transaction service for PIN verify flow.
+func (h *AuthHandler) SetTransactionService(svc *transaction.Service) {
+	h.txnService = svc
 }
 
 // LoginPIN handles POST /v1/auth/login/pin
@@ -217,6 +224,65 @@ func (h *AuthHandler) RegisterBiometric(w http.ResponseWriter, r *http.Request) 
 	}
 
 	response.Success(w, r, http.StatusCreated, map[string]string{"message": "Biometrik berhasil didaftarkan."})
+}
+
+// PINVerify handles POST /v1/auth/pin/verify (requires auth middleware)
+// Verifies PIN and issues a purpose-bound verification token (TTL 120s, single-use).
+func (h *AuthHandler) PINVerify(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
+	if err != nil {
+		response.Err(w, r, apperr.TokenInvalid)
+		return
+	}
+	deviceID := middleware.DeviceIDFromCtx(r.Context())
+
+	var req transaction.PINVerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if req.PINEncrypted == "" || req.Purpose == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if !transaction.ValidPurposes[req.Purpose] {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	clientIP := extractIP(r)
+
+	// Verify PIN (shares lockout counter with login)
+	if err := h.authService.VerifyPIN(r.Context(), userID, deviceID, req.PINEncrypted, clientIP); err != nil {
+		appErr := apperr.From(err)
+		if appErr.Code == apperr.InternalError.Code {
+			slog.Error("pin verify failed",
+				"request_id", chimiddleware.GetReqID(r.Context()),
+				"error", err,
+			)
+		}
+		response.Err(w, r, appErr)
+		return
+	}
+
+	// Issue verification token
+	if h.txnService == nil {
+		slog.Error("transaction service not set on auth handler")
+		response.Err(w, r, apperr.InternalError)
+		return
+	}
+
+	resp, err := h.txnService.CreateVerificationToken(r.Context(), userID, req.Purpose)
+	if err != nil {
+		slog.Error("create verification token failed",
+			"request_id", chimiddleware.GetReqID(r.Context()),
+			"error", err,
+		)
+		response.Err(w, r, apperr.From(err))
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, resp)
 }
 
 func extractBearerToken(r *http.Request) string {

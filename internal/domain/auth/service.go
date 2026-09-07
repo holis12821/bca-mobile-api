@@ -360,6 +360,82 @@ func (s *Service) handleSuccessfulLogin(ctx context.Context, user *User, req Log
 	}, nil
 }
 
+// VerifyPIN verifies the user's PIN for pre-transaction confirmation.
+// Returns the user ID on success. Counts toward the lockout counter on failure.
+func (s *Service) VerifyPIN(ctx context.Context, userID uuid.UUID, deviceID, pinEncrypted, clientIP string) error {
+	// Rate limit PIN verify (shares counter with login)
+	if s.rateLimiter != nil {
+		result, err := s.rateLimiter.CheckPINVerify(ctx, userID.String())
+		if err != nil {
+			return apperr.InternalError
+		}
+		if result != nil && !result.Allowed {
+			return apperr.RateLimitExceeded
+		}
+	}
+
+	// Resolve user
+	user, err := s.users.FindByDeviceID(ctx, deviceID)
+	if err != nil {
+		return fmt.Errorf("find user: %w", err)
+	}
+	if user == nil || user.ID != userID {
+		s.dummyPINVerify(ctx)
+		return apperr.InvalidPIN
+	}
+
+	// Check lockout
+	lockStatus, err := s.lockout.IsLocked(ctx, user.ID.String())
+	if err != nil {
+		return fmt.Errorf("check lockout: %w", err)
+	}
+	if lockStatus.Locked {
+		return apperr.AccountLocked
+	}
+
+	// Decrypt + verify PIN
+	payload, err := s.pinKeys.DecryptPIN(pinEncrypted)
+	if err != nil {
+		return apperr.InvalidPIN
+	}
+
+	if err := crypto.ValidatePINTimestamp(payload, crypto.MaxPINTimestampSkew); err != nil {
+		return apperr.InvalidPIN
+	}
+
+	if s.nonceCheck != nil {
+		fresh, err := s.nonceCheck.CheckAndMark(payload.Nonce)
+		if err != nil {
+			return fmt.Errorf("nonce check: %w", err)
+		}
+		if !fresh {
+			return apperr.InvalidPIN
+		}
+	}
+
+	match, err := crypto.VerifyPassword(ctx, payload.PIN, user.PINHash)
+	if err != nil {
+		return fmt.Errorf("verify pin: %w", err)
+	}
+
+	if !match {
+		return s.handleFailedPIN(ctx, user, deviceID, clientIP)
+	}
+
+	// Audit
+	if s.audit != nil {
+		s.audit.Log(&AuditEntry{
+			UserID:       &userID,
+			Action:       "AUTH_PIN_VERIFIED",
+			ResourceType: "auth",
+			IPAddress:    clientIP,
+			Metadata:     map[string]any{"device_id": deviceID},
+		})
+	}
+
+	return nil
+}
+
 func hashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])

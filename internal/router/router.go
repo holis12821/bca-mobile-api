@@ -11,11 +11,13 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/config"
 	"github.com/holis12821/bca-mobile-api/internal/domain/account"
 	"github.com/holis12821/bca-mobile-api/internal/domain/auth"
+	"github.com/holis12821/bca-mobile-api/internal/domain/transaction"
 	"github.com/holis12821/bca-mobile-api/internal/handler"
 	"github.com/holis12821/bca-mobile-api/internal/middleware"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/response"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/idempotency"
 	"github.com/holis12821/bca-mobile-api/internal/repository/postgres"
 	redisrepo "github.com/holis12821/bca-mobile-api/internal/repository/redis"
 )
@@ -113,6 +115,42 @@ func New(deps Deps) http.Handler {
 
 	accountH := handler.NewAccountHandler(accountService)
 
+	// Transaction dependencies
+	mutationRepo := postgres.NewMutationRepo(deps.DB)
+	transactionRepo := postgres.NewTransactionRepo(deps.DB)
+	inquiryRepo := postgres.NewInquiryRepo(deps.DB)
+	vtokenRepo := postgres.NewVerificationTokenRepo(deps.DB)
+	favoriteRepo := postgres.NewFavoriteTransferRepo(deps.DB)
+
+	inquiryCache := redisrepo.NewInquiryCache(deps.RedisSession)
+	vtokenCache := redisrepo.NewVerificationTokenCache(deps.RedisSession)
+	recentCache := redisrepo.NewRecentTransferCache(deps.RedisCache)
+	txnCacheInvalidator := redisrepo.NewTransactionCacheInvalidator(deps.RedisCache)
+	transferExecutor := postgres.NewTransferExecutor(deps.DB)
+	idemStore := idempotency.NewStore(deps.RedisSession)
+
+	txnService := transaction.NewService(transaction.ServiceConfig{
+		Mutations:        mutationRepo,
+		Transactions:     transactionRepo,
+		Inquiries:        inquiryRepo,
+		VTokens:          vtokenRepo,
+		Favorites:        favoriteRepo,
+		Accounts:         accountRepo,
+		Executor:         transferExecutor,
+		InquiryCache:     inquiryCache,
+		VTokenCache:      vtokenCache,
+		RecentCache:      recentCache,
+		CacheInvalidator: txnCacheInvalidator,
+		IdemStore:        idemStore,
+		Versions:         versionCounter,
+	})
+
+	// Wire PIN verify → verification token issuance
+	authH.SetTransactionService(txnService)
+
+	txnH := handler.NewTransactionHandler(txnService)
+	transferH := handler.NewTransferHandler(txnService)
+
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/health", healthH.Health)
 		r.Get("/health/live", healthH.Liveness)
@@ -131,6 +169,7 @@ func New(deps Deps) http.Handler {
 			// Auth
 			r.Post("/auth/logout", authH.Logout)
 			r.Post("/auth/biometric/register", authH.RegisterBiometric)
+			r.Post("/auth/pin/verify", authH.PINVerify)
 
 			// Account & Profile
 			r.Get("/account/profile", accountH.Profile)
@@ -142,6 +181,13 @@ func New(deps Deps) http.Handler {
 			r.Get("/notifications", accountH.ListNotifications)
 			r.Put("/notifications/{id}/read", accountH.MarkNotificationRead)
 			r.Put("/notifications/read-all", accountH.MarkAllNotificationsRead)
+
+			// Transactions
+			r.Get("/transactions/mutations", txnH.ListMutations)
+			r.Get("/transactions/history", txnH.ListHistory)
+			r.Get("/transfer/recent", txnH.ListRecentTransfers)
+			r.Post("/transfer/inquiry", transferH.Inquiry)
+			r.Post("/transfer/execute", transferH.Execute)
 		})
 	})
 
