@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
@@ -136,6 +137,29 @@ func (h *TransactionHandler) ListRecentTransfers(w http.ResponseWriter, r *http.
 	response.Success(w, r, http.StatusOK, map[string]any{
 		"recent_transfers": items,
 	})
+}
+
+// GetReceipt handles GET /v1/transactions/{transaction_id}/receipt
+func (h *TransactionHandler) GetReceipt(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
+	if err != nil {
+		response.Err(w, r, apperr.TokenInvalid)
+		return
+	}
+
+	txnID, err := uuid.Parse(chi.URLParam(r, "transaction_id"))
+	if err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	receipt, err := h.svc.GetReceipt(r.Context(), userID, txnID)
+	if err != nil {
+		h.handleError(w, r, err, "get receipt")
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, receipt)
 }
 
 func (h *TransactionHandler) handleError(w http.ResponseWriter, r *http.Request, err error, operation string) {

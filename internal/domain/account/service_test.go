@@ -50,6 +50,14 @@ func (r *mockProfileRepo) FindProfile(_ context.Context, userID uuid.UUID) (*acc
 	return p, nil
 }
 
+func (r *mockProfileRepo) UpdateEmail(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
+
+func (r *mockProfileRepo) UpdateSettings(_ context.Context, _ uuid.UUID, _ account.UpdateSettingsRequest) error {
+	return nil
+}
+
 type mockLimitRepo struct {
 	mu     sync.Mutex
 	limits map[uuid.UUID][]account.TransactionLimit

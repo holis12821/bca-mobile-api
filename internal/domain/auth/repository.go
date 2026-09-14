@@ -23,6 +23,12 @@ type UserRepository interface {
 
 	// SetLockedUntil sets the locked_until timestamp on the user row.
 	SetLockedUntil(ctx context.Context, userID uuid.UUID, lockedUntil *time.Time) error
+
+	// FindByID finds a user by their ID.
+	FindByID(ctx context.Context, userID uuid.UUID) (*User, error)
+
+	// UpdatePINHash updates the user's PIN hash.
+	UpdatePINHash(ctx context.Context, userID uuid.UUID, newHash string) error
 }
 
 // DeviceRepository defines data access for devices.

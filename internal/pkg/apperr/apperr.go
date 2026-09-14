@@ -57,6 +57,9 @@ var (
 	TransferLimitExceeded   = Error{http.StatusUnprocessableEntity, "TRANSFER_LIMIT_EXCEEDED", "Transaksi melebihi limit harian.", nil}
 	SelfTransfer            = Error{http.StatusUnprocessableEntity, "TRANSFER_SELF_TRANSFER", "Tidak dapat transfer ke rekening sendiri.", nil}
 	EWalletInsufficientBalance = Error{http.StatusUnprocessableEntity, "EWALLET_INSUFFICIENT_BALANCE", "Saldo tidak mencukupi untuk top-up.", nil}
+	QRISInvalidPayload         = Error{http.StatusBadRequest, "QRIS_INVALID_PAYLOAD", "Data QR code tidak valid.", nil}
+	QRISInsufficientBalance    = Error{http.StatusUnprocessableEntity, "QRIS_INSUFFICIENT_BALANCE", "Saldo tidak mencukupi untuk pembayaran QRIS.", nil}
+	QRISLimitExceeded          = Error{http.StatusUnprocessableEntity, "QRIS_LIMIT_EXCEEDED", "Pembayaran melebihi limit QRIS.", nil}
 )
 
 // --- 423 ---
@@ -74,7 +77,13 @@ var InternalError = Error{http.StatusInternalServerError, "INTERNAL_ERROR", "Ter
 // --- 503 ---
 
 var (
-	EWalletProviderDown = Error{http.StatusServiceUnavailable, "EWALLET_PROVIDER_DOWN", "Layanan provider sedang tidak tersedia.", nil}
+	EWalletProviderDown       = Error{http.StatusServiceUnavailable, "EWALLET_PROVIDER_DOWN", "Layanan provider sedang tidak tersedia.", nil}
+	RegistrationNotFound      = Error{http.StatusNotFound, "REGISTRATION_NOT_FOUND", "Pendaftaran tidak ditemukan.", nil}
+	RegistrationOTPInvalid    = Error{http.StatusUnprocessableEntity, "REGISTRATION_OTP_INVALID", "Kode OTP tidak valid.", nil}
+	RegistrationOTPExpired    = Error{http.StatusUnprocessableEntity, "REGISTRATION_OTP_EXPIRED", "Kode OTP sudah kedaluwarsa.", nil}
+	RegistrationTokenInvalid  = Error{http.StatusUnauthorized, "REGISTRATION_TOKEN_INVALID", "Token registrasi tidak valid.", nil}
+	RegistrationDuplicate     = Error{http.StatusConflict, "REGISTRATION_DUPLICATE", "NIK atau nomor telepon sudah terdaftar.", nil}
+	RegistrationInvalidDoc    = Error{http.StatusBadRequest, "REGISTRATION_INVALID_DOCUMENT", "Format dokumen tidak valid. Gunakan JPEG atau PNG.", nil}
 	MaintenanceMode     = Error{http.StatusServiceUnavailable, "MAINTENANCE_MODE", "Sistem sedang dalam pemeliharaan.", nil}
 )
 

@@ -285,6 +285,43 @@ func (h *AuthHandler) PINVerify(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, r, http.StatusOK, resp)
 }
 
+// ChangePIN handles POST /v1/auth/pin/change (requires auth middleware)
+func (h *AuthHandler) ChangePIN(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
+	if err != nil {
+		response.Err(w, r, apperr.TokenInvalid)
+		return
+	}
+
+	var req auth.ChangePINRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if req.OldPINEncrypted == "" || req.NewPINEncrypted == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	clientIP := extractIP(r)
+
+	if err := h.authService.ChangePIN(r.Context(), userID, req, clientIP); err != nil {
+		appErr := apperr.From(err)
+		if appErr.Code == apperr.InternalError.Code {
+			slog.Error("change pin failed",
+				"request_id", chimiddleware.GetReqID(r.Context()),
+				"error", err,
+			)
+		}
+		response.Err(w, r, appErr)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, map[string]string{
+		"message": "Kode akses berhasil diubah.",
+	})
+}
+
 func extractBearerToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	if len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {

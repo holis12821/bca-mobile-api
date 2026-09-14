@@ -227,6 +227,42 @@ func (rc *RecentTransferCacheImpl) SetRecent(ctx context.Context, userID uuid.UU
 	return rc.client.Set(ctx, key, data, transaction.RecentTransfersTTL).Err()
 }
 
+// ReceiptCacheImpl caches transaction receipts in Redis.
+// Key: cache:receipt:{txn_id}, TTL 24h. Receipts are immutable.
+type ReceiptCacheImpl struct {
+	client *goredis.Client
+}
+
+func NewReceiptCache(client *goredis.Client) *ReceiptCacheImpl {
+	return &ReceiptCacheImpl{client: client}
+}
+
+func (rc *ReceiptCacheImpl) GetReceipt(ctx context.Context, txnID string) (*transaction.ReceiptResponse, error) {
+	key := "cache:receipt:" + txnID
+	data, err := rc.client.Get(ctx, key).Bytes()
+	if err == goredis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var receipt transaction.ReceiptResponse
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		return nil, err
+	}
+	return &receipt, nil
+}
+
+func (rc *ReceiptCacheImpl) SetReceipt(ctx context.Context, txnID string, receipt *transaction.ReceiptResponse) error {
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	key := "cache:receipt:" + txnID
+	return rc.client.Set(ctx, key, data, transaction.ReceiptCacheTTL).Err()
+}
+
 // TransactionCacheInvalidator invalidates caches for ALL affected parties after a transaction.
 // Takes a list — internal transfers affect two different users.
 type TransactionCacheInvalidator struct {

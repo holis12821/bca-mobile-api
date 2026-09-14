@@ -2,6 +2,8 @@
 
 > Golang + PostgreSQL + Redis | Banking-Grade Security & Performance
 
+> **Status:** Dokumen ini sudah dikoreksi dan konsisten dengan SKILL.md §14. Lihat juga [06-LEDGER-AND-DEVICE-BINDING.md](./06-LEDGER-AND-DEVICE-BINDING.md) untuk detail migration 000009.
+
 ---
 
 ## Daftar Isi
@@ -122,10 +124,9 @@ Aplikasi perbankan memiliki tuntutan yang **berbeda** dari aplikasi biasa:
      └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
            │               │               │
            ▼               ▼               ▼
-     ┌─────────────────────────────────────────┐
-     │              Message Queue              │
-     │         (for async operations)          │
-     └─────────────────────────────────────────┘
+           │               │               │
+           │    (async via buffered channels,│
+           │     no external message queue)  │
            │               │               │
      ┌─────┴──────┐  ┌────┴───────┐  ┌───┴────────┐
      │ PostgreSQL │  │   Redis    │  │  External  │
@@ -143,15 +144,15 @@ Karena ini tahap awal, kita gunakan **modular monolith** — satu binary Go deng
 │                    BCA Mobile API                        │
 │                  (Single Go Binary)                      │
 │                                                          │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐ │
-│  │   Auth   │ │ Account  │ │ Transfer │ │  E-Wallet  │ │
-│  │  Domain  │ │  Domain  │ │  Domain  │ │   Domain   │ │
-│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └─────┬──────┘ │
-│       │            │            │              │         │
-│  ┌────┴────────────┴────────────┴──────────────┴──────┐ │
-│  │              Shared Infrastructure                  │ │
-│  │  (DB Pool, Redis Client, Logger, Middleware)        │ │
-│  └─────────────────────────────────────────────────────┘ │
+│  ┌────────┐ ┌────────┐ ┌──────────┐ ┌─────────┐ ┌──────┐ │
+│  │  Auth  │ │Account │ │ Transfer │ │ E-Wallet│ │ QRIS │ │
+│  │ Domain │ │ Domain │ │  Domain  │ │  Domain │ │Domain│ │
+│  └───┬────┘ └───┬────┘ └────┬─────┘ └────┬────┘ └──┬───┘ │
+│      │          │           │             │         │      │
+│  ┌───┴──────────┴───────────┴─────────────┴─────────┴───┐ │
+│  │              Shared Infrastructure                    │ │
+│  │  (DB Pool, Redis Client, Logger, Middleware)          │ │
+│  └──────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -173,7 +174,7 @@ bca-mobile-api/
 │   │   │   ├── entity.go           # User, Session, BiometricKey
 │   │   │   ├── repository.go       # Interface
 │   │   │   └── service.go          # Business logic
-│   │   ├── account/
+│   │   ├── account/                # includes notification entity/service
 │   │   │   ├── entity.go           # Account, Balance
 │   │   │   ├── repository.go
 │   │   │   └── service.go
@@ -185,7 +186,11 @@ bca-mobile-api/
 │   │   │   ├── entity.go           # EWalletProvider, TopUp
 │   │   │   ├── repository.go
 │   │   │   └── service.go
-│   │   └── notification/
+│   │   ├── qris/
+│   │   │   ├── entity.go
+│   │   │   ├── repository.go
+│   │   │   └── service.go
+│   │   └── registration/
 │   │       ├── entity.go
 │   │       ├── repository.go
 │   │       └── service.go
@@ -195,6 +200,7 @@ bca-mobile-api/
 │   │   ├── transaction_handler.go
 │   │   ├── ewallet_handler.go
 │   │   ├── notification_handler.go
+│   │   ├── qris_handler.go
 │   │   └── health_handler.go
 │   ├── middleware/
 │   │   ├── auth.go                 # JWT validation

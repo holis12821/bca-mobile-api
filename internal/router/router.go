@@ -11,6 +11,9 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/config"
 	"github.com/holis12821/bca-mobile-api/internal/domain/account"
 	"github.com/holis12821/bca-mobile-api/internal/domain/auth"
+	"github.com/holis12821/bca-mobile-api/internal/domain/ewallet"
+	"github.com/holis12821/bca-mobile-api/internal/domain/qris"
+	"github.com/holis12821/bca-mobile-api/internal/domain/registration"
 	"github.com/holis12821/bca-mobile-api/internal/domain/transaction"
 	"github.com/holis12821/bca-mobile-api/internal/handler"
 	"github.com/holis12821/bca-mobile-api/internal/middleware"
@@ -114,6 +117,7 @@ func New(deps Deps) http.Handler {
 	})
 
 	accountH := handler.NewAccountHandler(accountService)
+	notifH := handler.NewNotificationHandler(accountService)
 
 	// Transaction dependencies
 	mutationRepo := postgres.NewMutationRepo(deps.DB)
@@ -126,6 +130,7 @@ func New(deps Deps) http.Handler {
 	vtokenCache := redisrepo.NewVerificationTokenCache(deps.RedisSession)
 	recentCache := redisrepo.NewRecentTransferCache(deps.RedisCache)
 	txnCacheInvalidator := redisrepo.NewTransactionCacheInvalidator(deps.RedisCache)
+	receiptCache := redisrepo.NewReceiptCache(deps.RedisCache)
 	transferExecutor := postgres.NewTransferExecutor(deps.DB)
 	idemStore := idempotency.NewStore(deps.RedisSession)
 
@@ -140,6 +145,7 @@ func New(deps Deps) http.Handler {
 		InquiryCache:     inquiryCache,
 		VTokenCache:      vtokenCache,
 		RecentCache:      recentCache,
+		ReceiptCache:     receiptCache,
 		CacheInvalidator: txnCacheInvalidator,
 		IdemStore:        idemStore,
 		Versions:         versionCounter,
@@ -150,6 +156,59 @@ func New(deps Deps) http.Handler {
 
 	txnH := handler.NewTransactionHandler(txnService)
 	transferH := handler.NewTransferHandler(txnService)
+
+	// E-Wallet dependencies
+	ewalletProviderRepo := postgres.NewEWalletProviderRepo(deps.DB)
+	ewalletExecutor := postgres.NewEWalletExecutor(deps.DB)
+	ewalletProviderCache := redisrepo.NewEWalletProviderCache(deps.RedisCache)
+
+	ewalletService := ewallet.NewService(ewallet.ServiceConfig{
+		Providers:        ewalletProviderRepo,
+		ProviderStub:     ewallet.NewFakeProvider(),
+		Executor:         ewalletExecutor,
+		Accounts:         accountRepo,
+		InquiryCache:     inquiryCache,
+		VTokenCache:      vtokenCache,
+		ProviderCache:    ewalletProviderCache,
+		CacheInvalidator: txnCacheInvalidator,
+		IdemStore:        idemStore,
+		Versions:         versionCounter,
+	})
+
+	ewalletH := handler.NewEWalletHandler(ewalletService)
+
+	// QRIS dependencies
+	qrisExecutor := postgres.NewQRISExecutor(deps.DB)
+	qrisDecodeCache := redisrepo.NewQRISDecodeCache(deps.RedisSession)
+
+	qrisService := qris.NewService(qris.ServiceConfig{
+		Executor:         qrisExecutor,
+		Accounts:         accountRepo,
+		DecodeCache:      qrisDecodeCache,
+		VTokenCache:      vtokenCache,
+		CacheInvalidator: txnCacheInvalidator,
+		IdemStore:        idemStore,
+		Versions:         versionCounter,
+	})
+
+	qrisH := handler.NewQRISHandler(qrisService)
+
+	// Registration dependencies
+	regCache := redisrepo.NewRegistrationCache(deps.RedisSession)
+	regExecutor := postgres.NewRegistrationExecutor(deps.DB)
+
+	regService := registration.NewService(registration.ServiceConfig{
+		Cache:      regCache,
+		Executor:   regExecutor,
+		JWTManager: deps.JWTManager,
+		PINKeys:    deps.PINKeys,
+	})
+
+	uploadDir := "uploads"
+	if deps.Config != nil && deps.Config.UploadDir != "" {
+		uploadDir = deps.Config.UploadDir
+	}
+	regH := handler.NewRegistrationHandler(regService, deps.JWTManager, uploadDir)
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/health", healthH.Health)
@@ -162,12 +221,19 @@ func New(deps Deps) http.Handler {
 		r.Post("/auth/biometric/challenge", authH.BiometricChallenge)
 		r.Post("/auth/token/refresh", authH.RefreshToken)
 
+		// Registration (public endpoints)
+		r.Post("/registration/initiate", regH.Initiate)
+		r.Post("/registration/verify-otp", regH.VerifyOTP)
+		r.Post("/registration/upload-document", regH.UploadDocument)
+		r.Post("/registration/complete", regH.Complete)
+
 		// Protected endpoints (require valid access token)
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Auth(deps.JWTManager))
 
 			// Auth
 			r.Post("/auth/logout", authH.Logout)
+			r.Post("/auth/pin/change", authH.ChangePIN)
 			r.Post("/auth/biometric/register", authH.RegisterBiometric)
 			r.Post("/auth/pin/verify", authH.PINVerify)
 
@@ -177,17 +243,31 @@ func New(deps Deps) http.Handler {
 			r.Get("/account/dashboard", accountH.Dashboard)
 			r.Put("/account/transaction-limit", accountH.UpdateTransactionLimit)
 
+			// Account update endpoints
+			r.Put("/account/profile", accountH.UpdateProfile)
+			r.Put("/account/settings", accountH.UpdateSettings)
+
 			// Notifications
-			r.Get("/notifications", accountH.ListNotifications)
-			r.Put("/notifications/{id}/read", accountH.MarkNotificationRead)
-			r.Put("/notifications/read-all", accountH.MarkAllNotificationsRead)
+			r.Get("/notifications", notifH.ListNotifications)
+			r.Put("/notifications/{id}/read", notifH.MarkNotificationRead)
+			r.Put("/notifications/read-all", notifH.MarkAllNotificationsRead)
 
 			// Transactions
 			r.Get("/transactions/mutations", txnH.ListMutations)
 			r.Get("/transactions/history", txnH.ListHistory)
 			r.Get("/transfer/recent", txnH.ListRecentTransfers)
+			r.Get("/transactions/{transaction_id}/receipt", txnH.GetReceipt)
 			r.Post("/transfer/inquiry", transferH.Inquiry)
 			r.Post("/transfer/execute", transferH.Execute)
+
+			// E-Wallet
+			r.Get("/ewallet/providers", ewalletH.ListProviders)
+			r.Post("/ewallet/inquiry", ewalletH.Inquiry)
+			r.Post("/ewallet/topup", ewalletH.TopUp)
+
+			// QRIS
+			r.Post("/qris/decode", qrisH.Decode)
+			r.Post("/qris/pay", qrisH.Pay)
 		})
 	})
 

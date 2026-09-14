@@ -120,6 +120,44 @@ func (r *ProfileRepo) FindProfile(ctx context.Context, userID uuid.UUID) (*accou
 	return &profile, nil
 }
 
+// UpdateEmail updates the user's encrypted email.
+func (r *ProfileRepo) UpdateEmail(ctx context.Context, userID uuid.UUID, email string) error {
+	query := `
+		UPDATE users
+		SET email_encrypted = pgp_sym_encrypt($2, $3),
+		    updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := r.pool.Exec(ctx, query, userID, email, string(r.piiKey))
+	if err != nil {
+		return fmt.Errorf("update email: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
+// UpdateSettings updates the user's settings flags.
+func (r *ProfileRepo) UpdateSettings(ctx context.Context, userID uuid.UUID, req account.UpdateSettingsRequest) error {
+	query := `
+		UPDATE users
+		SET biometric_enabled = COALESCE($2, biometric_enabled),
+		    push_notification_enabled = COALESCE($3, push_notification_enabled),
+		    email_statement_enabled = COALESCE($4, email_statement_enabled),
+		    updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := r.pool.Exec(ctx, query, userID, req.BiometricEnabled, req.PushNotificationEnabled, req.EmailStatementEnabled)
+	if err != nil {
+		return fmt.Errorf("update settings: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
 // TransactionLimitRepo provides data access for transaction limits.
 type TransactionLimitRepo struct {
 	pool *pgxpool.Pool

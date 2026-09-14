@@ -32,7 +32,7 @@ Never ship a change that violates these. If a request conflicts with one, stop a
 ```
 cmd/server/main.go              wiring only, no logic
 internal/config/                env-based config (caarlos0/env)
-internal/domain/{auth,account,transaction,ewallet,notification}/
+internal/domain/{auth,account,transaction,ewallet,qris,registration}/
     entity.go       pure structs + enums, zero external deps
     repository.go   interfaces owned by the domain
     service.go      business logic
@@ -50,6 +50,8 @@ migrations/                     golang-migrate, NNNNNN_name.{up,down}.sql
 **Handlers contain no business logic.** A handler that computes a fee, checks a balance, or decides a limit is misplaced — move it to the service.
 
 **Notifications and QRIS get their own handlers** (`notification_handler.go`, `qris_handler.go`). *Spec note: `05-PROJECT-SETUP` router hangs them off `TransactionHandler` — that contradicts its own project structure. Use dedicated handlers.*
+
+*Implementation note: notification entity, repository, and service live inside the `account` domain (shared service). Only the HTTP handler is separate (`notification_handler.go`).*
 
 ---
 

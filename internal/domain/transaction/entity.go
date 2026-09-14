@@ -232,6 +232,27 @@ type TransferDestination struct {
 	Bank          string `json:"bank"`
 }
 
+// ReceiptResponse is the response for GET /transactions/{id}/receipt.
+type ReceiptResponse struct {
+	TransactionID   string `json:"transaction_id"`
+	Type            string `json:"type"`
+	Status          string `json:"status"`
+	Date            string `json:"date"`
+	Time            string `json:"time"`
+	ReferenceNumber string `json:"reference_number"`
+	SourceAccount   string `json:"source_account,omitempty"`
+	SourceName      string `json:"source_name,omitempty"`
+	DestinationAccount string `json:"destination_account,omitempty"`
+	DestinationName    string `json:"destination_name,omitempty"`
+	DestinationBank    string `json:"destination_bank,omitempty"`
+	ProviderName    string `json:"provider_name,omitempty"`
+	Amount          string `json:"amount"`
+	AdminFee        string `json:"admin_fee"`
+	Total           string `json:"total"`
+	Currency        string `json:"currency"`
+	Notes           string `json:"notes,omitempty"`
+}
+
 // Valid transfer types.
 var ValidTransferTypes = map[string]bool{
 	"INTERNAL":        true,

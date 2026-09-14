@@ -436,6 +436,75 @@ func (s *Service) VerifyPIN(ctx context.Context, userID uuid.UUID, deviceID, pin
 	return nil
 }
 
+// ChangePIN verifies the old PIN and sets a new one.
+func (s *Service) ChangePIN(ctx context.Context, userID uuid.UUID, req ChangePINRequest, clientIP string) error {
+	user, err := s.users.FindByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("find user: %w", err)
+	}
+	if user == nil {
+		return apperr.NotFound
+	}
+
+	// Decrypt old PIN
+	oldPayload, err := s.pinKeys.DecryptPIN(req.OldPINEncrypted)
+	if err != nil {
+		return apperr.OldPINMismatch
+	}
+	if err := crypto.ValidatePINTimestamp(oldPayload, crypto.MaxPINTimestampSkew); err != nil {
+		return apperr.OldPINMismatch
+	}
+
+	// Verify old PIN
+	match, err := crypto.VerifyPassword(ctx, oldPayload.PIN, user.PINHash)
+	if err != nil {
+		return fmt.Errorf("verify old pin: %w", err)
+	}
+	if !match {
+		return apperr.OldPINMismatch
+	}
+
+	// Decrypt new PIN
+	newPayload, err := s.pinKeys.DecryptPIN(req.NewPINEncrypted)
+	if err != nil {
+		return apperr.ValidationError
+	}
+	if err := crypto.ValidatePINTimestamp(newPayload, crypto.MaxPINTimestampSkew); err != nil {
+		return apperr.ValidationError
+	}
+
+	// New PIN must differ from old
+	if newPayload.PIN == oldPayload.PIN {
+		return apperr.Error{
+			Status:  422,
+			Code:    "VALIDATION_ERROR",
+			Message: "PIN baru tidak boleh sama dengan PIN lama.",
+		}
+	}
+
+	// Hash new PIN
+	newHash, err := crypto.HashPassword(ctx, newPayload.PIN, crypto.DefaultArgon2Params)
+	if err != nil {
+		return fmt.Errorf("hash new pin: %w", err)
+	}
+
+	if err := s.users.UpdatePINHash(ctx, userID, newHash); err != nil {
+		return fmt.Errorf("update pin hash: %w", err)
+	}
+
+	// Audit
+	if s.audit != nil {
+		s.audit.Log(&AuditEntry{
+			UserID:       &userID,
+			Action:       "PIN_CHANGED",
+			ResourceType: "auth",
+			IPAddress:    clientIP,
+		})
+	}
+
+	return nil
+}
+
 func hashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])

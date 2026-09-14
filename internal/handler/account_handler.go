@@ -4,11 +4,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
@@ -130,80 +128,48 @@ func (h *AccountHandler) UpdateTransactionLimit(w http.ResponseWriter, r *http.R
 	response.Success(w, r, http.StatusOK, map[string]string{"message": "Limit transaksi berhasil diperbarui."})
 }
 
-// ListNotifications handles GET /v1/notifications
-func (h *AccountHandler) ListNotifications(w http.ResponseWriter, r *http.Request) {
+// UpdateProfile handles PUT /v1/account/profile
+func (h *AccountHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
 	if err != nil {
 		response.Err(w, r, apperr.TokenInvalid)
 		return
 	}
 
-	limit := 20
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 50 {
-			limit = parsed
-		}
-	}
-
-	var cursor *uuid.UUID
-	if c := r.URL.Query().Get("cursor"); c != "" {
-		parsed, err := uuid.Parse(c)
-		if err != nil {
-			response.Err(w, r, apperr.ValidationError)
-			return
-		}
-		cursor = &parsed
-	}
-
-	resp, hasMore, nextCursor, err := h.svc.ListNotifications(r.Context(), userID, cursor, limit)
-	if err != nil {
-		h.handleError(w, r, err, "list notifications")
-		return
-	}
-
-	response.SuccessWithPagination(w, r, http.StatusOK, resp, response.Pagination{
-		Cursor:  nextCursor,
-		HasMore: hasMore,
-		Limit:   limit,
-	})
-}
-
-// MarkNotificationRead handles PUT /v1/notifications/{id}/read
-func (h *AccountHandler) MarkNotificationRead(w http.ResponseWriter, r *http.Request) {
-	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
-	if err != nil {
-		response.Err(w, r, apperr.TokenInvalid)
-		return
-	}
-
-	notifID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
+	var req account.UpdateProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
 
-	if err := h.svc.MarkNotificationRead(r.Context(), userID, notifID); err != nil {
-		h.handleError(w, r, err, "mark notification read")
+	if err := h.svc.UpdateProfile(r.Context(), userID, req); err != nil {
+		h.handleError(w, r, err, "update profile")
 		return
 	}
 
-	response.Success(w, r, http.StatusOK, map[string]string{"message": "Notifikasi ditandai sudah dibaca."})
+	response.Success(w, r, http.StatusOK, map[string]string{"message": "Profil berhasil diperbarui"})
 }
 
-// MarkAllNotificationsRead handles PUT /v1/notifications/read-all
-func (h *AccountHandler) MarkAllNotificationsRead(w http.ResponseWriter, r *http.Request) {
+// UpdateSettings handles PUT /v1/account/settings
+func (h *AccountHandler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
 	if err != nil {
 		response.Err(w, r, apperr.TokenInvalid)
 		return
 	}
 
-	if err := h.svc.MarkAllNotificationsRead(r.Context(), userID); err != nil {
-		h.handleError(w, r, err, "mark all notifications read")
+	var req account.UpdateSettingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
 		return
 	}
 
-	response.Success(w, r, http.StatusOK, map[string]string{"message": "Semua notifikasi ditandai sudah dibaca."})
+	if err := h.svc.UpdateSettings(r.Context(), userID, req); err != nil {
+		h.handleError(w, r, err, "update settings")
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, map[string]string{"message": "Pengaturan berhasil diperbarui"})
 }
 
 func (h *AccountHandler) handleError(w http.ResponseWriter, r *http.Request, err error, operation string) {

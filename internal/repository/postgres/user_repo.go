@@ -93,3 +93,39 @@ func (r *UserRepo) SetLockedUntil(ctx context.Context, userID uuid.UUID, lockedU
 	}
 	return nil
 }
+
+// FindByID finds a user by their primary key.
+func (r *UserRepo) FindByID(ctx context.Context, userID uuid.UUID) (*auth.User, error) {
+	query := `
+		SELECT id, full_name, display_name, pin_hash, pin_salt,
+		       status, locked_until, failed_pin_attempts, max_pin_attempts,
+		       last_login_at
+		FROM users
+		WHERE id = $1 AND deleted_at IS NULL`
+
+	var user auth.User
+	err := r.pool.QueryRow(ctx, query, userID).Scan(
+		&user.ID, &user.FullName, &user.DisplayName,
+		&user.PINHash, &user.PINSalt,
+		&user.Status, &user.LockedUntil,
+		&user.FailedPINAttempts, &user.MaxPINAttempts,
+		&user.LastLoginAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find user by id: %w", err)
+	}
+	return &user, nil
+}
+
+// UpdatePINHash updates the user's PIN hash.
+func (r *UserRepo) UpdatePINHash(ctx context.Context, userID uuid.UUID, newHash string) error {
+	query := `UPDATE users SET pin_hash = $2 WHERE id = $1`
+	_, err := r.pool.Exec(ctx, query, userID, newHash)
+	if err != nil {
+		return fmt.Errorf("update pin hash: %w", err)
+	}
+	return nil
+}

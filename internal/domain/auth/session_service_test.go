@@ -34,6 +34,12 @@ func (m *mockUserRepo) ResetFailedAttempts(_ context.Context, _ uuid.UUID) error
 func (m *mockUserRepo) SetLockedUntil(_ context.Context, _ uuid.UUID, _ *time.Time) error {
 	return nil
 }
+func (m *mockUserRepo) FindByID(_ context.Context, _ uuid.UUID) (*auth.User, error) {
+	return m.user, nil
+}
+func (m *mockUserRepo) UpdatePINHash(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
 
 type mockDeviceRepo struct{}
 

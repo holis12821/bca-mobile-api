@@ -22,6 +22,12 @@ type ProfileRepository interface {
 	// FindProfile returns the user profile with decrypted PII.
 	// PII decryption happens at this layer.
 	FindProfile(ctx context.Context, userID uuid.UUID) (*UserProfile, error)
+
+	// UpdateEmail updates the user's encrypted email.
+	UpdateEmail(ctx context.Context, userID uuid.UUID, email string) error
+
+	// UpdateSettings updates the user's settings flags.
+	UpdateSettings(ctx context.Context, userID uuid.UUID, req UpdateSettingsRequest) error
 }
 
 // TransactionLimitRepository defines data access for transaction limits.

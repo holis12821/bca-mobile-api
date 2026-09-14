@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -89,6 +90,18 @@ func run() error {
 	}
 	jwtMgr := crypto.NewJWTManager(jwtKeys, cfg.JWT.AccessTokenTTL, cfg.JWT.RefreshTokenTTL)
 
+	// PII encryption key (AES-256-GCM, hex-encoded in config)
+	var piiKey []byte
+	if cfg.Crypto.AESKey != "" {
+		piiKey, err = hex.DecodeString(cfg.Crypto.AESKey)
+		if err != nil {
+			return fmt.Errorf("decode AES_KEY: %w", err)
+		}
+		if len(piiKey) != 32 {
+			return fmt.Errorf("AES_KEY must be 32 bytes (64 hex chars), got %d bytes", len(piiKey))
+		}
+	}
+
 	// Router
 	handler := router.New(router.Deps{
 		DB:           pool,
@@ -97,6 +110,7 @@ func run() error {
 		PINKeys:      pinKeys,
 		JWTManager:   jwtMgr,
 		Config:       cfg,
+		PIIKey:       piiKey,
 	})
 
 	// HTTP server

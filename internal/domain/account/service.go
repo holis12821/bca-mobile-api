@@ -223,6 +223,49 @@ func (s *Service) UpdateTransactionLimit(ctx context.Context, userID uuid.UUID, 
 	return nil
 }
 
+// UpdateProfile updates the user's email (requires OTP verification — stubbed for now).
+func (s *Service) UpdateProfile(ctx context.Context, userID uuid.UUID, req UpdateProfileRequest) error {
+	if req.Email == "" {
+		return apperr.ValidationError
+	}
+
+	// OTP verification is stubbed: accept "000000" or any 6-digit code in dev mode.
+	// In production, this would verify against a real OTP service.
+	if len(req.OTPCode) != 6 {
+		return apperr.ValidationError
+	}
+
+	if err := s.profiles.UpdateEmail(ctx, userID, req.Email); err != nil {
+		return fmt.Errorf("update email: %w", err)
+	}
+
+	// Invalidate profile and dashboard caches
+	if s.versions != nil {
+		_, _ = s.versions.IncrVersion(ctx, "profile", userID)
+		_, _ = s.versions.IncrVersion(ctx, "dashboard", userID)
+	}
+
+	return nil
+}
+
+// UpdateSettings updates the user's settings flags.
+func (s *Service) UpdateSettings(ctx context.Context, userID uuid.UUID, req UpdateSettingsRequest) error {
+	if req.BiometricEnabled == nil && req.PushNotificationEnabled == nil && req.EmailStatementEnabled == nil {
+		return apperr.ValidationError
+	}
+
+	if err := s.profiles.UpdateSettings(ctx, userID, req); err != nil {
+		return fmt.Errorf("update settings: %w", err)
+	}
+
+	// Invalidate profile cache
+	if s.versions != nil {
+		_, _ = s.versions.IncrVersion(ctx, "profile", userID)
+	}
+
+	return nil
+}
+
 // ListNotifications returns paginated notifications.
 func (s *Service) ListNotifications(ctx context.Context, userID uuid.UUID, cursor *uuid.UUID, limit int) (*NotificationListResponse, bool, string, error) {
 	if limit <= 0 || limit > 50 {

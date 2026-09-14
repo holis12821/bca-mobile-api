@@ -144,6 +144,12 @@ type AffectedParty struct {
 	AccountID string
 }
 
+// ReceiptCache caches transaction receipts in Redis (immutable, long TTL).
+type ReceiptCache interface {
+	GetReceipt(ctx context.Context, txnID string) (*ReceiptResponse, error)
+	SetReceipt(ctx context.Context, txnID string, receipt *ReceiptResponse) error
+}
+
 // RecentTransferCache caches recent transfers.
 type RecentTransferCache interface {
 	GetRecent(ctx context.Context, userID uuid.UUID) ([]FavoriteTransfer, error)

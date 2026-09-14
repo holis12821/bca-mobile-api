@@ -135,6 +135,12 @@ type ChallengeData struct {
 	DeviceID  string // device_id that requested the challenge
 }
 
+// ChangePINRequest is the request body for POST /auth/pin/change.
+type ChangePINRequest struct {
+	OldPINEncrypted string `json:"old_pin_encrypted" validate:"required"`
+	NewPINEncrypted string `json:"new_pin_encrypted" validate:"required"`
+}
+
 // AuditEntry represents a single audit log entry to be written.
 type AuditEntry struct {
 	UserID       *uuid.UUID

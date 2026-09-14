@@ -2,6 +2,8 @@
 
 > Step-by-step setup: dari nol sampai API pertama berjalan
 
+> **Status:** Dokumen ini sudah dikoreksi dan konsisten dengan SKILL.md §14. Lihat juga [07-SETUP-RUNBOOK.md](./07-SETUP-RUNBOOK.md) untuk runbook lengkap.
+
 ---
 
 ## Prerequisites
@@ -87,9 +89,13 @@ go get github.com/google/uuid
 # Migration tool
 go get github.com/golang-migrate/migrate/v4
 
-# Testing
+# Concurrency control (Argon2id semaphore)
+go get golang.org/x/sync
+
+# Testing (testcontainers for real DB/Redis integration tests)
 go get github.com/stretchr/testify
-go get github.com/DATA-DOG/go-sqlmock
+go get github.com/testcontainers/testcontainers-go/modules/postgres
+go get github.com/testcontainers/testcontainers-go/modules/redis
 ```
 
 ### Kenapa dependency ini?
@@ -167,14 +173,21 @@ func main() {
     defer dbPool.Close()
     slog.Info("database connected")
 
-    // 4. Initialize Redis
-    redisClient, err := redis.NewClient(cfg.Redis)
+    // 4. Initialize Redis (two instances: session + cache)
+    redisSession, err := redis.NewClient(cfg.RedisSession)
     if err != nil {
-        slog.Error("failed to connect redis", "error", err)
+        slog.Error("failed to connect redis session", "error", err)
         os.Exit(1)
     }
-    defer redisClient.Close()
-    slog.Info("redis connected")
+    defer redisSession.Close()
+
+    redisCache, err := redis.NewClient(cfg.RedisCache)
+    if err != nil {
+        slog.Error("failed to connect redis cache", "error", err)
+        os.Exit(1)
+    }
+    defer redisCache.Close()
+    slog.Info("redis connected (session + cache)")
 
     // 5. Initialize repositories
     authRepo := postgres.NewAuthRepo(dbPool)
@@ -267,7 +280,8 @@ type Config struct {
     Port int    `env:"APP_PORT" envDefault:"8080"`
 
     Database DatabaseConfig
-    Redis    RedisConfig
+    RedisSession RedisSessionConfig
+    RedisCache   RedisCacheConfig
     JWT      JWTConfig
     Security SecurityConfig
 }
@@ -292,15 +306,25 @@ func (d DatabaseConfig) DSN() string {
     )
 }
 
-type RedisConfig struct {
-    Host     string `env:"REDIS_HOST" envDefault:"localhost"`
-    Port     int    `env:"REDIS_PORT" envDefault:"6379"`
+type RedisSessionConfig struct {
+    Host     string `env:"REDIS_SESSION_HOST" envDefault:"localhost"`
+    Port     int    `env:"REDIS_SESSION_PORT" envDefault:"6379"`
     Password string `env:"REDIS_PASSWORD" envDefault:""`
-    DB       int    `env:"REDIS_DB" envDefault:"0"`
     PoolSize int    `env:"REDIS_POOL_SIZE" envDefault:"20"`
 }
 
-func (r RedisConfig) Addr() string {
+func (r RedisSessionConfig) Addr() string {
+    return fmt.Sprintf("%s:%d", r.Host, r.Port)
+}
+
+type RedisCacheConfig struct {
+    Host     string `env:"REDIS_CACHE_HOST" envDefault:"localhost"`
+    Port     int    `env:"REDIS_CACHE_PORT" envDefault:"6380"`
+    Password string `env:"REDIS_PASSWORD" envDefault:""`
+    PoolSize int    `env:"REDIS_POOL_SIZE" envDefault:"20"`
+}
+
+func (r RedisCacheConfig) Addr() string {
     return fmt.Sprintf("%s:%d", r.Host, r.Port)
 }
 
@@ -352,6 +376,8 @@ func New(
     account *handler.AccountHandler,
     txn *handler.TransactionHandler,
     ewallet *handler.EWalletHandler,
+    notif *handler.NotificationHandler,
+    qris *handler.QRISHandler,
     authMW *middleware.AuthMiddleware,
 ) http.Handler {
     r := chi.NewRouter()
@@ -431,17 +457,17 @@ func New(
                 r.Post("/topup", ewallet.TopUp)
             })
 
-            // Notifications
+            // Notifications (dedicated handler, not TransactionHandler)
             r.Route("/notifications", func(r chi.Router) {
-                r.Get("/", txn.GetNotifications)
-                r.Put("/{notificationID}/read", txn.MarkNotificationRead)
-                r.Put("/read-all", txn.MarkAllNotificationsRead)
+                r.Get("/", notif.ListNotifications)
+                r.Put("/{notificationID}/read", notif.MarkNotificationRead)
+                r.Put("/read-all", notif.MarkAllNotificationsRead)
             })
 
-            // QRIS
+            // QRIS (dedicated handler, not TransactionHandler)
             r.Route("/qris", func(r chi.Router) {
-                r.Post("/decode", txn.DecodeQRIS)
-                r.Post("/pay", txn.PayQRIS)
+                r.Post("/decode", qris.DecodeQRIS)
+                r.Post("/pay", qris.PayQRIS)
             })
         })
 
@@ -656,7 +682,7 @@ type Repository interface {
     GetUserByPhoneHash(ctx context.Context, phoneHash string) (*User, error)
     GetUserByID(ctx context.Context, id uuid.UUID) (*User, error)
     UpdatePINHash(ctx context.Context, userID uuid.UUID, hash, salt string) error
-    IncrementFailedAttempts(ctx context.Context, userID uuid.UUID) error
+    IncrementFailedAttempts(ctx context.Context, userID uuid.UUID) (newCount int, err error)
     ResetFailedAttempts(ctx context.Context, userID uuid.UUID) error
     LockUser(ctx context.Context, userID uuid.UUID, until time.Time) error
     UpdateLastLogin(ctx context.Context, userID uuid.UUID) error
@@ -772,9 +798,10 @@ func (s *Service) LoginWithPIN(ctx context.Context, req LoginPINRequest) (*Login
         return nil, fmt.Errorf("decrypt pin: %w", err)
     }
 
-    // 3. Find user (lookup by device → user mapping, or phone)
-    device, err := s.repo.GetDevice(ctx, uuid.Nil, req.DeviceID)
-    if err != nil {
+    // 3. Resolve user from device_id alone (partial unique index on active devices)
+    //    One active device_id = one user. No active row → 403.
+    device, err := s.repo.GetDeviceByDeviceID(ctx, req.DeviceID)
+    if err != nil || device == nil {
         return nil, ErrDeviceNotRecognized
     }
 
@@ -794,11 +821,14 @@ func (s *Service) LoginWithPIN(ctx context.Context, req LoginPINRequest) (*Login
 
     // 5. Verify PIN
     if !appCrypto.VerifyPIN(pin, user.PINHash, user.PINSalt) {
-        _ = s.repo.IncrementFailedAttempts(ctx, user.ID)
-        if user.FailedPINAttempts+1 >= user.MaxPINAttempts {
+        // UPDATE ... RETURNING failed_pin_attempts — branch on the RETURNED value,
+        // not the stale in-memory user.FailedPINAttempts+1 (race condition fix)
+        newCount, _ := s.repo.IncrementFailedAttempts(ctx, user.ID)
+        if newCount >= user.MaxPINAttempts {
             lockUntil := time.Now().Add(30 * time.Minute)
             _ = s.repo.LockUser(ctx, user.ID, lockUntil)
             _ = s.rateLimiter.SetAccountLockout(ctx, user.ID.String(), 30*time.Minute)
+            // TODO: push-notify the registered device
         }
         return nil, ErrInvalidPIN
     }
@@ -900,14 +930,31 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
+  redis-session:
     image: redis:7-alpine
-    container_name: bca-redis
-    command: redis-server --requirepass localdev_redis_123
+    container_name: bca-redis-session
+    command: >
+      redis-server --requirepass localdev_redis_123
+      --maxmemory-policy noeviction
+      --appendonly yes --appendfsync everysec
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data
+      - redis_session_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "localdev_redis_123", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis-cache:
+    image: redis:7-alpine
+    container_name: bca-redis-cache
+    command: >
+      redis-server --requirepass localdev_redis_123
+      --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "localdev_redis_123", "ping"]
       interval: 5s
@@ -916,7 +963,7 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:
+  redis_session_data:
 ```
 
 ---
@@ -940,11 +987,12 @@ DB_SSLMODE=disable
 DB_MAX_CONNS=25
 DB_MIN_CONNS=5
 
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
+# Redis — two instances (session: noeviction, cache: allkeys-lru)
+REDIS_SESSION_HOST=localhost
+REDIS_SESSION_PORT=6379
+REDIS_CACHE_HOST=localhost
+REDIS_CACHE_PORT=6380
 REDIS_PASSWORD=localdev_redis_123
-REDIS_DB=0
 REDIS_POOL_SIZE=20
 
 # JWT

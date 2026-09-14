@@ -15,6 +15,7 @@ type Config struct {
 	PIN           PIN
 	Crypto        Crypto
 	Argon2        Argon2
+	UploadDir     string `env:"UPLOAD_DIR" envDefault:"uploads"`
 }
 
 type App struct {
@@ -106,6 +107,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if err := env.ParseWithOptions(&cfg.Argon2, env.Options{}); err != nil {
+		return nil, err
+	}
+
+	// Parse top-level fields
+	if err := env.Parse(&cfg); err != nil {
 		return nil, err
 	}
 

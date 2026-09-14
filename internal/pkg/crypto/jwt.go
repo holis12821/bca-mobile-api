@@ -15,8 +15,11 @@ import (
 type TokenType string
 
 const (
-	TokenTypeAccess  TokenType = "access"
-	TokenTypeRefresh TokenType = "refresh"
+	TokenTypeAccess       TokenType = "access"
+	TokenTypeRefresh      TokenType = "refresh"
+	TokenTypeRegistration TokenType = "registration"
+
+	RegistrationTokenTTL = 30 * time.Minute
 )
 
 // Claims are the JWT claims for this service.
@@ -84,6 +87,20 @@ func (m *JWTManager) GenerateTokenPair(userID, sessionID, deviceID string) (*Tok
 	}
 
 	return &TokenPair{AccessToken: accessToken, RefreshToken: refreshToken}, nil
+}
+
+// GenerateRegistrationToken creates a short-lived JWT for registration flow.
+func (m *JWTManager) GenerateRegistrationToken(registrationID string) (string, error) {
+	now := time.Now().UTC()
+	return m.generateToken(Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   registrationID,
+			ID:        uuid.New().String(),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(RegistrationTokenTTL)),
+		},
+		Type: TokenTypeRegistration,
+	})
 }
 
 // VerifyToken parses and validates a JWT, enforcing the expected typ claim.

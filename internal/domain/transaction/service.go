@@ -28,6 +28,7 @@ type Service struct {
 	inquiryCache     InquiryCache
 	vtokenCache      VerificationTokenCache
 	recentCache      RecentTransferCache
+	receiptCache     ReceiptCache
 	cacheInvalidator TransactionCacheInvalidator
 	idemStore        IdempotencyStore
 	versions         account.VersionCounter
@@ -44,6 +45,7 @@ type ServiceConfig struct {
 	InquiryCache     InquiryCache
 	VTokenCache      VerificationTokenCache
 	RecentCache      RecentTransferCache
+	ReceiptCache     ReceiptCache
 	CacheInvalidator TransactionCacheInvalidator
 	IdemStore        IdempotencyStore
 	Versions         account.VersionCounter
@@ -61,6 +63,7 @@ func NewService(cfg ServiceConfig) *Service {
 		inquiryCache:     cfg.InquiryCache,
 		vtokenCache:      cfg.VTokenCache,
 		recentCache:      cfg.RecentCache,
+		receiptCache:     cfg.ReceiptCache,
 		cacheInvalidator: cfg.CacheInvalidator,
 		idemStore:        cfg.IdemStore,
 		versions:         cfg.Versions,
@@ -374,6 +377,87 @@ func toTransactionItem(t Transaction) TransactionItem {
 		item.DestinationBank = *t.DestinationBank
 	}
 	return item
+}
+
+// GetReceipt returns a formatted receipt for a transaction.
+func (s *Service) GetReceipt(ctx context.Context, userID, txnID uuid.UUID) (*ReceiptResponse, error) {
+	txnIDStr := txnID.String()
+
+	// Check cache first (receipts are immutable, 24h TTL)
+	if s.receiptCache != nil {
+		cached, err := s.receiptCache.GetReceipt(ctx, txnIDStr)
+		if err != nil {
+			slog.Warn("receipt cache get failed", "error", err)
+		}
+		if cached != nil {
+			return cached, nil
+		}
+	}
+
+	txn, err := s.txns.FindByID(ctx, userID, txnID)
+	if err != nil {
+		return nil, fmt.Errorf("find transaction: %w", err)
+	}
+	if txn == nil {
+		return nil, apperr.NotFound
+	}
+
+	// Resolve source account info
+	var sourceNumber, sourceName string
+	if txn.SourceAccountID != nil {
+		accounts, err := s.accounts.FindActiveByUserID(ctx, userID)
+		if err == nil {
+			for _, a := range accounts {
+				if a.ID == *txn.SourceAccountID {
+					sourceNumber = a.AccountNumber
+					sourceName = a.AccountLabel
+					break
+				}
+			}
+		}
+	}
+
+	wibLoc, _ := time.LoadLocation("Asia/Jakarta")
+	createdWIB := txn.CreatedAt.In(wibLoc)
+
+	receipt := &ReceiptResponse{
+		TransactionID:   txn.ID.String(),
+		Type:            txn.Type,
+		Status:          txn.Status,
+		Date:            createdWIB.Format("02 January 2006"),
+		Time:            createdWIB.Format("15:04 WIB"),
+		ReferenceNumber: txn.ReferenceNumber,
+		SourceAccount:   sourceNumber,
+		SourceName:      sourceName,
+		Amount:          txn.Amount.StringFixed(2),
+		AdminFee:        txn.AdminFee.StringFixed(2),
+		Total:           txn.TotalAmount.StringFixed(2),
+		Currency:        txn.Currency,
+	}
+
+	if txn.DestinationAccount != nil {
+		receipt.DestinationAccount = *txn.DestinationAccount
+	}
+	if txn.DestinationName != nil {
+		receipt.DestinationName = *txn.DestinationName
+	}
+	if txn.DestinationBank != nil {
+		receipt.DestinationBank = *txn.DestinationBank
+	}
+	if txn.ProviderName != nil {
+		receipt.ProviderName = *txn.ProviderName
+	}
+	if txn.Notes != nil {
+		receipt.Notes = *txn.Notes
+	}
+
+	if s.receiptCache != nil {
+		if err := s.receiptCache.SetReceipt(ctx, txnIDStr, receipt); err != nil {
+			slog.Warn("receipt cache set failed", "error", err)
+		}
+	}
+
+	return receipt, nil
 }
 
 func toRecentItems(favs []FavoriteTransfer) []RecentTransferItem {

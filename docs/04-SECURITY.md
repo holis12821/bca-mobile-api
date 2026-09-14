@@ -2,6 +2,8 @@
 
 > Multi-layer security: transport, application, data, operational
 
+> **Status:** Dokumen ini sudah dikoreksi dan konsisten dengan SKILL.md §14.
+
 ---
 
 ## 1. Security Layers Overview
@@ -128,8 +130,11 @@ Refresh Token:
   Lifetime:   7 hari
   Contains:   session_id, device_id, jti (unique ID), iat, exp
   Storage:    Android EncryptedSharedPreferences
-  Rotation:   Setiap refresh menghasilkan token baru, token lama invalidated
-  Reuse Detection: Jika token lama digunakan → revoke SEMUA session user (compromise detected)
+  Rotation:   Setiap refresh menghasilkan token baru, token lama ditandai
+              refresh:revoked:{hash} dengan TTL = sisa lifetime (JANGAN dihapus —
+              key yang hilang tidak bisa dibedakan dari expired, reuse detection rusak)
+  Reuse Detection: Jika hash ditemukan di revoked → cabut SEMUA sesi user,
+              audit SECURITY_SUSPICIOUS_LOGIN, push-notify device
 ```
 
 ### JWT Claims Structure
@@ -157,6 +162,8 @@ Refresh Token:
 }
 ```
 
+**Penting:** Verifikasi JWT **wajib** memeriksa claim `typ`. Access token tidak boleh diterima di endpoint refresh, dan sebaliknya.
+
 ---
 
 ## 3. PIN Security
@@ -172,6 +179,10 @@ const (
     ArgonKeyLen  = 32
     SaltLen      = 16
 )
+
+// Argon2id 64MB x 4 threads per verify — bungkus dengan semaphore
+// untuk mencegah OOM saat login burst.
+// var argonSem = semaphore.NewWeighted(int64(min(runtime.NumCPU(), 8)))
 
 // Hash PIN
 func HashPIN(pin string) (hash string, salt string, err error) {
@@ -217,9 +228,14 @@ func VerifyPIN(pin, hash, salt string) bool {
 ```
 1. Server generates RSA-2048 key pair
 2. Public key dikirim ke app saat startup (atau di-embed)
-3. App encrypts PIN dengan public key sebelum kirim
-4. Server decrypts dengan private key
-5. Private key disimpan di HSM (production) atau encrypted file (dev)
+3. App encrypts PIN payload dengan public key menggunakan RSA-OAEP-SHA256
+   (BUKAN PKCS#1 v1.5 — vulnerable to padding oracle attacks)
+4. Payload terenkripsi berisi: {"pin":"123456","nonce":"<uuid>","ts":<unix>}
+5. Server decrypts dan memvalidasi:
+   - Tolak jika |ts - now| > 60 detik
+   - Tolak jika nonce sudah pernah dipakai (pin_nonce:{nonce}, TTL 120s)
+   - Tanpa anti-replay ini, pin_encrypted yang tersadap bisa diputar ulang
+6. Private key disimpan di HSM (production) atau encrypted file (dev)
 ```
 
 ### Brute-Force Protection
@@ -329,28 +345,35 @@ func (h *TransferHandler) Execute(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 1. Check Redis untuk existing result
-    cached, err := h.redis.Get(ctx, "idem:"+idempotencyKey).Result()
-    if err == nil {
-        // Sudah pernah diproses — return cached response
+    userID := middleware.UserIDFromCtx(r.Context())
+    key := fmt.Sprintf("idem:%s:%s", userID, idempotencyKey) // ALWAYS user-scoped
+
+    // 1. Claim the slot atomically. Never GET first.
+    //    (GET-first returns literal "PROCESSING" as a 200 body on concurrent replay)
+    ok, _ := h.redis.SetNX(ctx, key, "PROCESSING", 30*time.Second).Result()
+    if !ok {
+        v, _ := h.redis.Get(ctx, key).Result()
+        if v == "PROCESSING" {
+            respondError(w, 409, "IDEMPOTENCY_CONFLICT", "Transaksi sedang diproses.")
+            return
+        }
+        // Cached response from previous success
         w.Header().Set("X-Idempotent-Replayed", "true")
-        w.Write([]byte(cached))
+        w.Write([]byte(v))
         return
     }
 
-    // 2. Acquire lock (mencegah concurrent processing)
-    locked, err := h.redis.SetNX(ctx, "idem:"+idempotencyKey, "PROCESSING", 30*time.Second).Result()
-    if !locked {
-        respondError(w, 409, "IDEMPOTENCY_CONFLICT", "Request sedang diproses")
-        return
-    }
-
-    // 3. Process transaction
+    // 2. Process transaction
     result, err := h.service.ExecuteTransfer(ctx, req)
+    if err != nil {
+        h.redis.Del(ctx, key) // On failure: DEL so client can retry
+        respondError(w, ...)
+        return
+    }
 
-    // 4. Cache result
+    // 3. Cache successful result
     resultJSON, _ := json.Marshal(result)
-    h.redis.Set(ctx, "idem:"+idempotencyKey, resultJSON, 24*time.Hour)
+    h.redis.Set(ctx, key, resultJSON, 24*time.Hour)
 
     respond(w, 201, result)
 }
@@ -359,49 +382,67 @@ func (h *TransferHandler) Execute(w http.ResponseWriter, r *http.Request) {
 ### Double-Entry Bookkeeping
 
 ```
-Setiap transfer menghasilkan DUA mutation entries:
+Transfer internal (BCA→BCA) tanpa fee → DUA mutation:
+  1. DEBIT  rekening sumber      amount
+  2. CREDIT rekening tujuan      amount
 
-Transfer Rp 1.500.000 dari A ke B:
+Transfer internal dengan fee, atau rail keluar → TIGA mutation:
+  1. DEBIT  rekening sumber           amount + admin_fee
+  2. CREDIT rekening tujuan/settlement amount
+  3. CREDIT FEE_INCOME shard          admin_fee (hanya jika > 0)
 
-account_mutations:
-  1. account_id=A, type=DEBIT,  amount=1500000, balance_before=15750000, balance_after=14250000
-  2. account_id=B, type=CREDIT, amount=1500000, balance_before=5000000,  balance_after=6500000
+Contoh transfer antar bank Rp 50.000, fee 6.500:
+  1. DEBIT  nasabah           56500 (balance 15750000 → 15693500)
+  2. CREDIT TRANSFER_EXTERNAL 50000 (settlement shard via settlement_account_id())
+  3. CREDIT FEE_INCOME         6500
 
-Kedua entry dalam SATU database transaction (ACID).
-Jika satu gagal → keduanya rollback.
+Semua leg dalam SATU database transaction (SERIALIZABLE + retry 40001).
+Akun settlement di-resolve via settlement_account_id(rail, transaction_id),
+16 shard per rail untuk menyebar row-lock contention.
 ```
 
 ### Transaction Isolation
 
 ```sql
--- Transfer menggunakan SERIALIZABLE isolation untuk mencegah race condition
+-- Transfer menggunakan SERIALIZABLE isolation + retry loop
+-- Retry 40001 (serialization failure): max 3 attempts, jittered backoff (~10/30/90 ms)
 BEGIN;
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
--- Lock source account row
-SELECT balance, available_balance FROM accounts
-WHERE id = $1 FOR UPDATE;
+-- Lock ALL affected accounts, ordered by UUID ascending (prevents deadlock)
+SELECT id, balance, available_balance FROM accounts
+WHERE id IN ($source_id, $dest_id, $settlement_id, $fee_id)
+ORDER BY id
+FOR UPDATE;
 
--- Verify sufficient balance
+-- Verify sufficient balance: available_balance >= amount + admin_fee
+-- Verify daily limit (inside this transaction)
+
 -- Debit source
-UPDATE accounts SET balance = balance - $amount WHERE id = $source_id;
+UPDATE accounts SET balance = balance - ($amount + $admin_fee) WHERE id = $source_id;
 
--- Credit destination
+-- Credit destination (or settlement shard for outbound rails)
 UPDATE accounts SET balance = balance + $amount WHERE id = $dest_id;
 
--- Insert transaction record
+-- Credit fee-income shard (if admin_fee > 0)
+UPDATE accounts SET balance = balance + $admin_fee WHERE id = $fee_id;
+
+-- Insert transaction record (with WIB date, NOT CURRENT_DATE)
 INSERT INTO transactions (...) VALUES (...);
 
--- Insert mutations
-INSERT INTO account_mutations (...) VALUES (...), (...);
+-- Insert mutations (2 or 3 legs)
+INSERT INTO account_mutations (...) VALUES (...), (...), (...);
 
--- Update daily usage
-INSERT INTO daily_usage (...) VALUES (...)
+-- Update daily usage (WIB date)
+INSERT INTO daily_usage (user_id, usage_date, limit_type, total_amount, transaction_count)
+VALUES ($user_id, $wib_date, $limit_type, $amount, 1)
 ON CONFLICT (user_id, usage_date, limit_type)
 DO UPDATE SET total_amount = daily_usage.total_amount + $amount,
              transaction_count = daily_usage.transaction_count + 1;
 
 COMMIT;
+-- On SQLSTATE 40001: retry (up to 3 attempts)
+-- Cache invalidation happens AFTER commit, never inside the transaction
 ```
 
 ---
@@ -501,13 +542,13 @@ type LoginPINRequest struct {
 }
 
 type TransferRequest struct {
-    IdempotencyKey     string  `json:"idempotency_key" validate:"required,uuid"`
+    // IdempotencyKey is read from X-Idempotency-Key header, not body
     InquiryID          string  `json:"inquiry_id" validate:"required,uuid"`
     SourceAccountID    string  `json:"source_account_id" validate:"required,uuid"`
     DestinationAccount string  `json:"destination_account" validate:"required,numeric,min=10,max=16"`
     BankCode           string  `json:"bank_code" validate:"required,numeric,len=3"`
     TransferType       string  `json:"transfer_type" validate:"required,oneof=INTERNAL EXTERNAL VIRTUAL_ACCOUNT"`
-    Amount             float64 `json:"amount" validate:"required,gt=0,lte=100000000"`
+    Amount             int64   `json:"amount" validate:"required,gt=0,lte=10000000000"` // minor units (sen)
     Notes              string  `json:"notes" validate:"max=500"`
     VerificationToken  string  `json:"verification_token" validate:"required"`
 }
@@ -564,22 +605,28 @@ type AuditEntry struct {
     Metadata     map[string]interface{}
 }
 
-// Audit logger — async, non-blocking (jangan sampai audit failure menggagalkan transaksi)
-func (a *AuditService) Log(ctx context.Context, entry AuditEntry) {
-    go func() {
-        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-        defer cancel()
-
-        if err := a.repo.Insert(ctx, entry); err != nil {
-            // Fallback ke structured log file jika DB gagal
-            a.logger.Error("audit_log_failed",
-                "action", entry.Action,
-                "user_id", entry.UserID,
-                "error", err,
-            )
-        }
-    }()
+// Audit logger — buffered channel + fixed worker pool, NOT go func() per entry.
+// Bare go func() is unbounded under load and loses everything queued on crash.
+type AuditService struct {
+    repo   AuditRepository
+    logger *slog.Logger
+    ch     chan AuditEntry  // buffered channel, e.g. cap 1000
 }
+
+func (a *AuditService) Log(ctx context.Context, entry AuditEntry) {
+    select {
+    case a.ch <- entry:
+        // queued for worker pool
+    default:
+        // Buffer full — fallback to structured log file
+        a.logger.Error("audit_buffer_full",
+            "action", entry.Action,
+            "user_id", entry.UserID,
+        )
+    }
+}
+
+// Workers (started at init): for range a.ch { insert to DB, on error log to slog }
 ```
 
 ---
@@ -595,7 +642,7 @@ Transport:
 
 Authentication:
   [x] Argon2id for PIN hashing
-  [x] RSA-2048 for PIN encryption in transit
+  [x] RSA-2048 OAEP-SHA256 for PIN encryption in transit (with nonce/timestamp anti-replay)
   [x] JWT RS256 (not HS256) — asymmetric signing
   [x] Refresh token rotation with reuse detection
   [x] Biometric: FIDO2-style challenge-response

@@ -2,20 +2,23 @@
 
 > Key design, TTL strategy, invalidation patterns, dan data structures
 
+> **Status:** Dokumen ini sudah dikoreksi dan konsisten dengan SKILL.md §7 dan §14.
+
 ---
 
 ## Arsitektur Redis
 
 ```
-┌────────────────────────────────────────────────────────┐
-│                    Redis Cluster                       │
-│                                                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐│
-│  │   DB 0       │  │   DB 1       │  │   DB 2       ││
-│  │   Sessions   │  │   Cache      │  │   Rate Limit ││
-│  │   & Tokens   │  │   & Data     │  │   & Locks    ││
-│  └──────────────┘  └──────────────┘  └──────────────┘│
-└────────────────────────────────────────────────────────┘
+┌─────────────────────────────────┐  ┌──────────────────────────────────┐
+│      Redis Session Instance     │  │       Redis Cache Instance       │
+│      maxmemory-policy:          │  │       maxmemory-policy:          │
+│        noeviction               │  │         allkeys-lru              │
+│      AOF: appendfsync everysec  │  │       maxmemory: 512mb          │
+│                                 │  │                                  │
+│  session:*, refresh:*,          │  │  cache:*, cachever:*,           │
+│  bio_challenge:*, vtoken:*,     │  │  rate:*, lock:*, dlock:*        │
+│  inquiry:*, idem:*              │  │                                  │
+└─────────────────────────────────┘  └──────────────────────────────────┘
 ```
 
 ### Konvensi Penamaan Key
@@ -32,7 +35,7 @@ Contoh:
 
 ---
 
-## 1. Session Management (DB 0)
+## 1. Session Management (Session Instance)
 
 ### Active Sessions
 
@@ -65,8 +68,9 @@ EXPIRE session:usr_abc:dev_xyz 900  // Reset 15 menit
 // Logout: hapus session
 DEL session:usr_abc:dev_xyz
 
-// Logout semua device
-SCAN 0 MATCH session:usr_abc:* → DEL each
+// Logout semua device (via Set, bukan SCAN)
+SMEMBERS sessions:user:usr_abc → DEL each session
+DEL sessions:user:usr_abc
 ```
 
 ### Refresh Token Mapping
@@ -91,6 +95,29 @@ Fields:
   created_at    → timestamp
 ```
 
+### User Session Set (untuk logout-all tanpa SCAN)
+
+```
+Key:    sessions:user:{user_id}
+Type:   Set
+TTL:    7 hari
+Members: device_id list
+
+Dipakai untuk logout-all tanpa SCAN.
+```
+
+### Revoked Refresh Token (reuse detection)
+
+```
+Key:    refresh:revoked:{hash}
+Type:   String
+TTL:    sisa lifetime refresh token
+Value:  "revoked"
+
+Kalau hash ini ditemukan saat refresh → compromise detected,
+cabut SEMUA sesi user + audit SECURITY_SUSPICIOUS_LOGIN.
+```
+
 ### Verification Token (PIN untuk transaksi)
 
 ```
@@ -107,7 +134,7 @@ Fields:
 
 ---
 
-## 2. Data Cache (DB 1)
+## 2. Data Cache (Cache Instance)
 
 ### Dashboard (Beranda)
 
@@ -153,26 +180,26 @@ Invalidation:
 ### Transaction Mutations
 
 ```
-Key:    cache:mutations:{account_id}:{period}:{cursor_hash}
+Key:    cache:mutations:{account_id}:v{n}:{period}:{cursor_hash}
 Type:   String (JSON)
 TTL:    60 detik
 
 period: LAST_7_DAYS | THIS_MONTH | LAST_MONTH | CUSTOM_20260801_20260831
 
 Invalidation:
-  - Saat transaksi baru   → DEL cache:mutations:{account_id}:*
-  - Pattern delete via SCAN
+  - Saat transaksi baru   → INCR cachever:mutations:{account_id}
+  - Stale keys expire via TTL (no SCAN needed)
 ```
 
 ### Transaction History
 
 ```
-Key:    cache:history:{user_id}:{type}:{cursor_hash}
+Key:    cache:history:{user_id}:v{n}:{type}:{cursor_hash}
 Type:   String (JSON)
 TTL:    60 detik
 
 Invalidation:
-  - Saat transaksi baru → DEL cache:history:{user_id}:*
+  - Saat transaksi baru → INCR cachever:history:{user_id}
 ```
 
 ### Transaction Receipt
@@ -211,7 +238,7 @@ Invalidation:
 ### Notifications
 
 ```
-Key:    cache:notif:{user_id}
+Key:    cache:notif:{user_id}:v{n}:{cursor_hash}
 Type:   String (JSON)
 TTL:    60 detik
 
@@ -220,8 +247,8 @@ Type:   String (integer)
 TTL:    60 detik
 
 Invalidation:
-  - Saat notif baru     → DEL cache:notif:{user_id}, DEL cache:notif:count:{user_id}
-  - Saat notif dibaca   → DEL both
+  - Saat notif baru     → INCR cachever:notif:{user_id}, DEL cache:notif:count:{user_id}
+  - Saat notif dibaca   → INCR cachever:notif:{user_id}, DEL cache:notif:count:{user_id}
 ```
 
 ### Promotions
@@ -247,7 +274,7 @@ Content: maintenance_mode, min_version, feature_flags
 
 ---
 
-## 3. Rate Limiting & Locks (DB 2)
+## 3. Rate Limiting & Locks (Cache Instance)
 
 ### Login Rate Limit
 
@@ -304,7 +331,7 @@ Windows:
 ### Idempotency Keys
 
 ```
-Key:    idem:{idempotency_key}
+Key:    idem:{user_id}:{idempotency_key}
 Type:   String (JSON)
 TTL:    24 jam
 
@@ -312,11 +339,11 @@ Content: Response dari transaksi pertama
 
 Flow:
   1. Request masuk dengan idempotency_key
-  2. SETNX idem:{key} "PROCESSING" EX 30
+  2. SETNX idem:{user_id}:{key} "PROCESSING" EX 30
   3. Jika key sudah ada dan value != "PROCESSING" → return cached response
   4. Jika key sudah ada dan value == "PROCESSING" → return 409 Conflict
   5. Proses transaksi
-  6. SET idem:{key} {response_json} EX 86400
+  6. SET idem:{user_id}:{key} {response_json} EX 86400
 ```
 
 ### Distributed Lock (untuk transaksi)
@@ -380,44 +407,34 @@ Digunakan untuk:
 ### Pattern 3: Event-Driven Invalidation
 
 ```
-Transaction SUCCESS → Publish event → Invalidate:
-  - cache:balance:{source_account}
-  - cache:balance:{dest_account}
-  - cache:dashboard:{user_id}
-  - cache:mutations:{account_id}:*
-  - cache:history:{user_id}:*
-  - cache:transfers:recent:{user_id}
+Transaction SUCCESS → Invalidate ALL affected parties:
+  - cache:balance:{account_id}        → DEL
+  - cache:dashboard:{user_id}         → DEL
+  - cache:transfers:recent:{user_id}  → DEL
+  - cache:notif:count:{user_id}       → DEL
+  - cachever:mutations:{account_id}   → INCR
+  - cachever:history:{user_id}        → INCR
+  - cachever:notif:{user_id}          → INCR
 ```
 
 ### Bulk Invalidation Helper
 
 ```go
-// InvalidateTransactionCaches menghapus semua cache terkait transaksi
-func (r *RedisRepo) InvalidateTransactionCaches(ctx context.Context, userID, accountID string) error {
-    keys := []string{
-        fmt.Sprintf("cache:balance:%s", accountID),
-        fmt.Sprintf("cache:dashboard:%s", userID),
-        fmt.Sprintf("cache:transfers:recent:%s", userID),
-    }
+// InvalidateTransactionCaches invalidates caches for ALL affected parties.
+// An internal transfer affects two users — both must be invalidated.
+type AffectedParty struct{ UserID, AccountID string }
 
-    // Pattern-based deletion untuk mutations dan history
-    patterns := []string{
-        fmt.Sprintf("cache:mutations:%s:*", accountID),
-        fmt.Sprintf("cache:history:%s:*", userID),
-    }
-
+func (r *RedisRepo) InvalidateTransactionCaches(ctx context.Context, parties []AffectedParty) error {
     pipe := r.client.Pipeline()
-    for _, key := range keys {
-        pipe.Del(ctx, key)
+    for _, p := range parties {
+        pipe.Del(ctx, "cache:balance:"+p.AccountID)
+        pipe.Del(ctx, "cache:dashboard:"+p.UserID)
+        pipe.Del(ctx, "cache:transfers:recent:"+p.UserID)
+        pipe.Del(ctx, "cache:notif:count:"+p.UserID)
+        pipe.Incr(ctx, "cachever:mutations:"+p.AccountID)
+        pipe.Incr(ctx, "cachever:history:"+p.UserID)
+        pipe.Incr(ctx, "cachever:notif:"+p.UserID)
     }
-
-    for _, pattern := range patterns {
-        iter := r.client.Scan(ctx, 0, pattern, 100).Iterator()
-        for iter.Next(ctx) {
-            pipe.Del(ctx, iter.Val())
-        }
-    }
-
     _, err := pipe.Exec(ctx)
     return err
 }
@@ -444,6 +461,9 @@ func (r *RedisRepo) InvalidateTransactionCaches(ctx context.Context, userID, acc
 | `cache:notif:*` | 60 detik | Real-time feel |
 | `cache:promotions:active` | 5 menit | Marketing data |
 | `cache:health:config` | 5 menit | App config |
+| `cachever:*` | none | Version counter — INCR to invalidate |
+| `sessions:user:*` | 7 hari | Set of device_ids for logout-all |
+| `refresh:revoked:*` | remaining | Reuse detection |
 | `rate:login:*` | 15 menit | Rate limit window |
 | `lock:account:*` | 30 menit | Lockout duration |
 | `idem:*` | 24 jam | Idempotency guarantee |
@@ -459,8 +479,10 @@ func (r *RedisRepo) InvalidateTransactionCaches(ctx context.Context, userID, acc
 
 # Memory
 maxmemory 2gb
-maxmemory-policy allkeys-lru    # Untuk cache DB
-# DB 0 (sessions): noeviction — sessions tidak boleh hilang tiba-tiba
+# Ini config untuk Cache instance. Session instance menggunakan:
+#   maxmemory-policy noeviction
+#   appendonly yes / appendfsync everysec
+maxmemory-policy allkeys-lru
 
 # Persistence
 appendonly yes                   # AOF untuk durability
@@ -501,7 +523,7 @@ tcp-backlog 511
 1. Hit Rate        → cache:hit / (cache:hit + cache:miss)  → Target: > 90%
 2. Memory Usage    → INFO memory                           → Alert: > 80%
 3. Connected Clients → INFO clients                        → Alert: > 8000
-4. Evictions       → INFO stats (evicted_keys)             → Alert: > 0 untuk DB 0
+4. Evictions       → INFO stats (evicted_keys)             → Alert: > 0 untuk session instance
 5. Latency         → LATENCY HISTORY                       → Alert: p99 > 5ms
 6. Key Count       → DBSIZE                                → Trending
 7. Rate Limit Hits → Custom counter                        → Security alert threshold

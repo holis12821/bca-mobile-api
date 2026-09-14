@@ -120,6 +120,19 @@ type NotificationItem struct {
 	CreatedAt string         `json:"created_at"`
 }
 
+// UpdateProfileRequest is the request for PUT /account/profile.
+type UpdateProfileRequest struct {
+	Email   string `json:"email" validate:"required,email"`
+	OTPCode string `json:"otp_code" validate:"required"`
+}
+
+// UpdateSettingsRequest is the request for PUT /account/settings.
+type UpdateSettingsRequest struct {
+	BiometricEnabled         *bool `json:"biometric_enabled"`
+	PushNotificationEnabled  *bool `json:"push_notification_enabled"`
+	EmailStatementEnabled    *bool `json:"email_statement_enabled"`
+}
+
 // LimitCeilings are the server-side maximums from the DB constraint.
 var LimitCeilings = map[string]LimitCeiling{
 	"TRANSFER_INTERNAL": {DailyLimit: decimal.NewFromInt(100_000_000)},

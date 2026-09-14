@@ -2,6 +2,8 @@
 
 > Semua endpoint, request/response contracts, error codes
 
+> **Status:** Dokumen ini sudah dikoreksi dan konsisten dengan SKILL.md §14.
+
 ---
 
 ## Konvensi Umum
@@ -84,7 +86,7 @@ X-Idempotency-Key: <uuid_v4>  (untuk mutating operations)
 ### `GET /health`
 **Auth:** None
 **Purpose:** Health check + app config untuk Splash screen
-**Cache:** Redis 5 menit
+**Cache:** Liveness (DB + Redis ping) tidak di-cache; config (maintenance, version, feature flags) di-cache Redis 5 menit
 
 ```json
 // Response 200
@@ -337,7 +339,7 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
 {
   "pin_encrypted": "base64_encrypted",
   "transaction_id": "txn_abc123",
-  "purpose": "EWALLET_TOPUP"    // TRANSFER, EWALLET_TOPUP, PAYMENT
+  "purpose": "EWALLET_TOPUP"    // TRANSFER, EWALLET_TOPUP, QRIS_PAYMENT, CHANGE_LIMIT, CHANGE_PIN
 }
 
 // Response 200
@@ -421,13 +423,13 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
         "account_id": "acc_001",
         "account_number": "1234567890",
         "account_type": "TAHAPAN",
-        "balance": 15750000.00,
+        "balance": "15750000.00",
         "currency": "IDR",
-        "available_balance": 15250000.00,
-        "hold_amount": 500000.00
+        "available_balance": "15250000.00",
+        "hold_amount": "500000.00"
       }
     ],
-    "total_balance": 15750000.00
+    "total_balance": "15750000.00"
   }
 }
 ```
@@ -448,7 +450,7 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
       "masked_account": "****4567"
     },
     "balance": {
-      "total": 15750000.00,
+      "total": "15750000.00",
       "currency": "IDR",
       "primary_account": "1234567890"
     },
@@ -562,7 +564,7 @@ GET /transactions/mutations?account_id=acc_001&period=CUSTOM&start_date=2026-08-
     "account": {
       "account_number": "1234567890",
       "account_label": "Tahapan BCA",
-      "balance": 15750000.00
+      "balance": "15750000.00"
     },
     "transactions": [
       {
@@ -571,8 +573,8 @@ GET /transactions/mutations?account_id=acc_001&period=CUSTOM&start_date=2026-08-
         "time": "10:30:00",
         "description": "TRSF E-BANKING DB",
         "detail": "Transfer ke 0987654321 JOHN DOE",
-        "amount": -1500000.00,
-        "balance_after": 15750000.00,
+        "amount": "-1500000.00",
+        "balance_after": "15750000.00",
         "type": "DEBIT",
         "category": "TRANSFER",
         "icon": "ic_transfer",
@@ -584,8 +586,8 @@ GET /transactions/mutations?account_id=acc_001&period=CUSTOM&start_date=2026-08-
         "time": "15:45:00",
         "description": "TRSF E-BANKING CR",
         "detail": "Transfer dari 1111222233 JANE DOE",
-        "amount": 5000000.00,
-        "balance_after": 17250000.00,
+        "amount": "5000000.00",
+        "balance_after": "17250000.00",
         "type": "CREDIT",
         "category": "TRANSFER",
         "icon": "ic_transfer_in",
@@ -594,7 +596,7 @@ GET /transactions/mutations?account_id=acc_001&period=CUSTOM&start_date=2026-08-
     ]
   },
   "pagination": {
-    "cursor": "eyJpZCI6Im11dF8wMDIiLCJkYXRlIjoiMjAyNi0wOS0wMSJ9",
+    "cursor": "eyJkIjoiMjAyNi0wOS0wMSIsImMiOiIyMDI2LTA5LTAxVDE1OjQ1OjAwWiIsImkiOiJtdXRfMDAyIn0=",
     "has_more": true,
     "limit": 20
   }
@@ -621,9 +623,9 @@ GET /transactions/history?cursor=&limit=20&type=ALL
         "id": "txn_001",
         "type": "EWALLET_TOPUP",
         "status": "SUCCESS",
-        "amount": 100000.00,
-        "admin_fee": 1000.00,
-        "total": 101000.00,
+        "amount": "100000.00",
+        "admin_fee": "1000.00",
+        "total": "101000.00",
         "description": "Top Up GoPay",
         "destination": "0812****5678",
         "destination_name": "NURHOLIS MAJID",
@@ -662,9 +664,9 @@ GET /transactions/history?cursor=&limit=20&type=ALL
     "destination_number": "081234565678",
     "destination_name": "NURHOLIS MAJID",
     "provider": "GoPay",
-    "amount": 100000.00,
-    "admin_fee": 1000.00,
-    "total": 101000.00,
+    "amount": "100000.00",
+    "admin_fee": "1000.00",
+    "total": "101000.00",
     "currency": "IDR",
     "receipt_url": "https://api.bcamobile.id/v1/transactions/txn_001/receipt/pdf"
   }
@@ -747,17 +749,17 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 **Auth:** Bearer Token + PIN Verification
 **Purpose:** Eksekusi transfer — Screen: **Transfer Antar Rekening**
 **Idempotency:** Required (X-Idempotency-Key header)
+**Note:** `destination_account`, `bank_code`, `transfer_type`, `amount` di-derive dari inquiry. Field di body hanya cross-check; mismatch → `422 INQUIRY_MISMATCH`.
 
 ```json
 // Request
 {
-  "idempotency_key": "idk_unique_uuid",
   "inquiry_id": "inq_abc123",
   "source_account_id": "acc_001",
   "destination_account": "0987654321",
   "bank_code": "014",
   "transfer_type": "INTERNAL",
-  "amount": 1500000.00,
+  "amount": "1500000.00",
   "notes": "Bayar makan siang",
   "verification_token": "vtk_abc123"
 }
@@ -769,9 +771,9 @@ GET /transactions/history?cursor=&limit=20&type=ALL
     "transaction_id": "txn_002",
     "reference_number": "REF2026090200002",
     "status": "SUCCESS",
-    "amount": 1500000.00,
-    "admin_fee": 0,
-    "total": 1500000.00,
+    "amount": "1500000.00",
+    "admin_fee": "0.00",
+    "total": "1500000.00",
     "source": {
       "account_number": "1234567890",
       "name": "NURHOLIS MAJID"
@@ -892,11 +894,11 @@ GET /transactions/history?cursor=&limit=20&type=ALL
     "provider": "GoPay",
     "destination_name": "NURHOLIS MAJID",
     "destination_phone": "0812****5678",
-    "amount": 100000.00,
-    "admin_fee": 1000.00,
-    "total": 101000.00,
+    "amount": "100000.00",
+    "admin_fee": "1000.00",
+    "total": "101000.00",
     "source_account": "1234567890",
-    "source_balance": 15750000.00,
+    "source_balance": "15750000.00",
     "is_balance_sufficient": true,
     "expires_at": "2026-09-02T10:35:00Z"
   }
@@ -920,7 +922,6 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 ```json
 // Request
 {
-  "idempotency_key": "idk_unique_uuid",
   "inquiry_id": "inq_ew_001",
   "verification_token": "vtk_abc123"
 }
@@ -935,9 +936,9 @@ GET /transactions/history?cursor=&limit=20&type=ALL
     "provider": "GoPay",
     "destination_phone": "0812****5678",
     "destination_name": "NURHOLIS MAJID",
-    "amount": 100000.00,
-    "admin_fee": 1000.00,
-    "total": 101000.00,
+    "amount": "100000.00",
+    "admin_fee": "1000.00",
+    "total": "101000.00",
     "source_account": "1234567890",
     "source_name": "NURHOLIS MAJID",
     "created_at": "2026-09-02T10:30:00Z"
@@ -1036,7 +1037,7 @@ GET /transactions/history?cursor=&limit=20&type=ALL
   "data": {
     "merchant_name": "TOKO SEJAHTERA",
     "merchant_city": "JAKARTA",
-    "amount": 50000.00,
+    "amount": "50000.00",
     "is_amount_fixed": true,
     "qris_id": "qr_abc123",
     "expires_at": "2026-09-02T10:35:00Z"
@@ -1052,10 +1053,9 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 ```json
 // Request
 {
-  "idempotency_key": "idk_unique_uuid",
   "qris_id": "qr_abc123",
   "source_account_id": "acc_001",
-  "amount": 50000.00,
+  "amount": "50000.00",
   "verification_token": "vtk_abc123"
 }
 
@@ -1138,6 +1138,9 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 | `EWALLET_ACCOUNT_NOT_FOUND` | 404 | Nomor e-wallet tidak valid |
 | `EWALLET_INSUFFICIENT_BALANCE` | 422 | Saldo tidak cukup |
 | `EWALLET_PROVIDER_DOWN` | 503 | Provider sedang gangguan |
+| `INQUIRY_EXPIRED` | 422 | Sesi transaksi sudah kedaluwarsa |
+| `INQUIRY_MISMATCH` | 422 | Data body tidak sesuai dengan inquiry |
+| `VERIFICATION_TOKEN_INVALID` | 401 | Token verifikasi tidak valid atau sudah dipakai |
 | `RATE_LIMIT_EXCEEDED` | 429 | Terlalu banyak request |
 | `MAINTENANCE_MODE` | 503 | Sedang maintenance |
 | `IDEMPOTENCY_CONFLICT` | 409 | Transaksi sudah diproses |

@@ -2,6 +2,8 @@
 
 > Desain database banking-grade dengan audit trail, encryption at rest, dan optimasi index
 
+> **Status:** Dokumen ini sudah dikoreksi dan konsisten dengan SKILL.md §14. Lihat juga [06-LEDGER-AND-DEVICE-BINDING.md](./06-LEDGER-AND-DEVICE-BINDING.md) untuk detail migration 000009.
+
 ---
 
 ## Prinsip Desain Database
@@ -71,11 +73,12 @@ CREATE TABLE devices (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     revoked_at      TIMESTAMPTZ,
 
-    UNIQUE (user_id, device_id)
+    -- Note: global UNIQUE(user_id, device_id) replaced by partial index below
 );
 
 CREATE INDEX idx_devices_user_id ON devices (user_id) WHERE revoked_at IS NULL;
-CREATE INDEX idx_devices_device_id ON devices (device_id);
+-- Partial unique: one active device_id at a time (migration 000009)
+CREATE UNIQUE INDEX idx_devices_device_id_active ON devices (device_id) WHERE revoked_at IS NULL;
 
 -- ============================================================
 -- BIOMETRIC KEYS (FIDO2/WebAuthn style)
@@ -129,7 +132,9 @@ CREATE INDEX idx_sessions_expires ON sessions (expires_at) WHERE revoked_at IS N
 -- ============================================================
 CREATE TABLE accounts (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id         UUID NOT NULL REFERENCES users(id),
+    user_id         UUID REFERENCES users(id),              -- NULL for internal/settlement accounts
+    owner_type      VARCHAR(10) NOT NULL DEFAULT 'CUSTOMER'
+                    CHECK (owner_type IN ('CUSTOMER', 'INTERNAL')),
     account_number  VARCHAR(20) NOT NULL UNIQUE,
     account_type    VARCHAR(30) NOT NULL
                     CHECK (account_type IN ('TAHAPAN', 'TAHAPAN_GOLD', 'TAPRES',
@@ -176,7 +181,7 @@ CREATE TABLE transaction_limits (
 CREATE TABLE daily_usage (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id         UUID NOT NULL REFERENCES users(id),
-    usage_date      DATE NOT NULL DEFAULT CURRENT_DATE,
+    usage_date      DATE NOT NULL,                          -- WIB date, passed by application (no default)
     limit_type      VARCHAR(30) NOT NULL,
     total_amount    DECIMAL(18,2) NOT NULL DEFAULT 0,
     transaction_count INT NOT NULL DEFAULT 0,
@@ -199,9 +204,10 @@ CREATE INDEX idx_daily_usage_lookup ON daily_usage (user_id, usage_date, limit_t
 -- ============================================================
 CREATE TABLE transactions (
     id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    idempotency_key     VARCHAR(255) UNIQUE,        -- Mencegah duplikasi
+    idempotency_key     VARCHAR(255),               -- Scoped per user (see constraint below)
     user_id             UUID NOT NULL REFERENCES users(id),
     source_account_id   UUID REFERENCES accounts(id),
+    destination_account_id UUID REFERENCES accounts(id),    -- FK for internal transfers (migration 000009)
     type                VARCHAR(30) NOT NULL
                         CHECK (type IN ('TRANSFER_INTERNAL', 'TRANSFER_EXTERNAL',
                                'EWALLET_TOPUP', 'QRIS_PAYMENT', 'PULSA',
@@ -242,6 +248,9 @@ CREATE INDEX idx_txn_idempotency ON transactions (idempotency_key) WHERE idempot
 CREATE INDEX idx_txn_reference ON transactions (reference_number);
 CREATE INDEX idx_txn_created ON transactions (created_at DESC);
 
+-- Idempotency scoped per user (migration 000009)
+CREATE UNIQUE INDEX uq_txn_user_idempotency ON transactions (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+
 -- ============================================================
 -- ACCOUNT MUTATIONS (bank statement entries — immutable)
 -- ============================================================
@@ -258,8 +267,8 @@ CREATE TABLE account_mutations (
     detail              TEXT,
     category            VARCHAR(30),
     reference_number    VARCHAR(50),
-    transaction_date    DATE NOT NULL DEFAULT CURRENT_DATE,
-    transaction_time    TIME NOT NULL DEFAULT CURRENT_TIME,
+    transaction_date    DATE NOT NULL,                      -- WIB date, passed by application (no default — prevents timezone bugs)
+    transaction_time    TIME NOT NULL,                      -- WIB time, passed by application (no default)
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -460,6 +469,30 @@ CREATE TABLE promotions (
 );
 
 CREATE INDEX idx_promo_active ON promotions (valid_from, valid_until) WHERE is_active = TRUE;
+```
+
+### Triggers — `set_updated_at()` (migration 000009)
+
+```sql
+-- Shared trigger for all tables with updated_at column
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Applied to: users, accounts, transaction_limits, daily_usage,
+-- ewallet_providers, favorite_transfers, promotions, registrations
+```
+
+### Seed Transaction Limits (migration 000009)
+
+```sql
+-- Auto-seed 5 limit rows per new user via AFTER INSERT trigger
+-- Limit types: TRANSFER_INTERNAL, TRANSFER_EXTERNAL, EWALLET, QRIS, PAYMENT
+-- Server-side ceilings enforced by CHECK constraint ck_transaction_limit_ceiling
 ```
 
 ### 000008 — Rate Limiting & OTP
