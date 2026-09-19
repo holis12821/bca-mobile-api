@@ -1,0 +1,1988 @@
+{
+  "info": {
+    "_postman_id": "8f2a1c40-5d3b-4e71-9c88-0a6b1d2e4f10",
+    "name": "BCA Mobile API",
+    "description": "Collection lengkap untuk BCA Mobile API (Go + chi).\n\n## Cara pakai\n\n1. Import file ini **dan** `bca-mobile-api.postman_environment.json`.\n2. Pilih environment `BCA Mobile — Local` di pojok kanan atas.\n3. Jalankan **Auth → Login (PIN)**. Token disimpan otomatis ke environment; semua request lain memakainya lewat collection-level Bearer auth.\n4. Untuk transfer: **Transfer → Inquiry** → **Auth → PIN Verify** → **Transfer → Execute**. `inquiry_id` dan `verification_token` tersimpan otomatis antar langkah.\n\n## PIN tidak pernah dikirim polos\n\nAPI menolak PIN plaintext. Yang diterima adalah base64 dari RSA-OAEP-SHA256 atas `{\"pin\",\"nonce\",\"ts\"}`, dan payload ditolak kalau `ts` lebih tua dari 60 detik atau nonce-nya pernah dipakai.\n\nPostman tidak bisa melakukan RSA-OAEP di pre-request script, jadi request yang butuh PIN memanggil `POST /v1/dev/encrypt-pin` lebih dulu (otomatis, lewat `pm.sendRequest`). Endpoint itu hanya ada saat `APP_ENV=development`.\n\nDi luar Postman: `go run ./scripts/pinenc -pin 123456`.\n\n## Batas waktu yang bikin request gagal kalau ditunda\n\n| Objek | Umur |\n|---|---|\n| `pin_encrypted` | 60 detik |\n| `verification_token` | 120 detik, sekali pakai |\n| `inquiry_id` | 5 menit, sekali pakai |\n| `access_token` | 15 menit |\n\nKalau Execute menjawab `VERIFICATION_TOKEN_INVALID` atau `INQUIRY_EXPIRED`, ulangi dari Inquiry — bukan bug.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{access_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8080/v1"
+    },
+    {
+      "key": "device_id",
+      "value": "device-nurholis-001"
+    },
+    {
+      "key": "pin",
+      "value": "123456"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health (liveness + config)",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Ping DB + kedua Redis, plus blok config. 503 kalau ada dependency mati."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json().data;",
+                  "pm.test('database ok', () => pm.expect(d.database).to.eql('ok'));",
+                  "pm.test('redis ok', () => {",
+                  "  pm.expect(d.redis_session).to.eql('ok');",
+                  "  pm.expect(d.redis_cache).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Liveness",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health/live",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health",
+                "live"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Config",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health/config",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health",
+                "config"
+              ]
+            },
+            "description": "Feature flags + maintenance mode. Di-cache 5 menit."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Dev Helpers",
+      "description": "Hanya ada saat APP_ENV=development. Di environment lain rute ini 404.",
+      "item": [
+        {
+          "name": "Encrypt PIN",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pin\": \"{{pin}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/dev/encrypt-pin",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "dev",
+                "encrypt-pin"
+              ]
+            },
+            "description": "Menghasilkan `pin_encrypted` sekali pakai, umur 60 detik. Request lain memanggil ini otomatis — jalankan manual hanya kalau ingin melihat hasilnya."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const d = pm.response.json().data;",
+                  "pm.environment.set('pin_encrypted', d.pin_encrypted);",
+                  "console.log('pin_encrypted kedaluwarsa dalam', d.expires_in, 'detik');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PIN Public Key",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/dev/pin-public-key",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "dev",
+                "pin-public-key"
+              ]
+            },
+            "description": "PEM untuk frontend yang mau mengenkripsi sendiri (WebCrypto RSA-OAEP/SHA-256 atau Android Keystore). Ini kunci publik — aman dibagikan ke client."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Login (PIN)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Ambil pin_encrypted yang masih segar sebelum request dikirim.",
+                  "const base = pm.environment.get('base_url') || pm.collectionVariables.get('base_url');",
+                  "const pin = pm.environment.get('pin') || pm.collectionVariables.get('pin') || '123456';",
+                  "",
+                  "pm.sendRequest({",
+                  "  url: base + '/dev/encrypt-pin',",
+                  "  method: 'POST',",
+                  "  header: { 'Content-Type': 'application/json' },",
+                  "  body: { mode: 'raw', raw: JSON.stringify({ pin: pin }) }",
+                  "}, function (err, res) {",
+                  "  if (err || res.code !== 200) {",
+                  "    console.error('encrypt-pin gagal:', err ? err.message : res.text());",
+                  "    console.error('Pastikan server jalan dan APP_ENV=development.');",
+                  "    return;",
+                  "  }",
+                  "  pm.variables.set('pin_encrypted', res.json().data.pin_encrypted);",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "if (body.status !== 'success') {",
+                  "  console.error('login gagal:', body.error && body.error.code);",
+                  "  return;",
+                  "}",
+                  "pm.environment.set('access_token', body.data.access_token);",
+                  "pm.environment.set('refresh_token', body.data.refresh_token);",
+                  "pm.test('dapat access_token', () => pm.expect(body.data.access_token).to.be.a('string'));",
+                  "console.log('token tersimpan, berlaku 15 menit');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"device_id\": \"{{device_id}}\",\n  \"pin_encrypted\": \"{{pin_encrypted}}\",\n  \"device_info\": {\n    \"device_name\": \"Postman\",\n    \"device_model\": \"iPhone 15 Pro Max\",\n    \"os_version\": \"iOS 17.5\",\n    \"app_version\": \"1.0.0\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/login/pin",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "login",
+                "pin"
+              ]
+            },
+            "description": "User diresolusi dari `device_id` saja — satu device aktif = satu user. Device seed: `device-nurholis-001` (PIN 123456), `device-budi-001` (654321), `device-siti-001` (111111).\n\nRate limit: 5 percobaan / 15 menit per device. 5 PIN salah → akun terkunci 30 menit (423)."
+          }
+        },
+        {
+          "name": "PIN Verify (ambil verification_token)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const base = pm.environment.get('base_url') || pm.collectionVariables.get('base_url');",
+                  "const pin = pm.environment.get('pin') || pm.collectionVariables.get('pin') || '123456';",
+                  "",
+                  "pm.sendRequest({",
+                  "  url: base + '/dev/encrypt-pin',",
+                  "  method: 'POST',",
+                  "  header: { 'Content-Type': 'application/json' },",
+                  "  body: { mode: 'raw', raw: JSON.stringify({ pin: pin }) }",
+                  "}, function (err, res) {",
+                  "  if (err || res.code !== 200) {",
+                  "    console.error('encrypt-pin gagal:', err ? err.message : res.text());",
+                  "    return;",
+                  "  }",
+                  "  pm.variables.set('pin_encrypted', res.json().data.pin_encrypted);",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('verification_token', body.data.verification_token);",
+                  "  console.log('verification_token tersimpan, berlaku', body.data.expires_in, 'detik');",
+                  "} else {",
+                  "  console.error(body.error && body.error.code);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pin_encrypted\": \"{{pin_encrypted}}\",\n  \"purpose\": \"TRANSFER\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/pin/verify",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "pin",
+                "verify"
+              ]
+            },
+            "description": "Purpose yang sah: `TRANSFER`, `EWALLET_TOPUP`, `QRIS_PAYMENT`, `CHANGE_LIMIT`, `CHANGE_PIN`.\n\nToken terikat ke user + purpose, sekali pakai, umur 120 detik. Token `EWALLET_TOPUP` ditolak oleh `/transfer/execute`."
+          }
+        },
+        {
+          "name": "Refresh Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('access_token', body.data.access_token);",
+                  "  pm.environment.set('refresh_token', body.data.refresh_token);",
+                  "  console.log('token dirotasi');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/token/refresh",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "token",
+                "refresh"
+              ]
+            },
+            "description": "Rotasi dengan reuse detection: refresh token lama ditandai revoked, bukan dihapus. Memakai ulang token lama = semua sesi user dicabut."
+          }
+        },
+        {
+          "name": "Biometric Challenge",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"device_id\": \"{{device_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/biometric/challenge",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "biometric",
+                "challenge"
+              ]
+            },
+            "description": "Challenge 32 byte acak, umur 60 detik, sekali pakai."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('challenge_id', body.data.challenge_id);",
+                  "  pm.environment.set('challenge', body.data.challenge);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Biometric Register",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"key_id\": \"bio-key-001\",\n  \"public_key\": \"-----BEGIN PUBLIC KEY-----\\n...\\n-----END PUBLIC KEY-----\",\n  \"biometric_type\": \"FACE_ID\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/biometric/register",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "biometric",
+                "register"
+              ]
+            },
+            "description": "Server hanya menyimpan public key. Template biometrik tidak pernah dikirim — pencocokan terjadi di perangkat.\n\nDari Postman ini tidak bisa diselesaikan sungguhan: butuh keypair yang dibuat di Keystore/Secure Enclave."
+          }
+        },
+        {
+          "name": "Biometric Login",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"device_id\": \"{{device_id}}\",\n  \"key_id\": \"bio-key-001\",\n  \"challenge_id\": \"{{challenge_id}}\",\n  \"signature\": \"<base64 signature atas challenge>\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/login/biometric",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "login",
+                "biometric"
+              ]
+            },
+            "description": "Butuh tanda tangan dari private key di perangkat — tidak bisa dipalsukan dari Postman. Ada di sini sebagai dokumentasi kontrak."
+          }
+        },
+        {
+          "name": "Change PIN",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Butuh DUA ciphertext: PIN lama dan PIN baru.",
+                  "const base = pm.environment.get('base_url') || pm.collectionVariables.get('base_url');",
+                  "const oldPin = pm.environment.get('pin') || '123456';",
+                  "const newPin = pm.environment.get('new_pin') || '654321';",
+                  "",
+                  "function enc(pin, cb) {",
+                  "  pm.sendRequest({",
+                  "    url: base + '/dev/encrypt-pin',",
+                  "    method: 'POST',",
+                  "    header: { 'Content-Type': 'application/json' },",
+                  "    body: { mode: 'raw', raw: JSON.stringify({ pin: pin }) }",
+                  "  }, function (err, res) {",
+                  "    if (err || res.code !== 200) { console.error('encrypt-pin gagal'); return; }",
+                  "    cb(res.json().data.pin_encrypted);",
+                  "  });",
+                  "}",
+                  "",
+                  "enc(oldPin, function (oldEnc) {",
+                  "  pm.variables.set('old_pin_encrypted', oldEnc);",
+                  "  enc(newPin, function (newEnc) {",
+                  "    pm.variables.set('new_pin_encrypted', newEnc);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"old_pin_encrypted\": \"{{old_pin_encrypted}}\",\n  \"new_pin_encrypted\": \"{{new_pin_encrypted}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/pin/change",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "pin",
+                "change"
+              ]
+            },
+            "description": "PIN lama yang salah menambah counter lockout yang sama dengan login. Sukses = semua sesi lain dicabut.\n\n⚠️ Ini mengubah PIN user seed. Setelah dijalankan, update variable `pin` di environment atau login berikutnya gagal."
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"all_devices\": false\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/logout",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "logout"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Account & Profile",
+      "item": [
+        {
+          "name": "Profile",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success' && body.data.accounts && body.data.accounts.length) {",
+                  "  pm.environment.set('source_account_id', body.data.accounts[0].account_id);",
+                  "  console.log('source_account_id tersimpan:', body.data.accounts[0].account_number);",
+                  "}",
+                  "pm.test('PII ter-mask', () => {",
+                  "  pm.expect(body.data.phone).to.include('*');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/account/profile",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "profile"
+              ]
+            },
+            "description": "Nomor HP dan email tersimpan terenkripsi di DB dan keluar dalam bentuk ter-mask (`0812****7890`). Masking adalah lapisan presentasi, bukan penyimpanan."
+          }
+        },
+        {
+          "name": "Balance",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success' && body.data.accounts && body.data.accounts.length) {",
+                  "  pm.environment.set('source_account_id', body.data.accounts[0].account_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/account/balance",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "balance"
+              ]
+            },
+            "description": "Di-cache 30 detik, tapi tetap ditulis ke audit log setiap kali dibaca — termasuk saat jawabannya dari cache."
+          }
+        },
+        {
+          "name": "Dashboard",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/account/dashboard",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "dashboard"
+              ]
+            },
+            "description": "Agregat untuk Beranda: saldo, mutasi terbaru, promo, jumlah notifikasi belum dibaca. Cache 60 detik."
+          }
+        },
+        {
+          "name": "Update Profile (email)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"nurholis.baru@example.com\",\n  \"otp_code\": \"123456\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/account/profile",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "profile"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update Settings",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"biometric_enabled\": true,\n  \"push_notification_enabled\": true,\n  \"email_statement_enabled\": false\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/account/settings",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "settings"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update Transaction Limit",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"limits\": {\n    \"TRANSFER_INTERNAL\": {\n      \"daily_limit\": \"75000000\"\n    }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/account/transaction-limit",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "transaction-limit"
+              ]
+            },
+            "description": "Ada plafon sisi server: transfer ≤ Rp 100 jt/hari, e-wallet ≤ Rp 20 jt/hari, QRIS ≤ Rp 5 jt/transaksi. Di atas itu → 422."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Notifications",
+      "item": [
+        {
+          "name": "List Notifications",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const list = body.data && (body.data.notifications || body.data);",
+                  "if (Array.isArray(list) && list.length) {",
+                  "  pm.environment.set('notification_id', list[0].id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/notifications?limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "notifications"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "cursor",
+                  "value": "",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Pagination pakai cursor opaque. Cursor ikut masuk ke cache key, jadi halaman 2 tidak pernah mengembalikan isi halaman 1."
+          }
+        },
+        {
+          "name": "Mark as Read",
+          "request": {
+            "method": "PUT",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/notifications/{{notification_id}}/read",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "notifications",
+                "{{notification_id}}",
+                "read"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Mark All as Read",
+          "request": {
+            "method": "PUT",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/notifications/read-all",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "notifications",
+                "read-all"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Transactions",
+      "item": [
+        {
+          "name": "Mutations (mutasi rekening)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions/mutations?account_id={{source_account_id}}&limit=20&period=LAST_7_DAYS",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions",
+                "mutations"
+              ],
+              "query": [
+                {
+                  "key": "account_id",
+                  "value": "{{source_account_id}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "period",
+                  "value": "LAST_7_DAYS"
+                },
+                {
+                  "key": "cursor",
+                  "value": "",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "`account_id` wajib — tanpa itu 400. Jalankan **Account → Balance** dulu supaya variabelnya terisi.\n\n`period`: `TODAY`, `LAST_7_DAYS`, `LAST_30_DAYS`, atau rentang eksplisit. Batas hari memakai kalender WIB, bukan UTC."
+          }
+        },
+        {
+          "name": "History (riwayat transaksi)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const list = body.data && body.data.transactions;",
+                  "if (Array.isArray(list) && list.length) {",
+                  "  pm.environment.set('transaction_id', list[0].id);",
+                  "  console.log('transaction_id tersimpan:', list[0].reference_number);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions/history?limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions",
+                "history"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                },
+                {
+                  "key": "type",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "cursor",
+                  "value": "",
+                  "disabled": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Receipt (struk)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions/{{transaction_id}}/receipt",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions",
+                "{{transaction_id}}",
+                "receipt"
+              ]
+            },
+            "description": "Struk bersifat immutable dan di-cache 24 jam. Transaksi milik user lain menjawab 404, bukan 403 — tidak membocorkan keberadaan datanya."
+          }
+        },
+        {
+          "name": "Recent Transfers",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transfer/recent",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transfer",
+                "recent"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Transfer",
+      "description": "Urutan wajib: Inquiry → PIN Verify (folder Auth) → Execute.\n\nExecute mengambil tujuan, bank, dan biaya dari inquiry yang tersimpan; field di body hanya dipakai sebagai cross-check. Kalau beda → 422 INQUIRY_MISMATCH.",
+      "item": [
+        {
+          "name": "1. Inquiry",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('inquiry_id', body.data.inquiry_id);",
+                  "  console.log('inquiry_id tersimpan, kedaluwarsa dalam', body.data.expires_in, 'detik');",
+                  "  console.log('tujuan:', body.data.destination_name);",
+                  "} else {",
+                  "  console.error(body.error && body.error.code);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"destination_account\": \"9876543210\",\n  \"transfer_type\": \"INTERNAL\",\n  \"amount\": 100000\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/transfer/inquiry",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transfer",
+                "inquiry"
+              ]
+            },
+            "description": "`transfer_type`: `INTERNAL`, `EXTERNAL`, `VIRTUAL_ACCOUNT`. Untuk EXTERNAL tambahkan `bank_code` (3 digit).\n\nRekening seed: 9876543210 (Budi), 5555666677 (Siti), 1234567891 (rekening kedua sendiri).\n\nNomor settlement (diawali 99) selalu 404 — rekening internal bank tidak bisa jadi tujuan."
+          }
+        },
+        {
+          "name": "2. Execute",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('transaction_id', body.data.transaction_id);",
+                  "  console.log('ref:', body.data.reference_number, '| status:', body.data.status);",
+                  "  if (pm.response.headers.get('X-Idempotent-Replayed')) {",
+                  "    console.log('ini replay — tidak ada transaksi baru yang dibuat');",
+                  "  }",
+                  "} else {",
+                  "  console.error(body.error && body.error.code, '-', body.error && body.error.message);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inquiry_id\": \"{{inquiry_id}}\",\n  \"source_account_id\": \"{{source_account_id}}\",\n  \"destination_account\": \"9876543210\",\n  \"transfer_type\": \"INTERNAL\",\n  \"amount\": 100000,\n  \"verification_token\": \"{{verification_token}}\",\n  \"notes\": \"test dari postman\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/transfer/execute",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transfer",
+                "execute"
+              ]
+            },
+            "description": "`X-Idempotency-Key` wajib — tanpa header itu 400. `{{$guid}}` membuat key baru tiap kali dikirim.\n\nUntuk **menguji idempotency**: ganti nilai header dengan string tetap, kirim dua kali. Yang kedua mengembalikan respons yang sama persis dengan header `X-Idempotent-Replayed: true`, dan hanya ada satu transaksi di DB.\n\nGagal umum:\n- `VERIFICATION_TOKEN_INVALID` → token sudah dipakai atau lewat 120 detik; ulangi PIN Verify\n- `INQUIRY_EXPIRED` → inquiry lewat 5 menit; ulangi Inquiry\n- `TRANSFER_INSUFFICIENT_BALANCE` → saldo tersedia (saldo − hold) kurang dari amount + fee"
+          }
+        }
+      ]
+    },
+    {
+      "name": "E-Wallet",
+      "item": [
+        {
+          "name": "Providers",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/ewallet/providers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ewallet",
+                "providers"
+              ]
+            },
+            "description": "Seed: gopay, ovo, dana, shopeepay, linkaja. Cache 1 jam."
+          }
+        },
+        {
+          "name": "1. Inquiry",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('inquiry_id', body.data.inquiry_id);",
+                  "  console.log('tujuan:', body.data.destination_name, '| fee:', body.data.admin_fee);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"provider_id\": \"gopay\",\n  \"phone_number\": \"081234567890\",\n  \"amount\": 50000,\n  \"source_account_id\": \"{{source_account_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/ewallet/inquiry",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ewallet",
+                "inquiry"
+              ]
+            }
+          }
+        },
+        {
+          "name": "2. Top Up",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"inquiry_id\": \"{{inquiry_id}}\",\n  \"verification_token\": \"{{verification_token}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/ewallet/topup",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ewallet",
+                "topup"
+              ]
+            },
+            "description": "Jalankan **Auth → PIN Verify** dulu dengan `purpose` diganti jadi `EWALLET_TOPUP` — token bertujuan `TRANSFER` akan ditolak di sini."
+          }
+        }
+      ]
+    },
+    {
+      "name": "QRIS",
+      "item": [
+        {
+          "name": "1. Decode",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('qris_id', body.data.qris_id);",
+                  "  console.log('merchant:', body.data.merchant_name);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"qr_data\": \"00020101021226250013ID.CO.BCA.WWW01041234520458125303360540850000.005802ID5914TOKO SEJAHTERA6007JAKARTA6304A13B\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/qris/decode",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "qris",
+                "decode"
+              ]
+            },
+            "description": "Payload di atas adalah contoh format EMVCo. Hasil decode disimpan 5 menit dan dipakai sebagai sumber kebenaran saat Pay."
+          }
+        },
+        {
+          "name": "2. Pay",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"qris_id\": \"{{qris_id}}\",\n  \"source_account_id\": \"{{source_account_id}}\",\n  \"amount\": 50000,\n  \"verification_token\": \"{{verification_token}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/qris/pay",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "qris",
+                "pay"
+              ]
+            },
+            "description": "PIN Verify harus memakai `purpose: \"QRIS_PAYMENT\"` (bukan `PAYMENT` — nilai itu ditolak CHECK constraint di DB)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Registration",
+      "item": [
+        {
+          "name": "1. Initiate",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('registration_id', body.data.registration_id);",
+                  "  console.log('OTP dikirim ke', body.data.otp_destination);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"full_name\": \"CALON NASABAH\",\n  \"nik\": \"3201234567890001\",\n  \"phone_number\": \"081211112222\",\n  \"email\": \"calon@example.com\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/registration/initiate",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "registration",
+                "initiate"
+              ]
+            },
+            "description": "Rate limit 3 / jam per device. OTP dikirim lewat gateway SMS stub — kode-nya ada di log server."
+          }
+        },
+        {
+          "name": "2. Verify OTP",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('registration_token', body.data.registration_token);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"registration_id\": \"{{registration_id}}\",\n  \"otp_code\": \"123456\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/registration/verify-otp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "registration",
+                "verify-otp"
+              ]
+            }
+          }
+        },
+        {
+          "name": "3. Upload Document",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{registration_token}}"
+              }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "document_type",
+                  "value": "KTP",
+                  "type": "text"
+                },
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": []
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/registration/upload-document",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "registration",
+                "upload-document"
+              ]
+            },
+            "description": "Pilih file gambar di tab Body → form-data → baris `file`."
+          }
+        },
+        {
+          "name": "4. Complete",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const base = pm.environment.get('base_url') || pm.collectionVariables.get('base_url');",
+                  "pm.sendRequest({",
+                  "  url: base + '/dev/encrypt-pin',",
+                  "  method: 'POST',",
+                  "  header: { 'Content-Type': 'application/json' },",
+                  "  body: { mode: 'raw', raw: JSON.stringify({ pin: '112233' }) }",
+                  "}, function (err, res) {",
+                  "  if (err || res.code !== 200) { console.error('encrypt-pin gagal'); return; }",
+                  "  pm.variables.set('pin_encrypted', res.json().data.pin_encrypted);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{registration_token}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pin_encrypted\": \"{{pin_encrypted}}\",\n  \"device_id\": \"device-postman-baru-001\",\n  \"device_model\": \"Postman\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/registration/complete",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "registration",
+                "complete"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Onboarding (Buka Rekening)",
+      "description": "Alur buka rekening: Session → OCR e-KTP → Personal Data → OTP → Biometrik → Video Call → Credentials → Submit.\n\nSemua provider eksternal (OCR, Dukcapil, biometrik, SMS, core banking) memakai implementasi mock di dalam proses — tidak ada panggilan keluar.\n\n**WebSocket signaling** (`/v1/onboarding/video-call/signal`) tidak bisa disimpan dalam file collection. Buat manual: New → WebSocket Request → `ws://localhost:8080/v1/onboarding/video-call/signal?token=<signaling_token>&role=nasabah`. Lewat ngrok, skemanya `wss://`.",
+      "item": [
+        {
+          "name": "1. Create Session",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('session_id', body.data.session_id);",
+                  "  console.log('session:', body.data.session_id, '| step:', body.data.current_step);",
+                  "} else {",
+                  "  console.error(body.error && body.error.code);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product_type\": \"TAHAPAN_BCA\",\n  \"device_id\": \"device-postman-001\",\n  \"accepted_tnc_version\": \"v1.0\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/sessions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "sessions"
+              ]
+            },
+            "description": "`product_type` yang sah: `TAHAPAN_BCA`, `TAHAPAN_XPRESI`, `TABUNGANKU`. Nilai lain → `ONBOARDING_PRODUCT_UNAVAILABLE`.\n\nSesi berlaku 24 jam."
+          }
+        },
+        {
+          "name": "2. Get Session",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/onboarding/sessions/{{session_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "sessions",
+                "{{session_id}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "3. Process OCR (e-KTP)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('ocr_id', body.data.ocr_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "session_id",
+                  "value": "{{session_id}}",
+                  "type": "text"
+                },
+                {
+                  "key": "ktp_photo",
+                  "type": "file",
+                  "src": []
+                },
+                {
+                  "key": "flash_used",
+                  "value": "false",
+                  "type": "text"
+                },
+                {
+                  "key": "auto_captured",
+                  "value": "true",
+                  "type": "text"
+                },
+                {
+                  "key": "resolution",
+                  "value": "1920x1080",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/ocr",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "ocr"
+              ]
+            },
+            "description": "multipart/form-data. Pilih file apa pun untuk `ktp_photo` — OCR engine-nya mock, isinya tidak dibaca sungguhan. Maksimum 10 MB, rate limit per sesi."
+          }
+        },
+        {
+          "name": "4. Get OCR Result",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/onboarding/ocr/{{session_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "ocr",
+                "{{session_id}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "5. Save Personal Data",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"ocr_id\": \"{{ocr_id}}\",\n  \"personal_data\": {\n    \"nik\": \"3201234567890001\",\n    \"nama_lengkap\": \"CALON NASABAH\",\n    \"tempat_lahir\": \"JAKARTA\",\n    \"tanggal_lahir\": \"1995-05-17\",\n    \"jenis_kelamin\": \"LAKI-LAKI\",\n    \"alamat_ktp\": {\n      \"alamat_lengkap\": \"JL MERDEKA NO 10\",\n      \"rt_rw\": \"003/005\",\n      \"kode_pos\": \"12345\",\n      \"kelurahan\": \"MENTENG\",\n      \"kecamatan\": \"MENTENG\",\n      \"kota\": \"JAKARTA PUSAT\",\n      \"provinsi\": \"DKI JAKARTA\"\n    },\n    \"alamat_domisili_sama\": true,\n    \"pekerjaan\": \"KARYAWAN SWASTA\",\n    \"penghasilan_per_bulan\": \"5-10JT\",\n    \"sumber_dana_utama\": \"GAJI\",\n    \"nomor_hp\": \"081233334444\",\n    \"email\": \"calon@example.com\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/personal-data",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "personal-data"
+              ]
+            },
+            "description": "Memicu pengiriman OTP ke `nomor_hp`. Kode OTP-nya muncul di log server (SMS gateway-nya mock)."
+          }
+        },
+        {
+          "name": "6. Verify OTP",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"otp_code\": \"123456\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/verify-otp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "verify-otp"
+              ]
+            }
+          }
+        },
+        {
+          "name": "6b. Resend OTP",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/resend-otp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "resend-otp"
+              ]
+            }
+          }
+        },
+        {
+          "name": "7. Biometric (selfie + liveness)",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "session_id",
+                  "value": "{{session_id}}",
+                  "type": "text"
+                },
+                {
+                  "key": "face_photo",
+                  "type": "file",
+                  "src": []
+                },
+                {
+                  "key": "liveness_frames",
+                  "type": "file",
+                  "src": []
+                },
+                {
+                  "key": "challenge_type",
+                  "value": "BLINK",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/biometric",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "biometric"
+              ]
+            },
+            "description": "Maksimum 50 MB. `liveness_frames` boleh diisi beberapa file sekaligus."
+          }
+        },
+        {
+          "name": "8. Join Video Call Queue",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('queue_id', body.data.queue_id);",
+                  "  console.log('antrean:', body.data.queue_number, '| posisi:', body.data.position);",
+                  "  console.log('signaling URL:', body.data.signaling_url);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/video-call/queue",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "video-call",
+                "queue"
+              ]
+            },
+            "description": "Respons memuat `signaling_url` lengkap dengan token — itulah URL yang dipakai untuk WebSocket request. Host-nya mengikuti `SIGNALING_BASE_URL`, jadi setel env itu ke `wss://<subdomain>.ngrok-free.app` saat pakai tunnel."
+          }
+        },
+        {
+          "name": "9. Get Encryption Public Key",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/onboarding/credentials/public-key",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "credentials",
+                "public-key"
+              ]
+            }
+          }
+        },
+        {
+          "name": "10. Set Credentials",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Access code dan PIN memakai skema enkripsi yang sama dengan login.",
+                  "const base = pm.environment.get('base_url') || pm.collectionVariables.get('base_url');",
+                  "",
+                  "function enc(value, cb) {",
+                  "  pm.sendRequest({",
+                  "    url: base + '/dev/encrypt-pin',",
+                  "    method: 'POST',",
+                  "    header: { 'Content-Type': 'application/json' },",
+                  "    body: { mode: 'raw', raw: JSON.stringify({ pin: value }) }",
+                  "  }, function (err, res) {",
+                  "    if (err || res.code !== 200) { console.error('encrypt gagal'); return; }",
+                  "    cb(res.json().data.pin_encrypted);",
+                  "  });",
+                  "}",
+                  "",
+                  "enc('824671', function (accessEnc) {",
+                  "  pm.variables.set('access_code_encrypted', accessEnc);",
+                  "  enc('517392', function (pinEnc) {",
+                  "    pm.variables.set('pin_encrypted', pinEnc);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"access_code_encrypted\": \"{{access_code_encrypted}}\",\n  \"pin_encrypted\": \"{{pin_encrypted}}\",\n  \"encryption_key_id\": \"pin-key-v1\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/credentials",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "credentials"
+              ]
+            },
+            "description": "Access code dan PIN tidak boleh sama, dan keduanya ditolak kalau terlalu lemah (berurutan atau angka berulang)."
+          }
+        },
+        {
+          "name": "11. Submit",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{$guid}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"agreement_accepted\": true,\n  \"agreement_version\": \"v1.0\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/submit",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "submit"
+              ]
+            },
+            "description": "Langkah terakhir: membuat rekening lewat core banking stub. Idempoten — kirim ulang dengan key yang sama mengembalikan rekening yang sama, bukan rekening kedua."
+          }
+        },
+        {
+          "name": "Cancel Session",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/onboarding/sessions/{{session_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "sessions",
+                "{{session_id}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Onboarding — Internal (CS)",
+      "description": "Dipanggil backend CS, bukan aplikasi nasabah. Autentikasinya header `X-Internal-API-Key`, bukan Bearer token.",
+      "item": [
+        {
+          "name": "Submit Video Call Result",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"queue_id\": \"{{queue_id}}\",\n  \"agent_employee_id\": \"CS-001\",\n  \"result\": \"APPROVED\",\n  \"ktp_shown_live\": true,\n  \"identity_confirmed\": true,\n  \"notes\": \"Identitas sesuai\",\n  \"call_duration_seconds\": 180,\n  \"recording_id\": \"rec-001\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/video-call/result",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "video-call",
+                "result"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Audit Trail",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/onboarding/sessions/{{session_id}}/audit",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "sessions",
+                "{{session_id}}",
+                "audit"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Monitoring",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/onboarding/monitoring",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "monitoring"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -83,12 +84,18 @@ func (r *AccountRepo) FindByAccountNumber(ctx context.Context, accountNumber str
 
 // ProfileRepo provides user profile data with PII decryption at repository layer.
 type ProfileRepo struct {
-	pool   *pgxpool.Pool
-	piiKey []byte // AES-256-GCM key for PII decryption
+	pool          *pgxpool.Pool
+	piiPassphrase string // pgcrypto passphrase for pgp_sym_encrypt/decrypt
 }
 
+// NewProfileRepo takes the raw PII key and holds it hex-encoded.
+//
+// pgp_sym_encrypt's key parameter is TEXT, and pgx sends text as UTF-8. The
+// raw 32 bytes are arbitrary binary — any byte ≥ 0x80 makes Postgres reject
+// the whole statement with SQLSTATE 22021, so this must be the hex form.
+// Whatever writes these columns (the API, the seeder) has to agree on it.
 func NewProfileRepo(pool *pgxpool.Pool, piiKey []byte) *ProfileRepo {
-	return &ProfileRepo{pool: pool, piiKey: piiKey}
+	return &ProfileRepo{pool: pool, piiPassphrase: hex.EncodeToString(piiKey)}
 }
 
 // FindProfile returns the user profile with decrypted PII fields.
@@ -104,7 +111,7 @@ func (r *ProfileRepo) FindProfile(ctx context.Context, userID uuid.UUID) (*accou
 
 	var profile account.UserProfile
 	var phone, email string
-	err := r.pool.QueryRow(ctx, query, userID, string(r.piiKey)).Scan(
+	err := r.pool.QueryRow(ctx, query, userID, r.piiPassphrase).Scan(
 		&profile.ID, &profile.FullName, &profile.DisplayName,
 		&phone, &email,
 		&profile.LastLoginAt,
@@ -128,7 +135,7 @@ func (r *ProfileRepo) UpdateEmail(ctx context.Context, userID uuid.UUID, email s
 		    updated_at = NOW()
 		WHERE id = $1 AND deleted_at IS NULL`
 
-	tag, err := r.pool.Exec(ctx, query, userID, email, string(r.piiKey))
+	tag, err := r.pool.Exec(ctx, query, userID, email, r.piiPassphrase)
 	if err != nil {
 		return fmt.Errorf("update email: %w", err)
 	}

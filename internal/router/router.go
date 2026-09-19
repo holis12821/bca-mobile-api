@@ -1,6 +1,7 @@
 package router
 
 import (
+	"encoding/hex"
 	"net/http"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/domain/account"
 	"github.com/holis12821/bca-mobile-api/internal/domain/auth"
 	"github.com/holis12821/bca-mobile-api/internal/domain/ewallet"
+	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
 	"github.com/holis12821/bca-mobile-api/internal/domain/qris"
 	"github.com/holis12821/bca-mobile-api/internal/domain/registration"
 	"github.com/holis12821/bca-mobile-api/internal/domain/transaction"
@@ -23,6 +25,7 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/pkg/idempotency"
 	"github.com/holis12821/bca-mobile-api/internal/repository/postgres"
 	redisrepo "github.com/holis12821/bca-mobile-api/internal/repository/redis"
+	ws "github.com/holis12821/bca-mobile-api/internal/websocket"
 )
 
 type Deps struct {
@@ -42,7 +45,7 @@ func New(deps Deps) http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recovery)
 	r.Use(middleware.SecurityHeaders)
-	r.Use(middleware.CORS())
+	r.Use(middleware.CORS(corsOrigins(deps.Config)))
 	r.Use(middleware.Logging)
 
 	// Handlers
@@ -204,6 +207,121 @@ func New(deps Deps) http.Handler {
 		PINKeys:    deps.PINKeys,
 	})
 
+	// Onboarding dependencies
+	onboardingSessionRepo := postgres.NewOnboardingSessionRepo(deps.DB)
+	onboardingAuditRepo := postgres.NewOnboardingAuditRepo(deps.DB)
+	onboardingOCRRepo := postgres.NewOnboardingOCRResultRepo(deps.DB)
+	onboardingCache := redisrepo.NewOnboardingSessionCache(deps.RedisCache)
+	ocrRateLimiter := redisrepo.NewOCRRateLimiter(deps.RedisSession)
+
+	onboardingSessionService := onboarding.NewSessionService(onboarding.SessionServiceConfig{
+		Sessions: onboardingSessionRepo,
+		Cache:    onboardingCache,
+		Audit:    onboardingAuditRepo,
+	})
+
+	var piiAES *crypto.AES
+	if len(deps.PIIKey) > 0 {
+		var aesErr error
+		piiAES, aesErr = crypto.NewAES(hex.EncodeToString(deps.PIIKey))
+		if aesErr != nil {
+			panic("invalid PII AES key: " + aesErr.Error())
+		}
+	}
+
+	ocrService := onboarding.NewOCRService(onboarding.OCRServiceConfig{
+		Sessions:    onboardingSessionRepo,
+		Cache:       onboardingCache,
+		OCRResults:  onboardingOCRRepo,
+		OCREngine:   onboarding.NewMockOCREngine(),
+		Dukcapil:    onboarding.NewMockDukcapilClient(),
+		Storage:     onboarding.NewMockObjectStorage(),
+		RateLimiter: ocrRateLimiter,
+		AES:         piiAES,
+		Audit:       onboardingAuditRepo,
+	})
+
+	onboardingPersonalDataRepo := postgres.NewOnboardingPersonalDataRepo(deps.DB)
+	onboardingOTPCache := redisrepo.NewOnboardingOTPCache(deps.RedisSession)
+
+	personalDataService := onboarding.NewPersonalDataService(onboarding.PersonalDataServiceConfig{
+		Sessions:     onboardingSessionRepo,
+		Cache:        onboardingCache,
+		OCRResults:   onboardingOCRRepo,
+		PersonalData: onboardingPersonalDataRepo,
+		OTPCache:     onboardingOTPCache,
+		SMS:          onboarding.NewMockSMSGateway(),
+		AES:          piiAES,
+		Audit:        onboardingAuditRepo,
+	})
+
+	onboardingBiometricRepo := postgres.NewOnboardingBiometricRepo(deps.DB)
+	bioRateLimiter := redisrepo.NewBiometricRateLimiter(deps.RedisSession)
+
+	biometricService := onboarding.NewBiometricService(onboarding.BiometricServiceConfig{
+		Sessions:    onboardingSessionRepo,
+		Cache:       onboardingCache,
+		OCRResults:  onboardingOCRRepo,
+		Biometrics:  onboardingBiometricRepo,
+		Engine:      onboarding.NewMockBiometricEngine(),
+		Storage:     onboarding.NewMockObjectStorage(),
+		RateLimiter: bioRateLimiter,
+		AES:         piiAES,
+		Audit:       onboardingAuditRepo,
+	})
+
+	onboardingVideoCallRepo := postgres.NewOnboardingVideoCallRepo(deps.DB)
+	videoCallQueueCache := redisrepo.NewVideoCallQueueCache(deps.RedisSession)
+
+	sigBaseURL := "ws://localhost:8080"
+	if deps.Config != nil && deps.Config.SignalingBaseURL != "" {
+		sigBaseURL = deps.Config.SignalingBaseURL
+	}
+
+	videoCallService := onboarding.NewVideoCallService(onboarding.VideoCallServiceConfig{
+		Sessions:        onboardingSessionRepo,
+		Cache:           onboardingCache,
+		VideoCalls:      onboardingVideoCallRepo,
+		QueueCache:      videoCallQueueCache,
+		JWTManager:      deps.JWTManager,
+		Audit:           onboardingAuditRepo,
+		SignalingBaseURL: sigBaseURL,
+	})
+
+	onboardingCredentialRepo := postgres.NewOnboardingCredentialRepo(deps.DB)
+
+	credentialService := onboarding.NewCredentialService(onboarding.CredentialServiceConfig{
+		Sessions:    onboardingSessionRepo,
+		Cache:       onboardingCache,
+		Credentials: onboardingCredentialRepo,
+		PINKeys:     deps.PINKeys,
+		Audit:       onboardingAuditRepo,
+	})
+
+	onboardingIdemCache := redisrepo.NewOnboardingIdempotencyCache(deps.RedisSession)
+
+	submitService := onboarding.NewSubmitService(onboarding.SubmitServiceConfig{
+		Sessions:     onboardingSessionRepo,
+		Cache:        onboardingCache,
+		PersonalData: onboardingPersonalDataRepo,
+		Credentials:  onboardingCredentialRepo,
+		CoreBanking:  onboarding.NewMockCoreBankingClient(),
+		Idempotency:  onboardingIdemCache,
+		AES:          piiAES,
+		Audit:        onboardingAuditRepo,
+	})
+
+	monitoringService := onboarding.NewMonitoringService(onboarding.MonitoringServiceConfig{
+		Sessions:   onboardingSessionRepo,
+		Audit:      onboardingAuditRepo,
+		QueueCache: videoCallQueueCache,
+	})
+
+	sigHub := ws.NewHub()
+	signalingH := handler.NewSignalingHandler(sigHub, deps.JWTManager)
+
+	onboardingH := handler.NewOnboardingHandler(onboardingSessionService, ocrService, personalDataService, biometricService, videoCallService, credentialService, submitService, monitoringService, deps.PINKeys)
+
 	uploadDir := "uploads"
 	if deps.Config != nil && deps.Config.UploadDir != "" {
 		uploadDir = deps.Config.UploadDir
@@ -215,11 +333,53 @@ func New(deps Deps) http.Handler {
 		r.Get("/health/live", healthH.Liveness)
 		r.Get("/health/config", healthH.Config)
 
+		// Development-only helpers (Postman / frontend integration).
+		// Absent in any other APP_ENV — the route simply does not exist,
+		// so a production deployment answers 404 through NotFound.
+		if appEnv(deps.Config) == "development" {
+			devH := handler.NewDevHandler(deps.PINKeys)
+			r.Get("/dev/pin-public-key", devH.PINPublicKey)
+			r.Post("/dev/encrypt-pin", devH.EncryptPIN)
+		}
+
 		// Public auth endpoints
 		r.Post("/auth/login/pin", authH.LoginPIN)
 		r.Post("/auth/login/biometric", authH.BiometricLogin)
 		r.Post("/auth/biometric/challenge", authH.BiometricChallenge)
 		r.Post("/auth/token/refresh", authH.RefreshToken)
+
+		// Onboarding — buka rekening
+		r.Route("/onboarding", func(r chi.Router) {
+			r.Use(middleware.OnboardingAudit)
+
+			// Public endpoints for nasabah
+			r.Post("/sessions", onboardingH.CreateSession)
+			r.Get("/sessions/{session_id}", onboardingH.GetSession)
+			r.Delete("/sessions/{session_id}", onboardingH.CancelSession)
+			r.Post("/ocr", onboardingH.ProcessOCR)
+			r.Get("/ocr/{session_id}", onboardingH.GetOCRResult)
+			r.Post("/personal-data", onboardingH.SavePersonalData)
+			r.Post("/verify-otp", onboardingH.VerifyOTP)
+			r.Post("/resend-otp", onboardingH.ResendOTP)
+			r.Post("/biometric", onboardingH.ProcessBiometric)
+			r.Post("/video-call/queue", onboardingH.JoinVideoCallQueue)
+			r.Get("/video-call/signal", signalingH.HandleSignaling)
+			r.Get("/credentials/public-key", onboardingH.GetEncryptionPublicKey)
+			r.Post("/credentials", onboardingH.SetCredentials)
+			r.Post("/submit", onboardingH.Submit)
+
+			// Internal endpoints (CS backend, monitoring)
+			internalAPIKey := "dev-internal-key"
+			if deps.Config != nil && deps.Config.InternalAPIKey != "" {
+				internalAPIKey = deps.Config.InternalAPIKey
+			}
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.InternalAPIKey(internalAPIKey))
+				r.Post("/video-call/result", onboardingH.SubmitVideoCallResult)
+				r.Get("/sessions/{session_id}/audit", onboardingH.GetAuditTrail)
+				r.Get("/monitoring", onboardingH.GetMonitoringStatus)
+			})
+		})
 
 		// Registration (public endpoints)
 		r.Post("/registration/initiate", regH.Initiate)
@@ -286,4 +446,23 @@ func New(deps Deps) http.Handler {
 	})
 
 	return r
+}
+
+// appEnv defaults to development so tests that pass a nil Config keep the
+// permissive local behaviour. Every real deployment sets APP_ENV explicitly.
+func appEnv(cfg *config.Config) string {
+	if cfg == nil || cfg.App.Env == "" {
+		return "development"
+	}
+	return cfg.App.Env
+}
+
+// corsOrigins is empty by default: this is a mobile-first API and no browser
+// origin is trusted unless CORS_ALLOWED_ORIGINS names it. A web frontend
+// (or a tunnelled dev build) has to be listed explicitly.
+func corsOrigins(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.CORSAllowedOrigins
 }

@@ -44,6 +44,39 @@ func LoadRSAKeyPair(privatePath, publicPath string) (*RSAKeyPair, error) {
 	return ParseRSAKeyPair(privPEM, pubPEM)
 }
 
+// LoadRSAPublicKey reads only the public half from disk. Encrypting a PIN
+// needs nothing else, so a client-side tool never has to open the private key.
+func LoadRSAPublicKey(publicPath string) (*RSAKeyPair, error) {
+	pubPEM, err := os.ReadFile(publicPath)
+	if err != nil {
+		return nil, fmt.Errorf("read public key: %w", err)
+	}
+
+	return ParseRSAPublicKey(pubPEM)
+}
+
+// ParseRSAPublicKey parses a PEM-encoded RSA public key into a pair whose
+// PrivateKey is nil. EncryptPIN works; DecryptPIN will panic — by design,
+// since a holder of the public key has no business decrypting.
+func ParseRSAPublicKey(pubPEM []byte) (*RSAKeyPair, error) {
+	pubBlock, _ := pem.Decode(pubPEM)
+	if pubBlock == nil {
+		return nil, fmt.Errorf("no PEM block found in public key")
+	}
+
+	pubIface, err := x509.ParsePKIXPublicKey(pubBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse public key: %w", err)
+	}
+
+	pubKey, ok := pubIface.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("public key is not RSA")
+	}
+
+	return &RSAKeyPair{PublicKey: pubKey}, nil
+}
+
 // ParseRSAKeyPair parses PEM-encoded RSA key pair.
 func ParseRSAKeyPair(privPEM, pubPEM []byte) (*RSAKeyPair, error) {
 	privBlock, _ := pem.Decode(privPEM)
@@ -139,6 +172,18 @@ type NonceChecker interface {
 	// CheckAndMark returns true if the nonce was NOT seen before (fresh).
 	// It atomically marks the nonce as used.
 	CheckAndMark(nonce string) (fresh bool, err error)
+}
+
+// PublicKeyPEM returns the RSA public key in PEM-encoded PKIX format.
+func (kp *RSAKeyPair) PublicKeyPEM() ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(kp.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("marshal public key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: der,
+	}), nil
 }
 
 // MaxPINTimestampSkew is the maximum allowed clock skew for PIN payloads.

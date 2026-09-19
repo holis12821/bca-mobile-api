@@ -1,4 +1,4 @@
-.PHONY: help setup keys dev run build infra-up infra-down infra-reset \
+.PHONY: help setup keys dev run build pin tunnel infra-up infra-down infra-reset \
         migrate-create migrate-up migrate-down migrate-status verify-009 ledger-check \
         seed test test-verbose test-coverage test-concurrent lint vet check \
         docker-build prod-migrate prod-up prod-down prod-logs backup clean
@@ -43,6 +43,19 @@ run: ## Run server without hot reload
 
 build: ## Build production binary
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/server ./cmd/server
+
+pin: ## Encrypt a PIN for manual API calls — usage: make pin PIN=123456
+	@go run ./scripts/pinenc -pin $(or $(PIN),123456)
+
+tunnel: ## Public HTTPS URL for the local server — make tunnel [DOMAIN=your.ngrok-free.app]
+	@command -v ngrok >/dev/null || { echo "ngrok is not installed: brew install ngrok"; exit 1; }
+	@echo "Once the URL appears: set SIGNALING_BASE_URL=wss://<host> in .env, then restart the server."
+	@echo "A free static domain (ngrok dashboard) keeps that URL stable across restarts."
+ifdef DOMAIN
+	ngrok http --url=https://$(DOMAIN) 8080
+else
+	ngrok http 8080
+endif
 
 # === Infrastructure ===
 

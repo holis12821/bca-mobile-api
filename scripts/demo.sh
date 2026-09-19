@@ -45,6 +45,25 @@ yellow "=== BCA Mobile API Demo ==="
 yellow "Base URL: $BASE"
 echo ""
 
+# The API never accepts a plaintext PIN: it wants base64 of
+# RSA-OAEP-SHA256({"pin","nonce","ts"}), single-use and valid for 60 seconds.
+# /dev/encrypt-pin produces one, and exists only when APP_ENV=development.
+encrypt_pin() {
+  local pin="$1" resp
+  resp=$(curl -s -X POST "$BASE/dev/encrypt-pin" \
+    -H "Content-Type: application/json" \
+    -d "{\"pin\": \"$pin\"}")
+
+  local enc
+  enc=$(echo "$resp" | jq -r '.data.pin_encrypted // empty' 2>/dev/null || echo "")
+  if [ -z "$enc" ]; then
+    red "  Cannot encrypt PIN. Is the server running with APP_ENV=development?"
+    echo "  Response: $resp"
+    exit 1
+  fi
+  echo "$enc"
+}
+
 # -----------------------------------------------------------
 # 1. Health check
 # -----------------------------------------------------------
@@ -58,10 +77,10 @@ check "GET /health" "200" "$HTTP_CODE"
 yellow "2. Login with PIN"
 LOGIN_RESP=$(curl -s -X POST "$BASE/auth/login/pin" \
   -H "Content-Type: application/json" \
-  -d '{
-    "device_id": "device-nurholis-001",
-    "pin_encrypted": "dev_bypass:123456"
-  }')
+  -d "{
+    \"device_id\": \"device-nurholis-001\",
+    \"pin_encrypted\": \"$(encrypt_pin 123456)\"
+  }")
 HTTP_CODE=$(echo "$LOGIN_RESP" | jq -r '.status // empty' 2>/dev/null || echo "error")
 check "POST /auth/login/pin status" "success" "$HTTP_CODE"
 
@@ -145,7 +164,7 @@ check_contains "POST /ewallet/inquiry" "inquiry_id" "$INQUIRY_RESP"
 # -----------------------------------------------------------
 yellow "11. QRIS decode"
 # Minimal valid EMVCo TLV payload
-QR_DATA="00020101021226280014ID.CO.BCA.WWW01041234520400005303360540850000.005802ID5913TOKO SEJAHTERA6007JAKARTA6304A13B"
+QR_DATA="00020101021226250013ID.CO.BCA.WWW01041234520458125303360540850000.005802ID5914TOKO SEJAHTERA6007JAKARTA6304A13B"
 QRIS_RESP=$(curl -s -X POST "$BASE/qris/decode" \
   -H "$AUTH" -H "Content-Type: application/json" \
   -d "{\"qr_data\": \"$QR_DATA\"}")
@@ -157,10 +176,10 @@ check_contains "POST /qris/decode" "merchant_name" "$QRIS_RESP"
 yellow "12. Login with wrong PIN (error path)"
 WRONG_RESP=$(curl -s -X POST "$BASE/auth/login/pin" \
   -H "Content-Type: application/json" \
-  -d '{
-    "device_id": "device-nurholis-001",
-    "pin_encrypted": "dev_bypass:000000"
-  }')
+  -d "{
+    \"device_id\": \"device-nurholis-001\",
+    \"pin_encrypted\": \"$(encrypt_pin 000000)\"
+  }")
 check_contains "POST /auth/login/pin (wrong)" "AUTH_INVALID_PIN" "$WRONG_RESP"
 
 # -----------------------------------------------------------

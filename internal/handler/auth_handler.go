@@ -333,11 +333,15 @@ func extractBearerToken(r *http.Request) string {
 func extractIP(r *http.Request) string {
 	// Check X-Forwarded-For first (behind reverse proxy)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP (client IP)
-		if ip, _, err := net.SplitHostPort(xff); err == nil {
-			return ip
+		// Take the first IP (client IP) — may be comma-separated
+		if idx := strings.IndexByte(xff, ','); idx != -1 {
+			xff = xff[:idx]
 		}
-		return xff
+		return strings.TrimSpace(xff)
+	}
+	// Check X-Real-IP
+	if xri := r.Header.Get("X-Real-Ip"); xri != "" {
+		return strings.TrimSpace(xri)
 	}
 	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return ip

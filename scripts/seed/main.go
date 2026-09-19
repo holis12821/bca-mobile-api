@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,6 +19,8 @@ import (
 )
 
 func main() {
+	loadEnvFile(".env")
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://bcamobile:localdev_password_123@localhost:5432/bcamobile?sslmode=disable"
@@ -36,6 +40,82 @@ func main() {
 	seed(ctx, pool)
 
 	log.Println("seed complete!")
+}
+
+// loadEnvFile mirrors cmd/server: the seed must encrypt PII with the same
+// AES_KEY and hash lookups with the same LOOKUP_HMAC_SECRET the API uses, or
+// the rows it writes are unreadable to /account/profile.
+func loadEnvFile(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
+}
+
+// piiPassphrase is what pgp_sym_encrypt/pgp_sym_decrypt take as their key.
+// It must be byte-identical to what ProfileRepo passes, or the API reads back
+// rows it cannot decrypt: the hex text of AES_KEY, normalised to lower case
+// exactly the way hex.EncodeToString emits it.
+func piiPassphrase() string {
+	hexKey := os.Getenv("AES_KEY")
+	if hexKey == "" {
+		log.Fatal("AES_KEY not set — copy .env.example to .env first")
+	}
+
+	raw, err := hex.DecodeString(hexKey)
+	if err != nil {
+		log.Fatalf("AES_KEY is not valid hex: %v", err)
+	}
+	if len(raw) != 32 {
+		log.Fatalf("AES_KEY must be 32 bytes (64 hex chars), got %d", len(raw))
+	}
+
+	return hex.EncodeToString(raw)
+}
+
+// stableID derives a deterministic UUID from the row's natural key, so
+// re-running the seeder updates rows instead of piling up duplicates — a
+// random uuid.New() here means every `make seed` doubles the mutation list.
+func stableID(parts ...string) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(strings.Join(parts, "|")))
+}
+
+// displayName is the short, greeting-friendly form: "NURHOLIS MAJID" → "Nurholis".
+func displayName(fullName string) string {
+	first, _, _ := strings.Cut(strings.TrimSpace(fullName), " ")
+	if first == "" {
+		return fullName
+	}
+	return strings.ToUpper(first[:1]) + strings.ToLower(first[1:])
+}
+
+// pinSaltFrom pulls the salt segment out of an Argon2id encoded hash
+// ($argon2id$v=19$m=..,t=..,p=..$<salt>$<hash>). The column is legacy — the
+// encoded hash already carries its own salt and VerifyPassword reads only that
+// — but it is NOT NULL, so it needs a truthful value rather than a placeholder.
+func pinSaltFrom(encoded string) string {
+	parts := strings.Split(encoded, "$")
+	if len(parts) < 5 {
+		return "embedded"
+	}
+	return parts[4]
 }
 
 type seedUser struct {
@@ -128,49 +208,79 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 		},
 	}
 
+	passphrase := piiPassphrase()
+	hasher := crypto.NewHMACHasher(os.Getenv("LOOKUP_HMAC_SECRET"))
+
 	for _, u := range users {
 		pinHash := hashPIN(u.PIN)
 
-		// Insert user (upsert)
+		// Insert user (upsert).
+		// phone/email are stored encrypted (pgp_sym_encrypt, matching
+		// ProfileRepo) with a separate HMAC column for lookups. Never a
+		// plaintext phone_number column — that is what §4 forbids.
 		_, err := pool.Exec(ctx, `
-			INSERT INTO users (id, full_name, pin_hash, phone_number, email, status, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, 'ACTIVE', $6, $6)
+			INSERT INTO users (id, full_name, display_name, pin_hash, pin_salt,
+				phone_encrypted, phone_hash, email_encrypted, email_hash,
+				status, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5,
+				pgp_sym_encrypt($6, $7), $8, pgp_sym_encrypt($9, $7), $10,
+				'ACTIVE', $11, $11)
 			ON CONFLICT (id) DO UPDATE SET
 				full_name = EXCLUDED.full_name,
+				display_name = EXCLUDED.display_name,
 				pin_hash = EXCLUDED.pin_hash,
-				phone_number = EXCLUDED.phone_number,
-				email = EXCLUDED.email,
+				pin_salt = EXCLUDED.pin_salt,
+				phone_encrypted = EXCLUDED.phone_encrypted,
+				phone_hash = EXCLUDED.phone_hash,
+				email_encrypted = EXCLUDED.email_encrypted,
+				email_hash = EXCLUDED.email_hash,
 				updated_at = EXCLUDED.updated_at`,
-			u.ID, u.FullName, pinHash, u.Phone, u.Email, now)
+			u.ID, u.FullName, displayName(u.FullName), pinHash, pinSaltFrom(pinHash),
+			u.Phone, passphrase, hasher.Hash(u.Phone), u.Email, hasher.Hash(u.Email),
+			now)
 		if err != nil {
 			log.Fatalf("insert user %s: %v", u.FullName, err)
 		}
-		log.Printf("  user: %s (PIN: %s)", u.FullName, u.PIN)
+		log.Printf("  user: %s (PIN: %s, device: %s)", u.FullName, u.PIN, u.DeviceID)
 
-		// Insert device
+		// Insert device. No updated_at column here — devices are revoked,
+		// never mutated in place.
 		_, err = pool.Exec(ctx, `
-			INSERT INTO devices (id, user_id, device_id, device_model, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $5)
+			INSERT INTO devices (id, user_id, device_id, device_name, device_model, is_trusted, created_at)
+			VALUES ($1, $2, $3, $4, $4, true, $5)
 			ON CONFLICT DO NOTHING`,
 			uuid.New(), u.ID, u.DeviceID, u.DeviceModel, now)
 		if err != nil {
 			log.Fatalf("insert device for %s: %v", u.FullName, err)
 		}
 
-		// Insert accounts
-		for _, a := range u.Accounts {
-			_, err = pool.Exec(ctx, `
+		// Insert accounts. The first one is the primary — the dashboard
+		// has to have something to lead with.
+		//
+		// The conflict target is account_number, not id: a dev database that
+		// already carries a hand-made row for this number would otherwise
+		// fail the unique constraint on every run. RETURNING id then gives
+		// the row that actually exists, so mutations attach to it rather than
+		// to an id the seeder merely hoped for.
+		for i, a := range u.Accounts {
+			var accountID uuid.UUID
+			err = pool.QueryRow(ctx, `
 				INSERT INTO accounts (id, user_id, account_number, account_type, account_label,
-					balance, currency, status, created_at, updated_at)
-				VALUES ($1, $2, $3, 'SAVINGS', $4, $5, 'IDR', 'ACTIVE', $6, $6)
-				ON CONFLICT (id) DO UPDATE SET
+					balance, currency, status, is_primary, owner_type, created_at, updated_at)
+				VALUES ($1, $2, $3, 'TAHAPAN', $4, $5, 'IDR', 'ACTIVE', $6, 'CUSTOMER', $7, $7)
+				ON CONFLICT (account_number) DO UPDATE SET
+					user_id = EXCLUDED.user_id,
 					balance = EXCLUDED.balance,
 					account_label = EXCLUDED.account_label,
-					updated_at = EXCLUDED.updated_at`,
-				a.ID, u.ID, a.AccountNumber, a.AccountLabel, a.Balance, now)
+					is_primary = EXCLUDED.is_primary,
+					updated_at = EXCLUDED.updated_at
+				RETURNING id`,
+				a.ID, u.ID, a.AccountNumber, a.AccountLabel, a.Balance, i == 0, now,
+			).Scan(&accountID)
 			if err != nil {
 				log.Fatalf("insert account %s: %v", a.AccountNumber, err)
 			}
+			u.Accounts[i].ID = accountID
 			log.Printf("    account: %s (%s) balance: %s", a.AccountNumber, a.AccountLabel, a.Balance.String())
 		}
 
@@ -256,8 +366,8 @@ func seedMutations(ctx context.Context, pool *pgxpool.Pool, user seedUser, now t
 				amount, balance_before, balance_after, description, detail, category,
 				reference_number, transaction_date, transaction_time, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			ON CONFLICT DO NOTHING`,
-			uuid.New(), account.ID, m.Type,
+			ON CONFLICT (id) DO NOTHING`,
+			stableID("mutation", account.ID.String(), refNum, m.Desc), account.ID, m.Type,
 			m.Amount, balBefore, balAfter, m.Desc, m.Detail, m.Category,
 			refNum, dateStr, timeStr, now)
 		if err != nil {
@@ -286,8 +396,8 @@ func seedNotifications(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID
 		_, err := pool.Exec(ctx, `
 			INSERT INTO notifications (id, user_id, title, body, type, is_read, created_at)
 			VALUES ($1, $2, $3, $4, $5, false, $6)
-			ON CONFLICT DO NOTHING`,
-			uuid.New(), userID, n.Title, n.Body, n.Type, createdAt)
+			ON CONFLICT (id) DO NOTHING`,
+			stableID("notification", userID.String(), n.Title), userID, n.Title, n.Body, n.Type, createdAt)
 		if err != nil {
 			log.Printf("  warn: insert notification: %v", err)
 		}
@@ -358,10 +468,10 @@ func seedPromotions(ctx context.Context, pool *pgxpool.Pool, now time.Time) {
 	for _, p := range promos {
 		_, err := pool.Exec(ctx, `
 			INSERT INTO promotions (id, title, description, image_url, is_active,
-				start_date, end_date, created_at)
-			VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7)
-			ON CONFLICT DO NOTHING`,
-			uuid.New(), p.Title, p.Description, p.ImageURL,
+				valid_from, valid_until, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $7)
+			ON CONFLICT (id) DO NOTHING`,
+			stableID("promotion", p.Title), p.Title, p.Description, p.ImageURL,
 			now.AddDate(0, 0, -7), now.AddDate(0, 1, 0), now)
 		if err != nil {
 			log.Printf("  warn: insert promo: %v", err)

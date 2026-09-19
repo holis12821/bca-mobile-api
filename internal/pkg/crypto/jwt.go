@@ -18,6 +18,7 @@ const (
 	TokenTypeAccess       TokenType = "access"
 	TokenTypeRefresh      TokenType = "refresh"
 	TokenTypeRegistration TokenType = "registration"
+	TokenTypeSignaling    TokenType = "signaling"
 
 	RegistrationTokenTTL = 30 * time.Minute
 )
@@ -100,6 +101,21 @@ func (m *JWTManager) GenerateRegistrationToken(registrationID string) (string, e
 			ExpiresAt: jwt.NewNumericDate(now.Add(RegistrationTokenTTL)),
 		},
 		Type: TokenTypeRegistration,
+	})
+}
+
+// GenerateSignalingToken creates a short-lived JWT for WebSocket signaling auth.
+func (m *JWTManager) GenerateSignalingToken(sessionID, queueID string, ttl time.Duration) (string, error) {
+	now := time.Now().UTC()
+	return m.generateToken(Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   sessionID,
+			ID:        uuid.New().String(),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+		},
+		SessionID: queueID,
+		Type:      TokenTypeSignaling,
 	})
 }
 

@@ -15,7 +15,14 @@ type Config struct {
 	PIN           PIN
 	Crypto        Crypto
 	Argon2        Argon2
-	UploadDir     string `env:"UPLOAD_DIR" envDefault:"uploads"`
+	UploadDir          string `env:"UPLOAD_DIR" envDefault:"uploads"`
+	SignalingBaseURL   string `env:"SIGNALING_BASE_URL" envDefault:"ws://localhost:8080"`
+	InternalAPIKey     string `env:"INTERNAL_API_KEY" envDefault:"dev-internal-key"`
+
+	// CORSAllowedOrigins is empty by default: no browser origin is trusted.
+	// Set CORS_ALLOWED_ORIGINS (comma-separated, exact scheme+host+port) only
+	// for the web frontends that must reach this API from a browser.
+	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS" envSeparator:","`
 }
 
 type App struct {

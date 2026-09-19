@@ -2,6 +2,9 @@ keys/
 .env
 .env.*
 !.env.example
+!.env.prod.example
+deployments/uploads/
+uploads/
 bin/
 tmp/
 coverage.out

@@ -1,0 +1,4 @@
+DROP INDEX IF EXISTS idx_onboarding_sessions_completed_cleanup;
+DROP INDEX IF EXISTS idx_onboarding_ocr_auto_delete;
+DROP INDEX IF EXISTS idx_onboarding_biometrics_auto_delete;
+DROP INDEX IF EXISTS idx_onboarding_audit_retention;

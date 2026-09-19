@@ -67,6 +67,28 @@ go test ./... -count=1
 
 Runs through 14 API flows (login, profile, balance, transfers, QRIS, e-wallet, etc.) and reports PASS/FAIL.
 
+### Postman
+
+Import both files from `docs/postman/`, pick the `BCA Mobile — Local` environment, and run **Auth → Login (PIN)** first — it stores the token that every other request uses.
+
+The API never accepts a plaintext PIN (RSA-OAEP-SHA256 over `{pin, nonce, ts}`, valid 60 seconds), and Postman cannot do that padding in a pre-request script. Two ways around it:
+
+```bash
+make pin PIN=123456          # ciphertext for curl / shell
+curl -X POST localhost:8080/v1/dev/encrypt-pin -d '{"pin":"123456"}'
+```
+
+`/v1/dev/*` is mounted only when `APP_ENV=development`; the Postman collection calls it automatically. Full walkthrough: [Postman & ngrok](docs/09-POSTMAN-DAN-NGROK.md).
+
+### Expose to the internet (ngrok)
+
+```bash
+make tunnel                                   # random URL
+make tunnel DOMAIN=your-name.ngrok-free.app   # stable free domain
+```
+
+Then set `SIGNALING_BASE_URL=wss://<host>` in `.env` and restart, or WebSocket signaling will hand clients a `localhost` URL. A web frontend also needs its origin in `CORS_ALLOWED_ORIGINS` — the default trusts no browser origin at all.
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -116,6 +138,10 @@ See `internal/config/config.go` for all supported variables. Key ones:
 | `PIN_PUBLIC_KEY_PATH` | (required) | RSA public key for PIN encryption |
 | `AES_KEY` | (required) | Hex-encoded 32-byte key for PII encryption |
 | `UPLOAD_DIR` | `uploads` | Directory for document uploads |
+| `APP_ENV` | `development` | `development` also mounts `/v1/dev/*` helpers |
+| `SIGNALING_BASE_URL` | `ws://localhost:8080` | Host handed to clients in `signaling_url` |
+| `CORS_ALLOWED_ORIGINS` | (empty) | Comma-separated browser origins; empty trusts none |
+| `INTERNAL_API_KEY` | `dev-internal-key` | `X-Internal-API-Key` for the CS endpoints |
 
 ## Documentation
 
@@ -126,3 +152,4 @@ See `internal/config/config.go` for all supported variables. Key ones:
 - [Security](docs/05-SECURITY.md)
 - [Testing Strategy](docs/06-TESTING-STRATEGY.md)
 - [Setup Runbook](docs/07-SETUP-RUNBOOK.md)
+- [Postman & ngrok](docs/09-POSTMAN-DAN-NGROK.md)
