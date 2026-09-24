@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -19,11 +20,38 @@ import (
 )
 
 const (
-	otpLength    = 6
-	otpTTL       = 5 * time.Minute
-	otpMaxFail   = 5
-	otpRegenAt   = 3  // regenerate OTP after this many failures
+	otpLength  = 6
+	otpTTL     = 5 * time.Minute
+	otpMaxFail = 5
+	otpRegenAt = 3 // regenerate OTP after this many failures
+	// otpBlockTime is how long a session is locked out after otpMaxFail
+	// failures, and also how long the failure counter itself lives: a shorter
+	// counter window would let an attacker reset their budget simply by
+	// pausing, which defeats the lockout.
 	otpBlockTime = 30 * time.Minute
+	// otpMaxResend is the nasabah's resend quota per hour per session.
+	//
+	// Three policy decisions sit behind this number, none of them derivable
+	// from the counters alone (spec §10a records them too):
+	//
+	//  1. The failure lockout is the only limiter on verify-otp. There is no
+	//     separate 5-per-5-minutes window: the fifth wrong code blocks the
+	//     session for otpBlockTime, which is strictly tighter, and a second
+	//     limiter with the same numbers would only make the reason for a 429
+	//     ambiguous.
+	//  2. Automatic regeneration after otpRegenAt failures does NOT spend
+	//     this quota. The nasabah did not ask for that SMS, and charging them
+	//     for it would mean three wrong guesses silently cost a resend.
+	//  3. A resend does NOT reset the failure counter. If it did, three
+	//     resends would buy twelve guesses without ever reaching the lockout.
+	otpMaxResend int64 = 3
+)
+
+// What put an OTP_SENT row in the audit trail. Never the code itself.
+const (
+	otpTriggerPersonalData = "personal_data"
+	otpTriggerResend       = "resend"
+	otpTriggerRegenerated  = "regenerated_after_failures"
 )
 
 var (
@@ -37,9 +65,12 @@ type PersonalDataService struct {
 	ocrResults   OCRResultRepository
 	personalData PersonalDataRepository
 	otpCache     OTPCache
-	sms          SMSGateway
-	aes          *crypto.AES
-	audit        AuditRepository
+	// devMode mirrors APP_ENV=development and is the only thing that lets an
+	// OTP leave the process in a response body.
+	devMode bool
+	sms     SMSGateway
+	aes     *crypto.AES
+	audit   AuditRepository
 }
 
 type PersonalDataServiceConfig struct {
@@ -48,6 +79,7 @@ type PersonalDataServiceConfig struct {
 	OCRResults   OCRResultRepository
 	PersonalData PersonalDataRepository
 	OTPCache     OTPCache
+	DevMode      bool
 	SMS          SMSGateway
 	AES          *crypto.AES
 	Audit        AuditRepository
@@ -60,6 +92,7 @@ func NewPersonalDataService(cfg PersonalDataServiceConfig) *PersonalDataService 
 		ocrResults:   cfg.OCRResults,
 		personalData: cfg.PersonalData,
 		otpCache:     cfg.OTPCache,
+		devMode:      cfg.DevMode,
 		sms:          cfg.SMS,
 		aes:          cfg.AES,
 		audit:        cfg.Audit,
@@ -180,7 +213,11 @@ func (s *PersonalDataService) SavePersonalData(ctx context.Context, req SavePers
 		}
 	} else {
 		// Create new record
-		pdID = "pd_" + generateShortID()
+		shortID, idErr := generateShortID()
+		if idErr != nil {
+			return nil, fmt.Errorf("generate personal data id: %w", idErr)
+		}
+		pdID = "pd_" + shortID
 		personalData := &PersonalData{
 			ID:                  uuid.New(),
 			PersonalDataID:      pdID,
@@ -217,10 +254,19 @@ func (s *PersonalDataService) SavePersonalData(ctx context.Context, req SavePers
 		return nil, fmt.Errorf("store otp: %w", err)
 	}
 
-	if err := s.sms.SendOTP(ctx, pd.NomorHP, otp); err != nil {
-		slog.Error("send otp sms failed", "error", err)
-		// Don't fail the request — OTP is stored, client can request resend
+	// A fresh code deserves a fresh budget on both counters: the failures
+	// belonged to whatever OTP came before, and the hourly resend quota is
+	// measured from the first resend of this step, not from an earlier one.
+	if resetErr := s.otpCache.ResetAttempts(ctx, req.SessionID); resetErr != nil {
+		slog.Error("reset otp attempts failed", "session_id", req.SessionID, "error", resetErr)
 	}
+	if resetErr := s.otpCache.ResetResend(ctx, req.SessionID); resetErr != nil {
+		slog.Error("reset otp resend quota failed", "session_id", req.SessionID, "error", resetErr)
+	}
+
+	// SMS goes out only after the hash is stored, so a storage failure never
+	// leaves a code in the nasabah's inbox that the server cannot verify.
+	sendErr := s.sms.SendOTP(ctx, pd.NomorHP, otp)
 
 	// 8. Transition step: PERSONAL_DATA → OTP_VERIFY
 	completed := session.StepsCompleted
@@ -232,7 +278,6 @@ func (s *PersonalDataService) SavePersonalData(ctx context.Context, req SavePers
 	if s.cache != nil {
 		session.CurrentStep = StepOTPVerify
 		session.StepsCompleted = completed
-		session.ExpiresAt = time.Now().Add(sessionTTL)
 		if cacheErr := s.cache.Store(ctx, session); cacheErr != nil {
 			slog.Error("cache step update failed", "error", cacheErr)
 		}
@@ -244,23 +289,43 @@ func (s *PersonalDataService) SavePersonalData(ctx context.Context, req SavePers
 	}, ipAddress, userAgent)
 	s.writeAudit(ctx, req.SessionID, AuditOTPSent, "system", map[string]any{
 		"phone_masked": maskPhone(pd.NomorHP),
+		"reason":       otpTriggerPersonalData,
+		"delivered":    sendErr == nil,
 	}, ipAddress, userAgent)
 
-	return &SavePersonalDataResponse{
+	// The step has already advanced and the code is stored and valid, so the
+	// nasabah can recover with resend-otp. What they must not get is a 200
+	// with an otp_expires_at for an SMS that was never handed over.
+	if sendErr != nil {
+		slog.Error("send otp sms failed", "session_id", req.SessionID, "error", sendErr)
+		return nil, apperr.OTPDeliveryFailed
+	}
+
+	resp := &SavePersonalDataResponse{
 		PersonalDataID: pdID,
 		OTPSentTo:      maskPhone(pd.NomorHP),
 		OTPExpiresAt:   expiresAt,
 		CurrentStep:    StepOTPVerify,
-	}, nil
+	}
+	if s.devMode {
+		resp.OTPDebug = otp
+	}
+	return resp, nil
 }
 
 // VerifyOTP verifies the OTP code for a session.
 func (s *PersonalDataService) VerifyOTP(ctx context.Context, req VerifyOTPRequest, ipAddress, userAgent string) (*VerifyOTPResponse, error) {
-	// 1. Resolve session and validate step
+	// 1. Resolve session (also rejects an expired one) and confirm the device
+	//    asking is the device that started the flow.
 	session, err := s.resolveSession(ctx, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
+	if err := assertDeviceOwnsSession(session, req.DeviceID); err != nil {
+		return nil, err
+	}
+
+	// 2. Validate step
 	if session.CurrentStep != StepOTPVerify {
 		return nil, apperr.Error{
 			Status:  422,
@@ -269,27 +334,37 @@ func (s *PersonalDataService) VerifyOTP(ctx context.Context, req VerifyOTPReques
 		}
 	}
 
-	// 2. Check if blocked
+	// 3. Check if blocked. A blocked session's attempt is rejected before it
+	//    reaches the counter, so hammering the endpoint cannot extend the
+	//    lockout past the 30 minutes it was set for.
 	blocked, err := s.otpCache.IsBlocked(ctx, req.SessionID)
 	if err != nil {
 		return nil, fmt.Errorf("check otp block: %w", err)
 	}
 	if blocked {
+		s.writeAudit(ctx, req.SessionID, AuditOTPFailed, "nasabah:"+session.DeviceID, map[string]any{
+			"reason": "blocked",
+		}, ipAddress, userAgent)
 		return nil, s.otpBlockedError(ctx, req.SessionID)
 	}
 
-	// 3. Get stored OTP hash
+	// 4. Get stored OTP hash
 	storedHash, err := s.otpCache.GetOTP(ctx, req.SessionID)
 	if err != nil {
 		return nil, fmt.Errorf("get otp: %w", err)
 	}
 	if storedHash == "" {
+		s.writeAudit(ctx, req.SessionID, AuditOTPFailed, "nasabah:"+session.DeviceID, map[string]any{
+			"reason": "expired",
+		}, ipAddress, userAgent)
 		return nil, apperr.OTPExpired
 	}
 
-	// 4. Compare
+	// 5. Compare in constant time. Both sides are SHA-256 hex, so a plain !=
+	//    leaks only which prefix byte differed — but leaking nothing costs
+	//    one function call.
 	inputHash := hashOTP(req.OTPCode)
-	if inputHash != storedHash {
+	if subtle.ConstantTimeCompare([]byte(inputHash), []byte(storedHash)) != 1 {
 		// Increment attempts
 		attempts, err := s.otpCache.IncrAttempt(ctx, req.SessionID)
 		if err != nil {
@@ -297,6 +372,7 @@ func (s *PersonalDataService) VerifyOTP(ctx context.Context, req VerifyOTPReques
 		}
 
 		s.writeAudit(ctx, req.SessionID, AuditOTPFailed, "nasabah:"+session.DeviceID, map[string]any{
+			"reason":  "wrong_code",
 			"attempt": attempts,
 		}, ipAddress, userAgent)
 
@@ -311,7 +387,7 @@ func (s *PersonalDataService) VerifyOTP(ctx context.Context, req VerifyOTPReques
 
 		// After 3 failed attempts: regenerate new OTP
 		if attempts >= otpRegenAt {
-			if regenErr := s.regenerateOTP(ctx, req.SessionID, session.DeviceID, ipAddress, userAgent); regenErr != nil {
+			if regenErr := s.regenerateOTP(ctx, req.SessionID, ipAddress, userAgent); regenErr != nil {
 				slog.Error("regen otp failed", "error", regenErr)
 			}
 			return nil, apperr.OTPExpired
@@ -320,8 +396,11 @@ func (s *PersonalDataService) VerifyOTP(ctx context.Context, req VerifyOTPReques
 		return nil, apperr.OTPInvalid
 	}
 
-	// 5. OTP valid — transition to BIOMETRIC
+	// 6. OTP valid — clear the code and the failure budget, then move on.
 	_ = s.otpCache.DeleteOTP(ctx, req.SessionID)
+	if resetErr := s.otpCache.ResetAttempts(ctx, req.SessionID); resetErr != nil {
+		slog.Error("reset otp attempts failed", "session_id", req.SessionID, "error", resetErr)
+	}
 
 	completed := session.StepsCompleted
 	completed.OTPVerified = true
@@ -332,7 +411,6 @@ func (s *PersonalDataService) VerifyOTP(ctx context.Context, req VerifyOTPReques
 	if s.cache != nil {
 		session.CurrentStep = StepBiometric
 		session.StepsCompleted = completed
-		session.ExpiresAt = time.Now().Add(sessionTTL)
 		if cacheErr := s.cache.Store(ctx, session); cacheErr != nil {
 			slog.Error("cache step update failed", "error", cacheErr)
 		}
@@ -348,9 +426,12 @@ func (s *PersonalDataService) VerifyOTP(ctx context.Context, req VerifyOTPReques
 
 // ResendOTP allows the frontend to explicitly request a new OTP.
 func (s *PersonalDataService) ResendOTP(ctx context.Context, req ResendOTPRequest, ipAddress, userAgent string) (*ResendOTPResponse, error) {
-	// 1. Validate session step
+	// 1. Resolve session, confirm the device, validate step
 	session, err := s.resolveSession(ctx, req.SessionID)
 	if err != nil {
+		return nil, err
+	}
+	if err := assertDeviceOwnsSession(session, req.DeviceID); err != nil {
 		return nil, err
 	}
 	if session.CurrentStep != StepOTPVerify {
@@ -361,7 +442,9 @@ func (s *PersonalDataService) ResendOTP(ctx context.Context, req ResendOTPReques
 		}
 	}
 
-	// 2. Check if blocked
+	// 2. Check if blocked. Resending must not become a way around the
+	//    lockout: a new code would be useless anyway, since verify-otp
+	//    refuses while the block stands.
 	blocked, err := s.otpCache.IsBlocked(ctx, req.SessionID)
 	if err != nil {
 		return nil, fmt.Errorf("check otp block: %w", err)
@@ -383,7 +466,33 @@ func (s *PersonalDataService) ResendOTP(ctx context.Context, req ResendOTPReques
 		}
 	}
 
-	// 4. Generate and send new OTP
+	// 4. Spend one of the hourly quota. Counted before the send, so a gateway
+	//    outage cannot be turned into unlimited SMS attempts.
+	count, err := s.otpCache.IncrResend(ctx, req.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("incr otp resend: %w", err)
+	}
+	if count > otpMaxResend {
+		remaining, remErr := s.otpCache.ResendWindowRemaining(ctx, req.SessionID)
+		if remErr != nil {
+			slog.Error("get otp resend window remaining failed", "session_id", req.SessionID, "error", remErr)
+		}
+		remainSec := int(remaining.Seconds())
+		if remainSec < 0 {
+			remainSec = 0
+		}
+		return nil, apperr.Error{
+			Status:  apperr.RateLimitExceeded.Status,
+			Code:    apperr.RateLimitExceeded.Code,
+			Message: "Kirim ulang OTP sudah mencapai batas. Silakan coba lagi nanti.",
+			Details: map[string]any{
+				"retry_after_seconds": remainSec,
+			},
+		}
+	}
+
+	// 5. Generate and send new OTP. StoreOTP overwrites the key, so the
+	//    previous code stops verifying the moment this one lands.
 	otp, err := generateOTP(otpLength)
 	if err != nil {
 		return nil, fmt.Errorf("generate otp: %w", err)
@@ -395,23 +504,38 @@ func (s *PersonalDataService) ResendOTP(ctx context.Context, req ResendOTPReques
 		return nil, fmt.Errorf("store otp: %w", err)
 	}
 
-	if err := s.sms.SendOTP(ctx, phone, otp); err != nil {
-		slog.Error("send resend otp sms failed", "error", err)
-	}
+	// Deliberately NOT resetting the failure counter here: a resend that
+	// handed back a fresh budget would turn three resends into twelve guesses
+	// without ever reaching the lockout.
+	sendErr := s.sms.SendOTP(ctx, phone, otp)
 
 	s.writeAudit(ctx, req.SessionID, AuditOTPSent, "nasabah:"+session.DeviceID, map[string]any{
 		"phone_masked": maskPhone(phone),
-		"reason":       "user_resend",
+		"reason":       otpTriggerResend,
+		"resend_count": count,
+		"delivered":    sendErr == nil,
 	}, ipAddress, userAgent)
 
-	return &ResendOTPResponse{
+	if sendErr != nil {
+		slog.Error("send resend otp sms failed", "session_id", req.SessionID, "error", sendErr)
+		return nil, apperr.OTPDeliveryFailed
+	}
+
+	resp := &ResendOTPResponse{
 		OTPSentTo:    maskPhone(phone),
 		OTPExpiresAt: expiresAt,
-	}, nil
+	}
+	if s.devMode {
+		resp.OTPDebug = otp
+	}
+	return resp, nil
 }
 
-// regenerateOTP generates a new OTP and sends it via SMS.
-func (s *PersonalDataService) regenerateOTP(ctx context.Context, sessionID, deviceID, ipAddress, userAgent string) error {
+// regenerateOTP generates a new OTP and sends it via SMS after repeated
+// failures. It bypasses the resend quota on purpose: the nasabah did not ask
+// for this SMS, so charging them for it would mean three wrong guesses
+// silently cost one of their three resends.
+func (s *PersonalDataService) regenerateOTP(ctx context.Context, sessionID, ipAddress, userAgent string) error {
 	// Get phone from personal data
 	pd, err := s.personalData.FindBySessionID(ctx, sessionID)
 	if err != nil || pd == nil {
@@ -441,9 +565,26 @@ func (s *PersonalDataService) regenerateOTP(ctx context.Context, sessionID, devi
 
 	s.writeAudit(ctx, sessionID, AuditOTPSent, "system", map[string]any{
 		"phone_masked": maskPhone(phone),
-		"reason":       "regenerated_after_failures",
+		"reason":       otpTriggerRegenerated,
 	}, ipAddress, userAgent)
 
+	return nil
+}
+
+// assertDeviceOwnsSession rejects a session_id replayed from another device.
+//
+// The header stays optional for now: nothing after POST /sessions carries
+// X-Device-ID yet, and making it mandatory here would strand every Android
+// build already in testers' hands mid-flow. Clients that do send it get the
+// binding immediately. Answering ONBOARDING_NOT_FOUND rather than a
+// forbidden keeps a wrong device from learning that the session is real.
+func assertDeviceOwnsSession(session *Session, deviceID string) error {
+	if deviceID == "" || session.DeviceID == "" {
+		return nil
+	}
+	if deviceID != session.DeviceID {
+		return apperr.OnboardingNotFound
+	}
 	return nil
 }
 

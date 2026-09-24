@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 // AccountRepository defines data access for accounts.
@@ -15,6 +16,16 @@ type AccountRepository interface {
 	// FindByAccountNumber finds a CUSTOMER account by number.
 	// MUST filter owner_type = 'CUSTOMER' to exclude settlement shards.
 	FindByAccountNumber(ctx context.Context, accountNumber string) (*Account, error)
+
+	// FindOwnedByID returns the account only if it belongs to userID and is an
+	// active CUSTOMER account. Returns nil, nil otherwise.
+	//
+	// Every debit path (transfer, e-wallet top-up, QRIS) takes
+	// source_account_id straight from the request body. Without this check the
+	// executors locked and debited whatever UUID they were handed, and the
+	// daily limit consulted was the caller's own — so a logged-in user could
+	// spend someone else's balance.
+	FindOwnedByID(ctx context.Context, userID, accountID uuid.UUID) (*Account, error)
 }
 
 // ProfileRepository defines data access for user profile.
@@ -37,6 +48,46 @@ type TransactionLimitRepository interface {
 
 	// UpdateLimit updates a single limit type for a user.
 	UpdateLimit(ctx context.Context, userID uuid.UUID, limitType string, update LimitUpdate) error
+
+	// UsedToday returns today's consumed amount per limit type, keyed by
+	// limit_type. The date is a WIB calendar date supplied by the caller —
+	// never CURRENT_DATE, which would roll over at the wrong hour.
+	UsedToday(ctx context.Context, userID uuid.UUID, wibDate string) (map[string]decimal.Decimal, error)
+}
+
+// PromotionRepository reads the promo cards shown on the Beranda.
+type PromotionRepository interface {
+	// ListActive returns active, in-window promotions ordered by priority.
+	ListActive(ctx context.Context, limit int) ([]Promotion, error)
+}
+
+// ProfileOTPCache stores the one-time code that authorises a profile change.
+type ProfileOTPCache interface {
+	// Store saves the hashed code and returns when it expires.
+	Store(ctx context.Context, userID uuid.UUID, otpHash string, ttl time.Duration) (time.Time, error)
+
+	// Get returns the stored hash, or "" when there is none.
+	Get(ctx context.Context, userID uuid.UUID) (string, error)
+
+	// Delete removes the code (used or burnt).
+	Delete(ctx context.Context, userID uuid.UUID) error
+
+	// IncrAttempt counts a failed verification and returns the new total.
+	IncrAttempt(ctx context.Context, userID uuid.UUID) (int, error)
+
+	// ResetAttempts clears the failure counter.
+	ResetAttempts(ctx context.Context, userID uuid.UUID) error
+}
+
+// SMSGateway delivers the profile-change OTP. Satisfied by internal/pkg/sms.
+type SMSGateway interface {
+	SendOTP(ctx context.Context, phone, otp string) error
+}
+
+// VerificationTokenConsumer burns a purpose-bound token issued by
+// POST /auth/pin/verify. Satisfied by transaction.Service.
+type VerificationTokenConsumer interface {
+	ConsumeVerificationToken(ctx context.Context, userID uuid.UUID, rawToken, purpose string) error
 }
 
 // NotificationRepository defines data access for notifications.

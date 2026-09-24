@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/holis12821/bca-mobile-api/internal/config"
+	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 	"github.com/holis12821/bca-mobile-api/internal/repository/postgres"
 	redisrepo "github.com/holis12821/bca-mobile-api/internal/repository/redis"
@@ -99,6 +100,20 @@ func run() error {
 		}
 		if len(piiKey) != 32 {
 			return fmt.Errorf("AES_KEY must be 32 bytes (64 hex chars), got %d bytes", len(piiKey))
+		}
+	}
+
+	// Pemetaan card_type → kode kartu core banking diverifikasi SEBELUM server
+	// menerima permintaan (§10 docs/08-PILIH-KARTU-API-SPEC.md). Konfigurasi
+	// yang bolong harus menggagalkan deploy, bukan menunggu sampai ada nasabah
+	// yang submit dan rekeningnya terlanjur jadi tanpa kartu.
+	//
+	// Hanya ditegakkan ketika sisipan pilih kartu memang menyala: katalog yang
+	// tidak dipakai tidak perlu kode core banking.
+	if cfg.Client.CardSelectionEnabled {
+		if err := onboarding.VerifyCardCoreBankingMapping(ctx,
+			postgres.NewCardRepo(pool), cfg.Client.CardCoreBankingCode); err != nil {
+			return fmt.Errorf("konfigurasi kartu: %w", err)
 		}
 	}
 

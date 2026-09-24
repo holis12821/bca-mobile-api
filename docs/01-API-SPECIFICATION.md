@@ -214,14 +214,19 @@ X-Idempotency-Key: <uuid_v4>  (untuk mutating operations)
 }
 ```
 
-### `GET /auth/biometric/challenge`
+### `GET /auth/biometric/challenge` · `POST /auth/biometric/challenge`
 **Auth:** None
 **Purpose:** Request challenge untuk biometric authentication
-**Note:** Challenge berlaku 60 detik, single-use
+**Note:** Challenge berlaku 60 detik, single-use.
+**Note:** Kedua verb dilayani. GET memakai query `?device_id=`, POST memakai
+body JSON `{"device_id": "..."}`. Aplikasi boleh memilih salah satu.
 
 ```json
-// Request Query
+// Request Query (GET)
 GET /auth/biometric/challenge?device_id=d4e5f6a7-...
+
+// Request Body (POST)
+{ "device_id": "d4e5f6a7-..." }
 
 // Response 200
 {
@@ -330,6 +335,35 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
 }
 ```
 
+### `POST /auth/access-code/change`
+**Auth:** Bearer Token
+**Purpose:** Ubah **kode akses** (kredensial login) — Screen: **Akun → Ubah Kode Akses**
+
+Kode akses dan PIN adalah dua rahasia berbeda:
+- **Kode akses** diverifikasi oleh `POST /auth/login/pin`.
+- **PIN** diverifikasi oleh `POST /auth/pin/verify` untuk mengotorisasi transaksi,
+  dan diubah oleh `POST /auth/pin/change`.
+
+Keduanya mencabut **seluruh sesi lain** setelah berhasil, sehingga token yang
+sudah terlanjur bocor ikut mati.
+
+```json
+// Request
+{
+  "old_pin_encrypted": "base64_rsa_oaep...",
+  "new_pin_encrypted": "base64_rsa_oaep..."
+}
+
+// Response 200
+{
+  "status": "success",
+  "data": { "message": "Kode akses berhasil diubah." }
+}
+```
+
+Catatan: untuk nasabah lama yang belum punya kode akses (mis. akun seed),
+`POST /auth/login/pin` jatuh kembali memverifikasi PIN.
+
 ### `POST /auth/pin/verify`
 **Auth:** Bearer Token
 **Purpose:** Verifikasi PIN untuk otorisasi transaksi (E-Wallet PIN, Transfer PIN)
@@ -388,25 +422,54 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
 }
 ```
 
-### `PUT /account/profile`
+### `POST /account/profile/otp`
 **Auth:** Bearer Token
-**Purpose:** Update profil (email, phone) — memerlukan OTP
+**Purpose:** Minta OTP untuk mengubah data profil — Screen: **Akun → Ubah Profil**
+
+OTP dikirim ke **nomor HP yang terdaftar**, bukan ke alamat yang ada di
+request — pengecekan yang bisa dipenuhi sendiri oleh penyerang bukan
+pengecekan. Berlaku 5 menit, maksimal 5 kali salah lalu kode dihanguskan.
+
+```json
+// Response 200
+{
+  "status": "success",
+  "data": {
+    "sent_to": "0812****7890",
+    "expires_in": 300
+  }
+}
+```
+
+**Dev only:** saat `APP_ENV=development` response juga memuat `otp_debug`
+berisi kodenya, karena SMS gateway di lingkungan itu hanya menulis log.
+Field ini tidak pernah muncul di environment lain.
+
+### `PUT /account/profile`
+**Auth:** Bearer Token + OTP
+**Purpose:** Update data profil — Screen: **Akun → Ubah Profil**
+
+`otp_code` diverifikasi terhadap kode yang diterbitkan `POST /account/profile/otp`.
 
 ```json
 // Request
 {
-  "email": "newemail@gmail.com",
+  "email": "nurholis.baru@gmail.com",
   "otp_code": "123456"
 }
 
 // Response 200
 {
   "status": "success",
-  "data": {
-    "message": "Profil berhasil diperbarui"
-  }
+  "data": { "message": "Profil berhasil diperbarui" }
 }
 ```
+
+| Error | Arti |
+|---|---|
+| `OTP_EXPIRED` | Belum minta OTP, atau kodenya sudah kedaluwarsa |
+| `OTP_INVALID` | Kode salah |
+| `OTP_BLOCKED` | 5 kali salah — minta OTP baru |
 
 ### `GET /account/balance`
 **Auth:** Bearer Token
@@ -437,8 +500,16 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
 ### `GET /account/dashboard`
 **Auth:** Bearer Token
 **Purpose:** Aggregated data untuk Home screen — Screen: **Beranda**
-**Cache:** Redis 1 menit
+**Cache:** Redis 1 menit (invalidasi lewat version counter)
 **Note:** Menggabungkan balance + promo + notif count untuk mengurangi round-trip
+
+`promotions` dibaca dari tabel `promotions` (aktif dan masih dalam rentang
+`valid_from`..`valid_until`, urut `priority` menurun). Kalau tidak ada promo
+aktif, nilainya `[]` — bukan `null`.
+
+Kunci `primary_account`, `accounts` dan `unread_notification_count` masih
+dikirim untuk kompatibilitas dengan build lama, dan akan dihapus setelah
+aplikasi berpindah ke `balance` dan `unread_notifications`.
 
 ```json
 // Response 200
@@ -447,7 +518,8 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
   "data": {
     "user": {
       "display_name": "NURHOLIS",
-      "masked_account": "****4567"
+      "masked_account": "****4567",
+      "last_login_at": "2026-09-22T03:14:00Z"
     },
     "balance": {
       "total": "15750000.00",
@@ -457,7 +529,7 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
     "unread_notifications": 3,
     "promotions": [
       {
-        "id": "promo_001",
+        "id": "0f3a...",
         "title": "Cashback 50% Top Up GoPay",
         "image_url": "https://cdn.bca.co.id/promo/001.webp",
         "deep_link": "bcamobile://promo/001",
@@ -465,25 +537,15 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
       }
     ],
     "quick_actions": [
-      {
-        "id": "M_INFO",
-        "label": "m-Info",
-        "icon": "ic_info",
-        "enabled": true
-      },
-      {
-        "id": "TRANSFER",
-        "label": "Transfer",
-        "icon": "ic_transfer",
-        "enabled": true
-      },
-      {
-        "id": "E_WALLET",
-        "label": "e-Wallet",
-        "icon": "ic_ewallet",
-        "enabled": true
-      }
-    ]
+      { "id": "M_INFO",   "label": "m-Info",   "icon": "ic_info",     "enabled": true },
+      { "id": "TRANSFER", "label": "Transfer", "icon": "ic_transfer", "enabled": true },
+      { "id": "E_WALLET", "label": "e-Wallet", "icon": "ic_ewallet",  "enabled": true },
+      { "id": "QRIS",     "label": "QRIS",     "icon": "ic_qris",     "enabled": true }
+    ],
+
+    "primary_account": { "account_id": "…", "account_number": "1234567890", "balance": "15750000.00", "…": "…" },
+    "accounts": [ { "…": "…" } ],
+    "unread_notification_count": 3
   }
 }
 ```
@@ -509,14 +571,46 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
 }
 ```
 
-### `PUT /account/transaction-limit`
-**Auth:** Bearer Token + PIN Verification
-**Purpose:** Atur limit transaksi — Screen: **Akun → Atur Limit**
+### `GET /account/transaction-limit`
+**Auth:** Bearer Token
+**Purpose:** Lihat limit berlaku beserta pemakaian hari ini (WIB)
 
 ```json
-// Request
+// Response 200
 {
-  "verification_token": "vtk_abc123",
+  "status": "success",
+  "data": {
+    "limits": {
+      "transfer_internal_daily": "50000000.00",
+      "transfer_internal_used_today": "1500000.00",
+      "transfer_internal_remaining_today": "48500000.00",
+      "ewallet_daily": "20000000.00",
+      "ewallet_used_today": "0.00",
+      "ewallet_remaining_today": "20000000.00",
+      "qris_daily": "5000000.00",
+      "qris_per_transaction": "5000000.00",
+      "qris_used_today": "0.00",
+      "qris_remaining_today": "5000000.00"
+    }
+  }
+}
+```
+
+### `PUT /account/transaction-limit`
+**Auth:** Bearer Token + **PIN Verification (wajib)**
+**Purpose:** Atur limit transaksi — Screen: **Akun → Atur Limit**
+
+`verification_token` wajib: ambil dulu dari `POST /auth/pin/verify` dengan
+`purpose: "CHANGE_LIMIT"`. Token sekali pakai, berlaku 120 detik. Tanpa itu
+request ditolak `VERIFICATION_TOKEN_INVALID` — menaikkan plafon harian adalah
+keputusan keamanan, bukan sekadar pengaturan.
+
+`limits` menerima **dua bentuk**; keduanya setara:
+
+```json
+// Bentuk datar
+{
+  "verification_token": "a1b2c3...",
   "limits": {
     "transfer_internal_daily": 50000000,
     "transfer_external_daily": 25000000,
@@ -524,27 +618,46 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
   }
 }
 
-// Response 200
+// Bentuk bersarang
 {
-  "status": "success",
-  "data": {
-    "limits": {
-      "transfer_internal_daily": 50000000,
-      "transfer_external_daily": 25000000,
-      "ewallet_daily": 10000000,
-      "transfer_internal_used_today": 0,
-      "transfer_external_used_today": 0,
-      "ewallet_used_today": 0
-    }
+  "verification_token": "a1b2c3...",
+  "limits": {
+    "TRANSFER_INTERNAL": { "daily_limit": 50000000 },
+    "QRIS": { "daily_limit": 5000000, "per_transaction_limit": 2000000 }
   }
 }
 ```
 
----
+Response 200 sama persis dengan `GET /account/transaction-limit` di atas
+(limit baru + pemakaian hari ini).
+
+Plafon maksimum yang dipaksakan server: TRANSFER_INTERNAL & TRANSFER_EXTERNAL
+100 juta/hari, EWALLET 20 juta/hari, QRIS 20 juta/hari dan 5 juta/transaksi.
+
+### `POST /account/device/push-token`
+**Auth:** Bearer Token
+**Purpose:** Daftarkan FCM token perangkat untuk notifikasi push
+
+Perangkat diambil dari klaim `did` pada access token, **bukan** dari body —
+klien tidak boleh menempelkan token ke perangkat yang bukan sedang dipakainya.
+
+```json
+// Request
+{ "push_token": "fcm_token_dari_firebase" }
+
+// Response 200
+{
+  "status": "success",
+  "data": { "message": "Token notifikasi berhasil didaftarkan." }
+}
+```
 
 ## 4. Transactions / Mutations
 
 ### `GET /transactions/mutations`
+> `account_id` wajib milik pemegang access token. Rekening milik orang lain
+> dijawab `403 ACCOUNT_FORBIDDEN`.
+
 **Auth:** Bearer Token
 **Purpose:** Riwayat mutasi rekening — Screen: **Mutasi**
 **Cache:** Redis 1 menit
@@ -676,7 +789,11 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 ### `GET /transactions/{transaction_id}/receipt/pdf`
 **Auth:** Bearer Token
 **Purpose:** Download PDF bukti transaksi
-**Response:** `application/pdf` binary
+**Response:** `application/pdf` binary, dengan
+`Content-Disposition: attachment; filename="bukti-transaksi-{reference_number}.pdf"`
+
+Aturan kepemilikan sama dengan versi JSON: transaksi milik orang lain menjawab
+`404 NOT_FOUND`, bukan PDF.
 
 ---
 
@@ -746,6 +863,13 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 ```
 
 ### `POST /transfer/execute`
+> `source_account_id` wajib milik pemegang access token (`403 ACCOUNT_FORBIDDEN`
+> kalau bukan). Kalau eksekusi gagal karena alasan bisnis — saldo kurang, limit
+> terlampaui — `inquiry_id` dan `verification_token` **dikembalikan** dan masih
+> bisa dipakai ulang sampai masa berlakunya habis, jadi nasabah tidak perlu
+> mengulang dari layar tujuan dan prompt PIN. Sama berlaku untuk
+> `POST /ewallet/topup` dan `POST /qris/pay`.
+
 **Auth:** Bearer Token + PIN Verification
 **Purpose:** Eksekusi transfer — Screen: **Transfer Antar Rekening**
 **Idempotency:** Required (X-Idempotency-Key header)
@@ -960,6 +1084,10 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 ## 7. Notifications
 
 ### `GET /notifications`
+> Baris notifikasi kini benar-benar dibuat oleh server: transfer, top-up
+> e-wallet, pembayaran QRIS (tipe `TRANSACTION`), serta perubahan kredensial,
+> perubahan limit dan deteksi sesi mencurigakan (tipe `SECURITY`).
+
 **Auth:** Bearer Token
 **Purpose:** Daftar notifikasi — Screen: **Beranda** (bell icon)
 **Cache:** Redis 1 menit
@@ -1067,6 +1195,11 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 ## 9. Registrasi (Buka Rekening)
 
 ### `POST /registration/initiate`
+> **Dev only:** saat `APP_ENV=development`, response memuat `otp_debug` berisi
+> kode OTP, karena SMS gateway di lingkungan itu hanya menulis log. Field ini
+> tidak pernah muncul di environment lain. Hal yang sama berlaku untuk
+> `POST /v1/onboarding/personal-data` dan `POST /v1/onboarding/resend-otp`.
+
 **Auth:** None
 **Purpose:** Mulai proses buka rekening — Screen: **Buka Rekening**
 
@@ -1130,6 +1263,8 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 | `AUTH_BIOMETRIC_NOT_REGISTERED` | 401 | Biometrik belum terdaftar |
 | `AUTH_OLD_PIN_MISMATCH` | 422 | PIN lama salah saat ganti PIN |
 | `AUTH_DEVICE_NOT_RECOGNIZED` | 403 | Device tidak dikenal |
+| `AUTH_SESSION_REVOKED` | 401 | Sesi sudah di-logout/dicabut — access token tidak berlaku lagi meski belum expired |
+| `ACCOUNT_FORBIDDEN` | 403 | `account_id` / `source_account_id` bukan milik pemegang token |
 | `ACCOUNT_NOT_FOUND` | 404 | Rekening tidak ditemukan |
 | `TRANSFER_ACCOUNT_NOT_FOUND` | 404 | Rekening tujuan tidak valid |
 | `TRANSFER_INSUFFICIENT_BALANCE` | 422 | Saldo tidak cukup |
@@ -1141,6 +1276,10 @@ GET /transactions/history?cursor=&limit=20&type=ALL
 | `INQUIRY_EXPIRED` | 422 | Sesi transaksi sudah kedaluwarsa |
 | `INQUIRY_MISMATCH` | 422 | Data body tidak sesuai dengan inquiry |
 | `VERIFICATION_TOKEN_INVALID` | 401 | Token verifikasi tidak valid atau sudah dipakai |
+| `OTP_INVALID` | 422 | Kode OTP salah |
+| `OTP_EXPIRED` | 422 | OTP kedaluwarsa atau belum diminta |
+| `OTP_BLOCKED` | 429 | Terlalu banyak percobaan OTP |
+| `PROVIDER_NOT_CONFIGURED` | 503 | Integrasi eksternal (OCR, Dukcapil, biometrik, core banking) belum dipasang di environment ini |
 | `RATE_LIMIT_EXCEEDED` | 429 | Terlalu banyak request |
 | `MAINTENANCE_MODE` | 503 | Sedang maintenance |
 | `IDEMPOTENCY_CONFLICT` | 409 | Transaksi sudah diproses |

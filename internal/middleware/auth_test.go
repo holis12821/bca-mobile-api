@@ -1,10 +1,13 @@
 package middleware_test
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,7 +39,7 @@ func TestAuth_ValidAccessToken(t *testing.T) {
 	}
 
 	var gotUserID, gotSessionID, gotDeviceID string
-	handler := middleware.Auth(jwtMgr)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := middleware.Auth(jwtMgr, stubValidator{active: true})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUserID = middleware.UserIDFromCtx(r.Context())
 		gotSessionID = middleware.SessionIDFromCtx(r.Context())
 		gotDeviceID = middleware.DeviceIDFromCtx(r.Context())
@@ -67,7 +70,7 @@ func TestAuth_RefreshTokenRejected(t *testing.T) {
 	jwtMgr := setupJWT(t)
 	pair, _ := jwtMgr.GenerateTokenPair(uuid.New().String(), uuid.New().String(), "device")
 
-	handler := middleware.Auth(jwtMgr)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := middleware.Auth(jwtMgr, stubValidator{active: true})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("handler should not be called")
 	}))
 
@@ -84,7 +87,7 @@ func TestAuth_RefreshTokenRejected(t *testing.T) {
 
 func TestAuth_NoToken(t *testing.T) {
 	jwtMgr := setupJWT(t)
-	handler := middleware.Auth(jwtMgr)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := middleware.Auth(jwtMgr, stubValidator{active: true})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("handler should not be called")
 	}))
 
@@ -95,5 +98,68 @@ func TestAuth_NoToken(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+}
+
+// stubValidator stands in for the session store in the middleware tests.
+type stubValidator struct {
+	active bool
+	err    error
+}
+
+func (s stubValidator) IsSessionActive(context.Context, uuid.UUID) (bool, error) {
+	return s.active, s.err
+}
+
+func TestAuth_RevokedSessionIsRejected(t *testing.T) {
+	jwtMgr := setupJWT(t)
+	pair, err := jwtMgr.GenerateTokenPair(uuid.New().String(), uuid.New().String(), "test-device")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	handler := middleware.Auth(jwtMgr, stubValidator{active: false})(
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler ran for a revoked session")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a revoked session, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "AUTH_SESSION_REVOKED") {
+		t.Fatalf("expected AUTH_SESSION_REVOKED, got %s", rec.Body.String())
+	}
+}
+
+// A validator that cannot answer must fail closed: a datastore outage should
+// never silently re-enable every revoked session.
+func TestAuth_ValidatorErrorFailsClosed(t *testing.T) {
+	jwtMgr := setupJWT(t)
+	pair, err := jwtMgr.GenerateTokenPair(uuid.New().String(), uuid.New().String(), "test-device")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	handler := middleware.Auth(jwtMgr, stubValidator{err: errors.New("redis down")})(
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("handler ran despite an unavailable session store")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when the session store is unavailable, got %d", rec.Code)
 	}
 }

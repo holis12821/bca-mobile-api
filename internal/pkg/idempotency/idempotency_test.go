@@ -22,7 +22,13 @@ func setupTestRedis(t *testing.T) *goredis.Client {
 	if err != nil {
 		t.Fatalf("start redis: %v", err)
 	}
-	t.Cleanup(func() { container.Terminate(context.Background()) })
+	t.Cleanup(func() {
+		// Container yang bocor membuat run berikutnya gagal karena port bentrok,
+		// dan penyebabnya tidak akan kelihatan dari test yang gagal itu.
+		if err := container.Terminate(context.Background()); err != nil {
+			t.Logf("terminate redis container: %v", err)
+		}
+	})
 
 	host, _ := container.Host(ctx)
 	port, _ := container.MappedPort(ctx, "6379")

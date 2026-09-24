@@ -178,20 +178,50 @@ SELECT CASE WHEN balance = 15649000.00 THEN 'PASS' ELSE 'FAIL' END AS "L4 custom
 FROM accounts WHERE id = 'aaaaaaaa-0000-0000-0000-000000000001';
 
 -- L6: a deliberately single-sided posting MUST be caught by v_unbalanced_transactions
+--
+-- The fixture is created, asserted, and REMOVED inside one block. It used to be
+-- left behind, and that had a consequence beyond untidiness: `make ledger-check`
+-- reads the very same two views, so any database this script had ever run
+-- against reported a permanent ledger violation from then on. The repo's money
+-- invariant check became a row nobody could explain and everybody learned to
+-- ignore — which is worse than not having the check at all.
 DO $$
-DECLARE v_txn UUID := gen_random_uuid();
+DECLARE
+    v_txn     UUID := gen_random_uuid();
+    v_account UUID := 'aaaaaaaa-0000-0000-0000-000000000001';
+    v_before  NUMERIC;
+    v_caught  INT;
 BEGIN
+    SELECT balance INTO v_before FROM accounts WHERE id = v_account;
+
     INSERT INTO transactions (id,user_id,source_account_id,type,status,amount,admin_fee,total_amount,reference_number)
-    VALUES (v_txn,'11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000001',
+    VALUES (v_txn,'11111111-1111-1111-1111-111111111111',v_account,
             'TRANSFER_EXTERNAL','SUCCESS',50000,6500,56500,next_reference_number(DATE '2026-09-02'));
     INSERT INTO account_mutations (account_id,transaction_id,mutation_type,amount,
                                    balance_before,balance_after,description,transaction_date,transaction_time)
-    VALUES ('aaaaaaaa-0000-0000-0000-000000000001',v_txn,'DEBIT',56500,15649000,15592500,
+    VALUES (v_account,v_txn,'DEBIT',56500,15649000,15592500,
             'SINGLE SIDED', DATE '2026-09-02', TIME '11:00:00');
-    UPDATE accounts SET balance = 15592500 WHERE id = 'aaaaaaaa-0000-0000-0000-000000000001';
+    UPDATE accounts SET balance = 15592500 WHERE id = v_account;
+
+    SELECT COUNT(*) INTO v_caught
+    FROM v_unbalanced_transactions WHERE transaction_id = v_txn;
+
+    -- Dibersihkan SEBELUM hasilnya dilaporkan, supaya pembersihan tidak
+    -- terlewat ketika assertion-nya gagal.
+    DELETE FROM account_mutations WHERE transaction_id = v_txn;
+    DELETE FROM transactions WHERE id = v_txn;
+    UPDATE accounts SET balance = v_before WHERE id = v_account;
+
+    IF v_caught = 1 THEN
+        RAISE NOTICE 'PASS  L6 single-sided posting is detected';
+    ELSE
+        RAISE EXCEPTION 'FAIL: L6 single-sided posting was NOT detected';
+    END IF;
 END $$;
 
-SELECT CASE WHEN COUNT(*) = 1 THEN 'PASS' ELSE 'FAIL' END AS "L6 single-sided posting is detected"
+-- Dan kedua view harus kembali kosong: fixture di atas tidak boleh menyisakan
+-- apa pun yang membuat `make ledger-check` melaporkan pelanggaran selamanya.
+SELECT CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END AS "L7 verify fixture leaves no ledger drift"
 FROM v_unbalanced_transactions;
 
 -- ---------- audit immutability still intact ----------

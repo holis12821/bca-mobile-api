@@ -1,0 +1,71 @@
+# Konfigurasi hot reload untuk `air` (dipakai oleh `make dev`).
+#
+# Tanpa file ini air memakai default-nya, yaitu `go build -o ./tmp/main .` —
+# membangun paket di root. Root project ini tidak punya file .go sama sekali
+# (main-nya di ./cmd/server), jadi air selalu gagal dengan
+# "no Go files in ..." lalu mencoba menjalankan ./tmp/main yang tidak pernah
+# terbentuk, dan berhenti dengan exit code 127.
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  # Inti perbaikannya: tunjuk paket main yang benar.
+  cmd = "go build -o ./tmp/server ./cmd/server"
+  # `entrypoint` menggantikan `bin`, yang sudah deprecated sejak air 1.6x.
+  # Bentuknya array supaya argumen bisa ditambahkan tanpa mengubah kunci.
+  entrypoint = ["./tmp/server"]
+
+  # Server membaca .env saat start, jadi mengubahnya harus memicu restart —
+  # air tidak mengawasi file tanpa ekstensi .go kecuali disebut di sini.
+  include_ext = ["go"]
+  include_file = [".env"]
+
+  # Direktori yang tidak boleh memicu rebuild.
+  #
+  # `uploads` yang paling penting: endpoint OCR dan upload dokumen menulis ke
+  # sana saat dipakai, dan tanpa pengecualian ini setiap foto KTP yang masuk
+  # akan me-restart server di tengah request yang sedang berjalan.
+  # `keys` berisi kunci RSA, `migrations` dieksekusi oleh golang-migrate bukan
+  # oleh server, dan `scripts` berisi main terpisah (seed, pinenc) yang tidak
+  # ada hubungannya dengan proses yang sedang berjalan.
+  exclude_dir = [
+    "tmp",
+    "bin",
+    "uploads",
+    "keys",
+    "migrations",
+    "docs",
+    "deployments",
+    "scripts",
+    "vendor",
+    ".git",
+    ".claude",
+  ]
+
+  # File test tidak perlu me-restart server.
+  exclude_regex = ["_test\\.go"]
+  exclude_unchanged = true
+
+  # Beri jeda supaya satu kali "save all" di editor tidak memicu banyak build.
+  delay = 800
+
+  # Kalau build gagal, biarkan binary lama tetap jalan daripada mati total.
+  stop_on_error = false
+
+  # Argon2id memakai 64MB per verify; beri waktu proses lama menutup koneksi
+  # Postgres/Redis dengan rapi sebelum dipaksa berhenti.
+  send_interrupt = true
+  kill_delay = "2s"
+
+  log = "build-errors.log"
+
+[log]
+  time = true
+
+[misc]
+  # Bersihkan ./tmp saat air keluar.
+  clean_on_exit = true
+
+[screen]
+  clear_on_rebuild = false

@@ -29,6 +29,9 @@ type Claims struct {
 	SessionID string    `json:"sid"`
 	DeviceID  string    `json:"did"`
 	Type      TokenType `json:"typ"`
+	// Role is set on signaling tokens only. Which side of a video call a
+	// connection may take has to be signed, not read off the query string.
+	Role string `json:"role,omitempty"`
 }
 
 // JWTManager handles RS256 JWT generation and verification.
@@ -104,8 +107,9 @@ func (m *JWTManager) GenerateRegistrationToken(registrationID string) (string, e
 	})
 }
 
-// GenerateSignalingToken creates a short-lived JWT for WebSocket signaling auth.
-func (m *JWTManager) GenerateSignalingToken(sessionID, queueID string, ttl time.Duration) (string, error) {
+// GenerateSignalingToken creates a short-lived JWT for WebSocket signaling
+// auth. role names the side of the call the bearer may occupy.
+func (m *JWTManager) GenerateSignalingToken(sessionID, queueID, role string, ttl time.Duration) (string, error) {
 	now := time.Now().UTC()
 	return m.generateToken(Claims{
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -116,6 +120,7 @@ func (m *JWTManager) GenerateSignalingToken(sessionID, queueID string, ttl time.
 		},
 		SessionID: queueID,
 		Type:      TokenTypeSignaling,
+		Role:      role,
 	})
 }
 

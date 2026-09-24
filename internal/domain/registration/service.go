@@ -2,9 +2,13 @@ package registration
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
+	"math/big"
 	"strings"
 	"time"
 
@@ -19,6 +23,11 @@ type Service struct {
 	executor   RegistrationExecutor
 	jwtManager *crypto.JWTManager
 	pinKeys    *crypto.RSAKeyPair
+	sms        SMSGateway
+	// devMode mirrors APP_ENV=development. It is the only thing that lets the
+	// OTP appear in a response body, and it is passed in rather than read from
+	// the environment so tests cannot switch it on by accident.
+	devMode bool
 }
 
 type ServiceConfig struct {
@@ -26,6 +35,8 @@ type ServiceConfig struct {
 	Executor   RegistrationExecutor
 	JWTManager *crypto.JWTManager
 	PINKeys    *crypto.RSAKeyPair
+	SMS        SMSGateway
+	DevMode    bool
 }
 
 func NewService(cfg ServiceConfig) *Service {
@@ -34,6 +45,8 @@ func NewService(cfg ServiceConfig) *Service {
 		executor:   cfg.Executor,
 		jwtManager: cfg.JWTManager,
 		pinKeys:    cfg.PINKeys,
+		sms:        cfg.SMS,
+		devMode:    cfg.DevMode,
 	}
 }
 
@@ -47,7 +60,13 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 	}
 
 	regID := uuid.New()
-	otpCode := fmt.Sprintf("%06d", rand.IntN(1000000))
+
+	// crypto/rand, not math/rand: a process-seeded PRNG makes the next OTP
+	// predictable from an observed one, which turns a 10^6 guess into a 1.
+	otpCode, err := generateOTP()
+	if err != nil {
+		return nil, fmt.Errorf("generate otp: %w", err)
+	}
 
 	reg := &Registration{
 		ID:          regID,
@@ -56,7 +75,7 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		PhoneNumber: req.PhoneNumber,
 		Email:       strings.ToLower(strings.TrimSpace(req.Email)),
 		Status:      "OTP_PENDING",
-		OTPCode:     otpCode,
+		OTPHash:     hashOTP(otpCode),
 		OTPExpiry:   time.Now().Add(OTPCacheTTL),
 		Documents:   make(map[string]string),
 		CreatedAt:   time.Now(),
@@ -67,20 +86,22 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		return nil, fmt.Errorf("store registration: %w", err)
 	}
 
-	// In dev: log OTP instead of sending SMS
-	slog.Info("registration OTP generated",
-		"registration_id", regID.String(),
-		"phone", req.PhoneNumber,
-		"otp", otpCode,
-	)
+	if s.sms != nil {
+		if err := s.sms.SendOTP(ctx, req.PhoneNumber, otpCode); err != nil {
+			slog.Error("send registration otp failed", "registration_id", regID.String(), "error", err)
+			// Not fatal: the code is stored, the nasabah can ask for a resend.
+		}
+	}
 
-	maskedPhone := maskPhone(req.PhoneNumber)
-
-	return &InitiateResponse{
+	resp := &InitiateResponse{
 		RegistrationID: regID.String(),
 		Status:         "OTP_PENDING",
-		OTPDestination: maskedPhone,
-	}, nil
+		OTPDestination: maskPhone(req.PhoneNumber),
+	}
+	if s.devMode {
+		resp.OTPDebug = otpCode
+	}
+	return resp, nil
 }
 
 // VerifyOTP verifies the OTP and returns a registration token.
@@ -98,11 +119,28 @@ func (s *Service) VerifyOTP(ctx context.Context, req VerifyOTPRequest) (*VerifyO
 	if time.Now().After(reg.OTPExpiry) {
 		return nil, apperr.RegistrationOTPExpired
 	}
-	if reg.OTPCode != req.OTPCode {
+	if reg.OTPAttempts >= MaxOTPAttempts {
+		return nil, apperr.RegistrationOTPExpired
+	}
+
+	// Constant-time compare of the hashes — a byte-by-byte string compare on
+	// the code leaks its prefix through timing.
+	if subtle.ConstantTimeCompare([]byte(reg.OTPHash), []byte(hashOTP(req.OTPCode))) != 1 {
+		reg.OTPAttempts++
+		reg.UpdatedAt = time.Now()
+		if reg.OTPAttempts >= MaxOTPAttempts {
+			// Burn the code rather than leaving a hot credential in Redis.
+			reg.OTPHash = ""
+		}
+		if err := s.cache.Update(ctx, reg); err != nil {
+			slog.Error("update registration otp attempts failed", "registration_id", regID(reg), "error", err)
+		}
 		return nil, apperr.RegistrationOTPInvalid
 	}
 
 	reg.Status = "OTP_VERIFIED"
+	reg.OTPHash = ""
+	reg.OTPAttempts = 0
 	reg.UpdatedAt = time.Now()
 	if err := s.cache.Update(ctx, reg); err != nil {
 		return nil, fmt.Errorf("update registration: %w", err)
@@ -192,6 +230,22 @@ func (s *Service) Complete(ctx context.Context, regID string, req CompleteReques
 		Message:       "Pendaftaran berhasil. Silakan login dengan kode akses Anda.",
 	}, nil
 }
+
+// generateOTP returns a uniformly distributed 6-digit code from crypto/rand.
+func generateOTP() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", n.Int64()), nil
+}
+
+func hashOTP(code string) string {
+	h := sha256.Sum256([]byte(code))
+	return hex.EncodeToString(h[:])
+}
+
+func regID(reg *Registration) string { return reg.ID.String() }
 
 func maskPhone(phone string) string {
 	if len(phone) <= 8 {

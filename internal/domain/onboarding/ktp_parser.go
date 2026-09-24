@@ -9,6 +9,12 @@ import (
 
 var nikRegex = regexp.MustCompile(`^[0-9]{16}$`)
 
+// nikDigitsRegex finds 16 consecutive digits inside noisy OCR text.
+//
+// Compiled once, at package level: it used to be built inside extractNIK, so
+// every OCR call paid for compiling the same pattern again.
+var nikDigitsRegex = regexp.MustCompile(`[0-9]{16}`)
+
 // ParseKTPFromText extracts KTP fields from raw OCR text.
 // This is a best-effort parser for Indonesian e-KTP layout.
 func ParseKTPFromText(raw string) KTPData {
@@ -96,9 +102,7 @@ func extractNIK(s string) string {
 	}
 
 	// Try to find 16 consecutive digits in the string
-	re := regexp.MustCompile(`[0-9]{16}`)
-	match := re.FindString(cleaned)
-	return match
+	return nikDigitsRegex.FindString(cleaned)
 }
 
 // ValidateNIK checks the NIK structure: PPKKCC-DDMMYY-NNNN.

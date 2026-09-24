@@ -53,19 +53,19 @@ type TransferExecutor interface {
 
 // ExecuteParams holds everything needed to execute a transfer inside the DB transaction.
 type ExecuteParams struct {
-	IdempotencyKey     string
-	UserID             uuid.UUID
-	SourceAccountID    uuid.UUID
-	Inquiry            *Inquiry
-	TransferType       string // INTERNAL, EXTERNAL, VIRTUAL_ACCOUNT
-	TxnType            string // TRANSFER_INTERNAL, TRANSFER_EXTERNAL
-	LimitType          string // TRANSFER_INTERNAL, TRANSFER_EXTERNAL
-	Amount             decimal.Decimal
-	AdminFee           decimal.Decimal
-	TotalAmount        decimal.Decimal
-	Notes              string
-	WIBDate            time.Time // application-supplied WIB date
-	WIBTime            time.Time // application-supplied WIB time
+	IdempotencyKey  string
+	UserID          uuid.UUID
+	SourceAccountID uuid.UUID
+	Inquiry         *Inquiry
+	TransferType    string // INTERNAL, EXTERNAL, VIRTUAL_ACCOUNT
+	TxnType         string // TRANSFER_INTERNAL, TRANSFER_EXTERNAL
+	LimitType       string // TRANSFER_INTERNAL, TRANSFER_EXTERNAL
+	Amount          decimal.Decimal
+	AdminFee        decimal.Decimal
+	TotalAmount     decimal.Decimal
+	Notes           string
+	WIBDate         time.Time // application-supplied WIB date
+	WIBTime         time.Time // application-supplied WIB time
 }
 
 // LimitCheckResult is returned when a daily limit is exceeded.
@@ -175,10 +175,10 @@ type IdempotencyResult struct {
 
 // CacheTTLs for transaction-related caches.
 const (
-	InquiryCacheTTL       = 5 * time.Minute
-	VerificationTokenTTL  = 120 * time.Second
-	RecentTransfersTTL    = 5 * time.Minute
-	MutationsCacheTTL     = 60 * time.Second
-	HistoryCacheTTL       = 60 * time.Second
-	ReceiptCacheTTL       = 24 * time.Hour
+	InquiryCacheTTL      = 5 * time.Minute
+	VerificationTokenTTL = 120 * time.Second
+	RecentTransfersTTL   = 5 * time.Minute
+	MutationsCacheTTL    = 60 * time.Second
+	HistoryCacheTTL      = 60 * time.Second
+	ReceiptCacheTTL      = 24 * time.Hour
 )

@@ -31,7 +31,7 @@ const (
 // Rate limit key builders
 func loginDeviceKey(deviceID string) string { return "rate:login:dev:" + deviceID }
 func loginIPKey(ip string) string           { return "rate:login:ip:" + ip }
-func pinVerifyUserKey(userID string) string  { return "rate:pin:" + userID }
+func pinVerifyUserKey(userID string) string { return "rate:pin:" + userID }
 
 // AuthRateLimiter provides rate limiting for authentication endpoints.
 // Implements auth.RateLimiter.

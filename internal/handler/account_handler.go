@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -42,8 +41,8 @@ func (h *AccountHandler) Profile(w http.ResponseWriter, r *http.Request) {
 		"id":           profile.ID.String(),
 		"full_name":    profile.FullName,
 		"display_name": profile.DisplayName,
-		"phone":        maskPhone(profile.Phone),
-		"email":        maskEmail(profile.Email),
+		"phone":        account.MaskPhone(profile.Phone),
+		"email":        account.MaskEmail(profile.Email),
 		"accounts":     toAccountBalanceList(profile.Accounts),
 	}
 	if profile.LastLoginAt != nil {
@@ -119,13 +118,52 @@ func (h *AccountHandler) UpdateTransactionLimit(w http.ResponseWriter, r *http.R
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
+	if req.VerificationToken == "" {
+		response.Err(w, r, apperr.VerificationTokenInvalid)
+		return
+	}
 
-	if err := h.svc.UpdateTransactionLimit(r.Context(), userID, req); err != nil {
+	limits, err := h.svc.UpdateTransactionLimit(r.Context(), userID, req)
+	if err != nil {
 		h.handleError(w, r, err, "update transaction limit")
 		return
 	}
 
-	response.Success(w, r, http.StatusOK, map[string]string{"message": "Limit transaksi berhasil diperbarui."})
+	response.Success(w, r, http.StatusOK, limits)
+}
+
+// RequestProfileOTP handles POST /v1/account/profile/otp
+func (h *AccountHandler) RequestProfileOTP(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
+	if err != nil {
+		response.Err(w, r, apperr.TokenInvalid)
+		return
+	}
+
+	resp, err := h.svc.RequestProfileOTP(r.Context(), userID)
+	if err != nil {
+		h.handleError(w, r, err, "request profile otp")
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, resp)
+}
+
+// TransactionLimits handles GET /v1/account/transaction-limit
+func (h *AccountHandler) TransactionLimits(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
+	if err != nil {
+		response.Err(w, r, apperr.TokenInvalid)
+		return
+	}
+
+	limits, err := h.svc.GetTransactionLimits(r.Context(), userID)
+	if err != nil {
+		h.handleError(w, r, err, "get transaction limits")
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, limits)
 }
 
 // UpdateProfile handles PUT /v1/account/profile
@@ -138,6 +176,10 @@ func (h *AccountHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 
 	var req account.UpdateProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if req.Email == "" || req.OTPCode == "" {
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
@@ -199,36 +241,4 @@ func toAccountBalanceList(accounts []account.Account) []account.AccountBalance {
 		}
 	}
 	return result
-}
-
-// maskPhone masks a phone number: 0812****5678
-func maskPhone(phone string) string {
-	if len(phone) <= 4 {
-		return phone
-	}
-	visible := 4
-	if len(phone) > 8 {
-		visible = 4
-	}
-	prefix := phone[:4]
-	suffix := phone[len(phone)-visible:]
-	masked := strings.Repeat("*", len(phone)-4-visible)
-	return prefix + masked + suffix
-}
-
-// maskEmail masks an email: n***s@gmail.com
-func maskEmail(email string) string {
-	if email == "" {
-		return ""
-	}
-	at := strings.LastIndex(email, "@")
-	if at <= 0 {
-		return email
-	}
-	local := email[:at]
-	domain := email[at:]
-	if len(local) <= 2 {
-		return local + "***" + domain
-	}
-	return string(local[0]) + strings.Repeat("*", len(local)-2) + string(local[len(local)-1]) + domain
 }

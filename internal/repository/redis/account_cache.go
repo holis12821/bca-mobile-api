@@ -27,12 +27,12 @@ func profileCacheKey(userID uuid.UUID, version int64) string {
 }
 
 type cachedProfile struct {
-	ID          string     `json:"id"`
-	FullName    string     `json:"full_name"`
-	DisplayName string     `json:"display_name"`
-	Phone       string     `json:"phone"`
-	Email       string     `json:"email"`
-	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
+	ID          string          `json:"id"`
+	FullName    string          `json:"full_name"`
+	DisplayName string          `json:"display_name"`
+	Phone       string          `json:"phone"`
+	Email       string          `json:"email"`
+	LastLoginAt *time.Time      `json:"last_login_at,omitempty"`
 	Accounts    []cachedAccount `json:"accounts"`
 }
 

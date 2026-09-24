@@ -20,9 +20,9 @@ func TestSessionCache_DeleteSession(t *testing.T) {
 	deviceID := uuid.New()
 
 	session := &auth.Session{
-		ID:       uuid.New(),
-		UserID:   userID,
-		DeviceID: deviceID,
+		ID:        uuid.New(),
+		UserID:    userID,
+		DeviceID:  deviceID,
 		CreatedAt: time.Now(),
 	}
 

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/account"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/notify"
 )
 
 type NotificationRepo struct {
@@ -17,6 +19,34 @@ type NotificationRepo struct {
 
 func NewNotificationRepo(pool *pgxpool.Pool) *NotificationRepo {
 	return &NotificationRepo{pool: pool}
+}
+
+// Insert writes one notification row. Implements notify.Store.
+func (r *NotificationRepo) Insert(ctx context.Context, e notify.Entry) error {
+	var metadata []byte
+	if len(e.Metadata) > 0 {
+		var err error
+		metadata, err = json.Marshal(e.Metadata)
+		if err != nil {
+			return fmt.Errorf("marshal notification metadata: %w", err)
+		}
+	}
+
+	const query = `
+		INSERT INTO notifications (id, user_id, type, title, body, deep_link, metadata, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+
+	var deepLink *string
+	if e.DeepLink != "" {
+		deepLink = &e.DeepLink
+	}
+
+	_, err := r.pool.Exec(ctx, query,
+		uuid.New(), e.UserID, e.Type, e.Title, e.Body, deepLink, metadata, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("insert notification: %w", err)
+	}
+	return nil
 }
 
 // ListByUserID returns paginated notifications using keyset pagination.

@@ -1,9 +1,11 @@
-.PHONY: help setup keys dev run build pin tunnel infra-up infra-down infra-reset \
+.PHONY: help setup keys dev run stop check-port build pin tunnel tunnel-env infra-up infra-down infra-reset \
         migrate-create migrate-up migrate-down migrate-status verify-009 ledger-check \
         seed test test-verbose test-coverage test-concurrent lint vet check \
         docker-build prod-migrate prod-up prod-down prod-logs backup clean
 
 DB_URL ?= postgres://bcamobile:localdev_password_123@localhost:5432/bcamobile?sslmode=disable
+# Port server. Override untuk menjalankan instance kedua: make run PORT=8081
+PORT ?= 8080
 COMPOSE_DEV  := docker compose -f deployments/docker-compose.yml
 COMPOSE_PROD := docker compose -f deployments/docker-compose.prod.yml --env-file .env.prod
 
@@ -35,11 +37,42 @@ keys: ## Generate RSA key pairs for JWT and PIN encryption
 
 # === Development ===
 
-dev: ## Start dev server with hot reload
+# check-port gagal lebih awal dengan pesan yang menyebut prosesnya, alih-alih
+# membiarkan server start lalu mati dengan "bind: address already in use" —
+# `make dev` dan `make run` menjalankan server yang SAMA, jadi keduanya tidak
+# bisa hidup bersamaan dan yang kedua selalu kalah di port.
+check-port:
+	@PID=$$(lsof -ti :$(PORT) -sTCP:LISTEN 2>/dev/null); \
+	if [ -n "$$PID" ]; then \
+		echo "Port $(PORT) sudah dipakai oleh: $$(basename "$$(ps -o comm= -p $$PID)") (PID $$PID)"; \
+		echo ""; \
+		echo "'make dev' dan 'make run' menjalankan server yang sama — pilih salah satu."; \
+		echo "Hentikan yang sedang jalan dulu:  make stop"; \
+		echo "Atau pakai port lain:             make run PORT=8081"; \
+		exit 1; \
+	fi
+
+dev: check-port ## Start dev server with hot reload
 	air
 
-run: ## Run server without hot reload
-	go run ./cmd/server
+run: check-port ## Run server without hot reload
+	SERVER_PORT=$(PORT) go run ./cmd/server
+
+stop: ## Stop whatever is serving on $(PORT) (air or go run)
+	@PID=$$(lsof -ti :$(PORT) -sTCP:LISTEN 2>/dev/null); \
+	if [ -z "$$PID" ]; then \
+		echo "Tidak ada yang jalan di port $(PORT)."; \
+	else \
+		PARENT=$$(ps -o ppid= -p $$PID | tr -d ' '); \
+		if [ "$$(basename "$$(ps -o comm= -p $$PARENT 2>/dev/null)")" = "air" ]; then \
+			echo "Menghentikan air (PID $$PARENT) beserta servernya (PID $$PID)"; \
+			kill $$PARENT 2>/dev/null || true; \
+		else \
+			echo "Menghentikan server (PID $$PID)"; \
+		fi; \
+		kill $$PID 2>/dev/null || true; \
+		sleep 1; \
+	fi
 
 build: ## Build production binary
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/server ./cmd/server
@@ -49,13 +82,17 @@ pin: ## Encrypt a PIN for manual API calls — usage: make pin PIN=123456
 
 tunnel: ## Public HTTPS URL for the local server — make tunnel [DOMAIN=your.ngrok-free.app]
 	@command -v ngrok >/dev/null || { echo "ngrok is not installed: brew install ngrok"; exit 1; }
-	@echo "Once the URL appears: set SIGNALING_BASE_URL=wss://<host> in .env, then restart the server."
+	@echo "Leave this running, then in another terminal: make tunnel-env"
+	@echo "That points SIGNALING_BASE_URL at the tunnel; air restarts the server on its own."
 	@echo "A free static domain (ngrok dashboard) keeps that URL stable across restarts."
 ifdef DOMAIN
 	ngrok http --url=https://$(DOMAIN) 8080
 else
 	ngrok http 8080
 endif
+
+tunnel-env: ## Point SIGNALING_BASE_URL at the running ngrok tunnel
+	@./scripts/sync-tunnel-env.sh
 
 # === Infrastructure ===
 

@@ -8,16 +8,34 @@ import (
 
 // User represents a user for authentication purposes.
 type User struct {
-	ID                uuid.UUID
-	FullName          string
-	DisplayName       string
-	PINHash           string
-	PINSalt           string
+	ID          uuid.UUID
+	FullName    string
+	DisplayName string
+	PINHash     string
+	PINSalt     string
+
+	// AccessCodeHash is the "kode akses" the nasabah chose during onboarding —
+	// what m-BCA asks for at login, as distinct from the PIN that authorises a
+	// transaction. It was collected, hashed, handed to the provisioner and then
+	// dropped, so login could only ever check PINHash. Empty for users created
+	// before it was persisted (the seeded demo accounts), and LoginCredential
+	// falls back to the PIN for those.
+	AccessCodeHash string
+
 	Status            string
 	LockedUntil       *time.Time
 	FailedPINAttempts int
 	MaxPINAttempts    int
 	LastLoginAt       *time.Time
+}
+
+// LoginCredential returns the hash that POST /auth/login/pin must verify
+// against: the access code when the user has one, otherwise the PIN.
+func (u *User) LoginCredential() string {
+	if u.AccessCodeHash != "" {
+		return u.AccessCodeHash
+	}
+	return u.PINHash
 }
 
 // Device represents a registered device.
@@ -45,6 +63,16 @@ type Session struct {
 	AuthMethod       string
 	ExpiresAt        time.Time
 	CreatedAt        time.Time
+
+	// DeviceKey is the client-supplied device_id — the same value the JWT
+	// carries as "did". It is not a database column; it exists so the Redis
+	// cache can key on the identifier every caller actually has.
+	//
+	// The cache used to write session:{user}:{devices.id} but delete
+	// session:{user}:{client device_id}. Those never matched, so logout left
+	// the cached session in place and InvalidateAllUserSessions deleted keys
+	// that had never been written.
+	DeviceKey string
 }
 
 // LoginRequest is the decoded request body for PIN login.
@@ -64,10 +92,10 @@ type DeviceInfo struct {
 
 // LoginResponse is returned on successful PIN login.
 type LoginResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
+	AccessToken  string   `json:"access_token"`
+	RefreshToken string   `json:"refresh_token"`
+	TokenType    string   `json:"token_type"`
+	ExpiresIn    int      `json:"expires_in"`
 	User         UserInfo `json:"user"`
 }
 

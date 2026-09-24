@@ -164,6 +164,10 @@ Forwarding  https://nama-anda.ngrok-free.app -> http://localhost:8080
 
 Base URL untuk frontend jadi `https://nama-anda.ngrok-free.app/v1`.
 
+Daftar lengkap alamat per lingkungan — HTTP, `/internal/v1`, WebSocket
+signaling, health, dan konstanta untuk aplikasi Android — ada di
+[10-BASE-URL-DAN-ENDPOINT.md](10-BASE-URL-DAN-ENDPOINT.md).
+
 ### Empat hal yang harus disetel, kalau tidak frontend akan gagal
 
 **1. `SIGNALING_BASE_URL`** — nilai ini ikut masuk ke `signaling_url` yang diterima client. Kalau masih `ws://localhost:8080`, frontend di device lain akan mencoba menyambung ke dirinya sendiri.

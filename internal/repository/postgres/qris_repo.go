@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand/v2"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,10 +38,7 @@ func (e *QRISExecutorImpl) ExecutePay(ctx context.Context, params qris.ExecutePa
 
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "40001" {
-			if attempt < maxSerializationRetries-1 {
-				base := time.Duration(10*(1<<attempt)) * time.Millisecond
-				jitter := time.Duration(rand.IntN(int(base / 2)))
-				time.Sleep(base + jitter)
+			if backoffSerialization(ctx, attempt) {
 				continue
 			}
 		}
@@ -55,7 +52,15 @@ func (e *QRISExecutorImpl) tryExecutePay(ctx context.Context, params qris.Execut
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
-	defer pgxTx.Rollback(ctx)
+	// Rollback setelah commit yang sukses mengembalikan pgx.ErrTxClosed — itu
+	// jalur normal, bukan kegagalan. Sisanya dicatat: transaksi yang gagal
+	// dilepas menahan koneksi di pool sampai timeout, dan diam-diam adalah cara
+	// terburuk untuk mengetahuinya.
+	defer func() {
+		if rbErr := pgxTx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			slog.Error("rollback gagal", "op", "qris payment", "error", rbErr)
+		}
+	}()
 
 	txnID := uuid.New()
 
@@ -76,20 +81,26 @@ func (e *QRISExecutorImpl) tryExecutePay(ctx context.Context, params qris.Execut
 	type lockedAccount struct {
 		ID      uuid.UUID
 		Balance decimal.Decimal
+		Hold    decimal.Decimal
 	}
 	balances := make(map[uuid.UUID]lockedAccount)
 	for _, accID := range accountIDs {
 		var la lockedAccount
-		err := pgxTx.QueryRow(ctx, `SELECT id, balance FROM accounts WHERE id = $1 FOR UPDATE`, accID).Scan(&la.ID, &la.Balance)
+		// hold_amount is part of the spendable calculation — the transfer
+		// executor has always read it, and these two rails did not, so funds
+		// already earmarked by a pending transaction could be spent twice.
+		err := pgxTx.QueryRow(ctx,
+			`SELECT id, balance, hold_amount FROM accounts WHERE id = $1 FOR UPDATE`,
+			accID).Scan(&la.ID, &la.Balance, &la.Hold)
 		if err != nil {
 			return nil, fmt.Errorf("lock account %s: %w", accID, err)
 		}
 		balances[accID] = la
 	}
 
-	// Check source balance
+	// Check source balance against the AVAILABLE amount, not the raw balance.
 	source := balances[params.SourceAccountID]
-	if source.Balance.LessThan(params.TotalAmount) {
+	if source.Balance.Sub(source.Hold).LessThan(params.TotalAmount) {
 		return nil, apperr.QRISInsufficientBalance
 	}
 
@@ -106,14 +117,33 @@ func (e *QRISExecutorImpl) tryExecutePay(ctx context.Context, params qris.Execut
 		return nil, fmt.Errorf("check daily usage: %w", err)
 	}
 
+	// A missing transaction_limits row means zero, which means deny — the same
+	// rule the transfer executor documents. Treating it as "unlimited" (the
+	// old !dailyLimit.IsZero() guard below) meant a user whose limits were
+	// never provisioned had no ceiling at all.
 	var dailyLimit decimal.Decimal
 	err = pgxTx.QueryRow(ctx,
 		`SELECT daily_limit FROM transaction_limits WHERE user_id = $1 AND limit_type = 'QRIS'`,
 		params.UserID).Scan(&dailyLimit)
-	if err != nil && err != pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
+		dailyLimit = decimal.Zero
+	} else if err != nil {
 		return nil, fmt.Errorf("check daily limit: %w", err)
 	}
-	if !dailyLimit.IsZero() && usedToday.Add(params.TotalAmount).GreaterThan(dailyLimit) {
+	if usedToday.Add(params.TotalAmount).GreaterThan(dailyLimit) {
+		return nil, apperr.QRISLimitExceeded
+	}
+
+	// QRIS is the one rail with a per-transaction ceiling (see
+	// account.LimitCeilings). It was configurable but never enforced.
+	var perTxnLimit *decimal.Decimal
+	err = pgxTx.QueryRow(ctx,
+		`SELECT per_transaction_limit FROM transaction_limits WHERE user_id = $1 AND limit_type = 'QRIS'`,
+		params.UserID).Scan(&perTxnLimit)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("check per-transaction limit: %w", err)
+	}
+	if perTxnLimit != nil && params.TotalAmount.GreaterThan(*perTxnLimit) {
 		return nil, apperr.QRISLimitExceeded
 	}
 

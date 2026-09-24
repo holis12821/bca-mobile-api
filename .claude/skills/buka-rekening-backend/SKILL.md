@@ -104,12 +104,12 @@ onboarding_audit_logs    -- immutable audit trail
 onboarding:session:{session_id}           -- session cache (TTL 24h)
 onboarding:ocr_rate:{session_id}          -- OCR attempt counter (10/hour)
 onboarding:otp:{session_id}              -- hashed OTP (TTL 5m)
-onboarding:otp_attempt:{session_id}      -- OTP attempt counter
+onboarding:otp_attempt:{session_id}      -- OTP attempt counter (TTL 30m = window blokir)
 onboarding:otp_block:{session_id}        -- OTP block flag (TTL 30m)
 onboarding:bio_rate:{session_id}         -- biometric attempt counter (5/hour)
 onboarding:queue:active                  -- video call sorted set (score = join timestamp)
 onboarding:queue:counter:{YYYY-MM-DD}   -- daily sequential queue number
-onboarding:idem:{idempotency_key}        -- submit idempotency cache (TTL 24h)
+onboarding:idem:{session_id}:{idempotency_key}  -- submit idempotency slot (SETNX claim 60s, response TTL 24h)
 ```
 
 ### Session State Machine
@@ -159,10 +159,15 @@ Semua route di bawah `/v1/onboarding/` sub-router dengan `OnboardingAudit` middl
 3. **PII encryption** — NIK, nama, alamat, phone, email di-encrypt AES-256-GCM (hex-encoded ciphertext)
 4. **Credential hashing** — Kode akses dan PIN di-hash Argon2id, JANGAN simpan plaintext
 5. **Credential transport** — RSA-OAEP-SHA256 encrypt dari mobile, server decrypt sebelum hash
-6. **Auto-expiry** — Session expire 24 jam (lazy check + rolling TTL extension per step)
-7. **Rate limiting** — Per-device (3 sessions/hour), per-session OCR (10/hour), biometric (5/hour)
+6. **Auto-expiry** — Session expire 24 jam sejak dibuat (lazy check). Perpindahan step TIDAK memperpanjang `expires_at`
+7. **Rate limiting** — Per-IP seluruh grup onboarding (60/5 menit), per-device (3 sessions/hour), per-session OCR (10/hour), biometric (5/hour)
 8. **OTP security** — SHA-256 hash, 5-min TTL, block setelah 5 gagal (30 min), regen setelah 3 gagal
-9. **Dukcapil validation** — NIK wajib divalidasi ke API Dukcapil sebelum lanjut
+9. **Dukcapil validation** — NIK wajib divalidasi ke API Dukcapil sebelum lanjut. Error timeout dan error lain dibedakan (`OCR_DUKCAPIL_TIMEOUT` vs `OCR_DUKCAPIL_UNAVAILABLE`)
+10. **Cache session** — Redis menyimpan `cachedSession` (struct khusus cache), bukan `onboarding.Session` mentah: struct domain memakai `json:"-"` untuk `device_id`/`id`/`tnc_version` sehingga marshal langsung akan menghilangkan aktor audit
+11. **Signaling role** — Role (`nasabah`/`agent`) ditandatangani di dalam JWT signaling, tidak pernah diambil dari query string. Token agent hanya lewat endpoint internal `/video-call/agent-token`
+12. **Internal API key** — `INTERNAL_API_KEY` tidak punya default; kosong = semua endpoint internal 403, dan di luar development server menolak start
+13. **Client IP** — `X-Forwarded-For`/`X-Real-IP` hanya dipercaya bila peer termasuk `TRUSTED_PROXIES`; audit trail memakai hasil resolver itu
+14. **Upload artefak** — Foto KTP diunggah setelah semua validasi lolos, dan dihapus kembali bila penyimpanan baris gagal (tanpa file yatim di bucket)
 10. **Step enforcement** — Setiap endpoint validasi `session.CurrentStep` sebelum proses
 
 ---
@@ -398,8 +403,10 @@ Implement the final submission endpoint that creates the bank account.
 
 Requirements:
 - POST /v1/onboarding/submit
-  - Idempotency via X-Idempotency-Key header (key: onboarding:idem:{key}, TTL 24h)
-  - If same key received: return cached JSON response
+  - Idempotency via X-Idempotency-Key header, scoped per session
+    (key: onboarding:idem:{session_id}:{key}) and claimed atomically with SETNX
+  - If the slot holds a response: return it; if it is still processing: IDEMPOTENCY_CONFLICT
+  - Release the slot on failure so the client can retry
   - Validate session current_step == "REVIEW"
   - Validate agreement_accepted == true and agreement_version not empty
   - Validate ALL steps completed:
@@ -409,7 +416,9 @@ Requirements:
   - Fetch and decrypt personal data (holder name, NIK)
   - Verify credentials exist
   - Call CoreBankingClient.CreateAccount() to create bank account
-  - Generate m-BCA user_id with prefix "mbca_"
+  - Provision the m-BCA user via AccountProvisioner (users + devices + accounts
+    + transaction_limits in one transaction) so the nasabah can actually log in;
+    m_bca.user_id is that user id
   - Transition: REVIEW → COMPLETED
   - Return: account info, m-BCA info, created_at
   - Cache response for idempotency

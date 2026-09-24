@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"sort"
 	"time"
@@ -19,6 +20,34 @@ import (
 )
 
 const maxSerializationRetries = 3
+
+// backoffSerialization waits before retrying a serialization failure (40001) and
+// reports whether the retry should still happen.
+//
+// The wait used to be a bare time.Sleep, which ignores cancellation: a request
+// the client had already abandoned — or one the 30s request timeout had already
+// killed — still slept and then opened another SERIALIZABLE transaction. Under a
+// burst of conflicts that is load spent on work nobody is waiting for, at
+// exactly the moment the database can least afford it.
+func backoffSerialization(ctx context.Context, attempt int) bool {
+	if attempt >= maxSerializationRetries-1 {
+		return false
+	}
+
+	// Jittered backoff: ~10ms, ~30ms, ~90ms
+	base := time.Duration(10*(1<<attempt)) * time.Millisecond
+	jitter := time.Duration(rand.IntN(int(base / 2)))
+
+	timer := time.NewTimer(base + jitter)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
 
 // TransferExecutor runs transfers in a SERIALIZABLE transaction with 40001 retry.
 type TransferExecutor struct {
@@ -43,11 +72,7 @@ func (te *TransferExecutor) ExecuteTransfer(ctx context.Context, params transact
 		// Check for serialization failure (SQLSTATE 40001)
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "40001" {
-			if attempt < maxSerializationRetries-1 {
-				// Jittered backoff: ~10ms, ~30ms, ~90ms
-				base := time.Duration(10*(1<<attempt)) * time.Millisecond
-				jitter := time.Duration(rand.IntN(int(base / 2)))
-				time.Sleep(base + jitter)
+			if backoffSerialization(ctx, attempt) {
 				continue
 			}
 		}
@@ -67,7 +92,14 @@ func (te *TransferExecutor) tryExecute(ctx context.Context, params transaction.E
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
-	defer pgxTx.Rollback(ctx)
+	// Rollback setelah commit yang sukses mengembalikan pgx.ErrTxClosed — jalur
+	// normal. Sisanya dicatat: ini jalur uang, dan transaksi yang gagal dilepas
+	// menahan kunci baris rekening sampai timeout.
+	defer func() {
+		if rbErr := pgxTx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			slog.Error("rollback gagal", "op", "transfer execute", "error", rbErr)
+		}
+	}()
 
 	inquiry := params.Inquiry
 

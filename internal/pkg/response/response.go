@@ -2,6 +2,7 @@ package response
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -33,6 +34,15 @@ type Pagination struct {
 type Meta struct {
 	RequestID string `json:"request_id"`
 	Timestamp string `json:"timestamp"`
+
+	// CatalogOutdated menandai client mengirim catalog_version katalog kartu
+	// yang sudah bukan versi terkini (§7 docs/08-PILIH-KARTU-API-SPEC.md).
+	//
+	// Field ini ada di Meta yang dipakai SELURUH endpoint, bukan hanya kartu —
+	// itu konsekuensi dari spec yang menempatkannya di meta, bukan di data.
+	// `omitempty` menjaga agar respons lain tidak berubah sama sekali: kunci
+	// ini hanya muncul ketika bernilai true.
+	CatalogOutdated bool `json:"catalog_outdated,omitempty"`
 }
 
 func Success(w http.ResponseWriter, r *http.Request, status int, data any) {
@@ -40,6 +50,23 @@ func Success(w http.ResponseWriter, r *http.Request, status int, data any) {
 		Status: "success",
 		Data:   data,
 		Meta:   meta(r),
+	})
+}
+
+// SuccessWithMeta menulis respons sukses dengan Meta yang sudah disesuaikan.
+//
+// mutate menerima Meta standar (request_id, timestamp) dan boleh menambahinya.
+// Dipakai endpoint yang perlu menyelipkan penanda di meta — sejauh ini hanya
+// catalog_outdated — tanpa memaksa setiap pemanggil Success menyusun Meta.
+func SuccessWithMeta(w http.ResponseWriter, r *http.Request, status int, data any, mutate func(*Meta)) {
+	m := meta(r)
+	if mutate != nil {
+		mutate(&m)
+	}
+	write(w, r, status, Envelope{
+		Status: "success",
+		Data:   data,
+		Meta:   m,
 	})
 }
 
@@ -80,5 +107,13 @@ func meta(r *http.Request) Meta {
 func write(w http.ResponseWriter, _ *http.Request, status int, body Envelope) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(body)
+
+	// Status sudah terkirim, jadi tidak ada lagi yang bisa disampaikan ke client
+	// bila encoding gagal — lazimnya karena koneksi ditutup di tengah jalan.
+	// Dicatat, bukan diabaikan: kegagalan yang BUKAN koneksi terputus (tipe yang
+	// tidak bisa di-marshal pada payload baru) hanya akan tampak sebagai respons
+	// terpotong, dan itu nyaris mustahil dilacak tanpa satu baris log.
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		slog.Warn("tulis respons JSON gagal", "status", status, "error", err)
+	}
 }

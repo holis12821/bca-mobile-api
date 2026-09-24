@@ -55,6 +55,34 @@ func (r *AccountRepo) FindActiveByUserID(ctx context.Context, userID uuid.UUID) 
 	return accounts, rows.Err()
 }
 
+// FindOwnedByID returns the account only when userID owns it.
+// This is the ownership gate for every debit path — see the interface doc.
+func (r *AccountRepo) FindOwnedByID(ctx context.Context, userID, accountID uuid.UUID) (*account.Account, error) {
+	query := `
+		SELECT id, user_id, account_number, account_type, account_label,
+		       currency, balance, hold_amount, available_balance,
+		       is_primary, status, opened_at
+		FROM accounts
+		WHERE id = $1
+		  AND user_id = $2
+		  AND owner_type = 'CUSTOMER'
+		  AND status = 'ACTIVE'`
+
+	var a account.Account
+	err := r.pool.QueryRow(ctx, query, accountID, userID).Scan(
+		&a.ID, &a.UserID, &a.AccountNumber, &a.AccountType, &a.AccountLabel,
+		&a.Currency, &a.Balance, &a.HoldAmount, &a.AvailableBalance,
+		&a.IsPrimary, &a.Status, &a.OpenedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find owned account: %w", err)
+	}
+	return &a, nil
+}
+
 // FindByAccountNumber finds a CUSTOMER account by account number.
 // Filters owner_type = 'CUSTOMER' to exclude settlement shards (9902000000).
 func (r *AccountRepo) FindByAccountNumber(ctx context.Context, accountNumber string) (*account.Account, error) {
@@ -201,6 +229,32 @@ func (r *TransactionLimitRepo) FindByUserID(ctx context.Context, userID uuid.UUI
 		limits = append(limits, l)
 	}
 	return limits, rows.Err()
+}
+
+// UsedToday returns today's consumed amount per limit type.
+// wibDate is a calendar date resolved by the caller in Asia/Jakarta.
+func (r *TransactionLimitRepo) UsedToday(ctx context.Context, userID uuid.UUID, wibDate string) (map[string]decimal.Decimal, error) {
+	const query = `
+		SELECT limit_type, COALESCE(total_amount, 0)
+		FROM daily_usage
+		WHERE user_id = $1 AND usage_date = $2`
+
+	rows, err := r.pool.Query(ctx, query, userID, wibDate)
+	if err != nil {
+		return nil, fmt.Errorf("query daily usage: %w", err)
+	}
+	defer rows.Close()
+
+	used := make(map[string]decimal.Decimal)
+	for rows.Next() {
+		var limitType string
+		var amount decimal.Decimal
+		if err := rows.Scan(&limitType, &amount); err != nil {
+			return nil, fmt.Errorf("scan daily usage: %w", err)
+		}
+		used[limitType] = amount
+	}
+	return used, rows.Err()
 }
 
 // UpdateLimit updates a single limit type for a user.

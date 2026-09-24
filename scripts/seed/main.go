@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -320,6 +319,140 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 
 	// Seed promotions
 	seedPromotions(ctx, pool, now)
+
+	// Seed katalog kartu Paspor (development saja — lihat fungsinya)
+	seedCardProducts(ctx, pool)
+}
+
+// seedCardProducts menanam katalog kartu untuk pengembangan lokal.
+//
+// ANGKA DI SINI PALSU DAN SENGAJA TERLIHAT PALSU. Biaya dan limit resmi belum
+// diputuskan product owner — lihat docs/08-PILIH-KARTU-API-SPEC.md §17. Nilai
+// berulang seperti 11111 / 2222222 dipilih supaya siapa pun yang melihatnya di
+// layar atau di database langsung tahu itu bukan tarif sungguhan.
+//
+// Godaannya adalah memakai 14000/16000/19000 dari contoh §4, karena kelihatan
+// lebih "nyata". Justru itu bahayanya: angka-angka itu berasal dari strings.xml
+// client — data desain layar — dan kalau bocor ke staging tidak ada yang curiga.
+//
+// Fungsi ini menolak jalan di luar development. Katalog produksi diisi lewat
+// admin API, bukan seeder.
+func seedCardProducts(ctx context.Context, pool *pgxpool.Pool) {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+	if env == "" {
+		env = "development"
+	}
+	if env != "development" && env != "test" {
+		log.Printf("  card products: DILEWATI (APP_ENV=%s) — angka seed adalah placeholder dev", env)
+		return
+	}
+
+	cards := []struct {
+		Type          string
+		Name          string
+		Tier          string
+		Style         string
+		AdminFee      int64
+		IssuanceFee   int64
+		ReplaceFee    int64
+		LimitCash     int64
+		LimitBCA      int64
+		LimitInterbnk int64
+		LimitDebit    int64
+		DeliveryMin   int
+		DeliveryMax   int
+		MinAge        int
+		MinDeposit    int64
+	}{
+		{"PASPOR_BLUE", "Blue Mastercard", "DEBIT", "BLUE",
+			11111, 0, 11111, 1111111, 11111111, 1111111, 11111111, 3, 7, 17, 500000},
+		{"PASPOR_GOLD", "Gold Mastercard", "DEBIT", "GOLD",
+			22222, 0, 22222, 2222222, 22222222, 2222222, 22222222, 3, 7, 17, 500000},
+		{"PASPOR_PLATINUM", "Platinum Mastercard", "PLATINUM_DEBIT", "PLATINUM",
+			33333, 0, 33333, 3333333, 33333333, 3333333, 33333333, 5, 10, 17, 500000},
+	}
+
+	for _, c := range cards {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO card_products (card_type, name, tier_key, style,
+				fee_monthly_admin, fee_card_issuance, fee_card_replacement,
+				limit_cash_withdrawal, limit_transfer_bca,
+				limit_transfer_interbank, limit_debit_purchase,
+				delivery_days_min, delivery_days_max, min_age, min_initial_deposit)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			ON CONFLICT (card_type) DO UPDATE SET
+				name = EXCLUDED.name,
+				tier_key = EXCLUDED.tier_key,
+				style = EXCLUDED.style,
+				fee_monthly_admin = EXCLUDED.fee_monthly_admin,
+				fee_card_issuance = EXCLUDED.fee_card_issuance,
+				fee_card_replacement = EXCLUDED.fee_card_replacement,
+				limit_cash_withdrawal = EXCLUDED.limit_cash_withdrawal,
+				limit_transfer_bca = EXCLUDED.limit_transfer_bca,
+				limit_transfer_interbank = EXCLUDED.limit_transfer_interbank,
+				limit_debit_purchase = EXCLUDED.limit_debit_purchase,
+				delivery_days_min = EXCLUDED.delivery_days_min,
+				delivery_days_max = EXCLUDED.delivery_days_max,
+				min_age = EXCLUDED.min_age,
+				min_initial_deposit = EXCLUDED.min_initial_deposit,
+				updated_at = NOW()`,
+			c.Type, c.Name, c.Tier, c.Style,
+			c.AdminFee, c.IssuanceFee, c.ReplaceFee,
+			c.LimitCash, c.LimitBCA, c.LimitInterbnk, c.LimitDebit,
+			c.DeliveryMin, c.DeliveryMax, c.MinAge, c.MinDeposit)
+		if err != nil {
+			log.Printf("  warn: insert card product %s: %v", c.Type, err)
+		}
+	}
+
+	// Pemetaan ke produk.
+	//
+	// Ketiga produk diisi supaya flow pilih kartu bisa dicoba pada semuanya di
+	// development. Lineup di bawah adalah TEBAKAN untuk dev, bukan penawaran
+	// resmi: Xpresi dan TabunganKu memang produk dengan tarif lebih rendah, jadi
+	// keduanya diberi kartu kelas bawah saja. Jawaban resminya §17 butir 1 —
+	// jangan menyalin daftar ini ke staging atau produksi.
+	options := []struct {
+		Product  string
+		Card     string
+		Order    int
+		Default  bool
+		Popular  bool
+		BadgeKey string
+	}{
+		{"TAHAPAN_BCA", "PASPOR_BLUE", 1, true, true, "RECOMMENDED_BEGINNER"},
+		{"TAHAPAN_BCA", "PASPOR_GOLD", 2, false, false, "FLEXIBLE_TRANSACTION"},
+		{"TAHAPAN_BCA", "PASPOR_PLATINUM", 3, false, false, "MAX_LIMIT"},
+
+		// Xpresi: dua kartu, Blue sebagai default.
+		{"TAHAPAN_XPRESI", "PASPOR_BLUE", 1, true, true, "RECOMMENDED_BEGINNER"},
+		{"TAHAPAN_XPRESI", "PASPOR_GOLD", 2, false, false, "FLEXIBLE_TRANSACTION"},
+
+		// TabunganKu: satu kartu saja. Produk setoran awal Rp20 ribu tidak
+		// masuk akal ditawari kartu dengan limit tertinggi.
+		{"TABUNGANKU", "PASPOR_BLUE", 1, true, false, "RECOMMENDED_BEGINNER"},
+	}
+
+	for _, o := range options {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO product_card_options (product_type, card_type, display_order,
+				is_default, is_popular, badge_key)
+			VALUES ($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (product_type, card_type, COALESCE(region_code, ''))
+			DO UPDATE SET
+				display_order = EXCLUDED.display_order,
+				is_default = EXCLUDED.is_default,
+				is_popular = EXCLUDED.is_popular,
+				badge_key = EXCLUDED.badge_key,
+				updated_at = NOW()`,
+			o.Product, o.Card, o.Order, o.Default, o.Popular, o.BadgeKey)
+		if err != nil {
+			log.Printf("  warn: insert card option %s/%s: %v", o.Product, o.Card, err)
+		}
+	}
+
+	log.Printf("  card products: %d seeded, %d options (ANGKA PLACEHOLDER DEV)",
+		len(cards), len(options))
 }
 
 func seedMutations(ctx context.Context, pool *pgxpool.Pool, user seedUser, now time.Time) {
@@ -328,12 +461,12 @@ func seedMutations(ctx context.Context, pool *pgxpool.Pool, user seedUser, now t
 	account := user.Accounts[0]
 
 	mutations := []struct {
-		Type        string
-		Amount      decimal.Decimal
-		Desc        string
-		Detail      string
-		Category    string
-		DaysAgo     int
+		Type     string
+		Amount   decimal.Decimal
+		Desc     string
+		Detail   string
+		Category string
+		DaysAgo  int
 	}{
 		{"CREDIT", decimal.NewFromInt(5000000), "TRANSFER MASUK", "Transfer dari BUDI SANTOSO", "TRANSFER", 0},
 		{"DEBIT", decimal.NewFromInt(150000), "QRIS TOKO SEJAHTERA", "Pembayaran QRIS", "QRIS", 1},
@@ -407,13 +540,13 @@ func seedNotifications(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID
 
 func seedEWalletProviders(ctx context.Context, pool *pgxpool.Pool) {
 	providers := []struct {
-		ID           string
-		Name         string
-		MinAmount    int64
-		MaxAmount    int64
-		AdminFee     int64
-		Presets      string
-		SortOrder    int
+		ID        string
+		Name      string
+		MinAmount int64
+		MaxAmount int64
+		AdminFee  int64
+		Presets   string
+		SortOrder int
 	}{
 		{"gopay", "GoPay", 10000, 2000000, 0, "[10000,20000,50000,100000,200000,500000]", 1},
 		{"ovo", "OVO", 10000, 2000000, 0, "[10000,20000,50000,100000,200000,500000]", 2},
@@ -478,10 +611,4 @@ func seedPromotions(ctx context.Context, pool *pgxpool.Pool, now time.Time) {
 		}
 	}
 	log.Printf("  promotions: %d seeded", len(promos))
-}
-
-// hashToken generates a SHA-256 hash for verification token seed data
-func hashToken(token string) string {
-	h := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(h[:])
 }

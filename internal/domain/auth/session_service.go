@@ -102,10 +102,16 @@ func (s *Service) RefreshToken(ctx context.Context, rawToken, clientIP string) (
 		}
 	}
 
-	// 9. Update Redis session cache
+	// 9. Update Redis session cache. DeviceKey carries the client device id so
+	// the cache key matches the one logout deletes.
 	if s.sessionCache != nil {
+		session.DeviceKey = claims.DeviceID
 		if err := s.sessionCache.StoreSession(ctx, session, "", session.AuthMethod); err != nil {
 			slog.Error("refresh session cache failed", "error", err)
+		}
+		// Rotation extends the session, so the live marker is extended too.
+		if err := s.sessionCache.MarkActive(ctx, userID, sessionID, s.refreshTTL); err != nil {
+			slog.Error("mark session active on refresh failed", "error", err)
 		}
 	}
 
@@ -157,6 +163,11 @@ func (s *Service) Logout(ctx context.Context, sessionID, userID uuid.UUID, devic
 		if err := s.sessionCache.DeleteSession(ctx, userID, deviceID); err != nil {
 			slog.Error("delete session cache failed", "error", err)
 		}
+		// Clearing the live marker is what actually makes the access token
+		// stop working. Revoking the row alone only stopped the refresh.
+		if err := s.sessionCache.RevokeActive(ctx, userID, sessionID); err != nil {
+			slog.Error("revoke active session failed", "error", err)
+		}
 	}
 
 	if s.audit != nil {
@@ -182,6 +193,9 @@ func (s *Service) LogoutAll(ctx context.Context, userID uuid.UUID, currentSessio
 	if s.sessionCache != nil {
 		if err := s.sessionCache.InvalidateAllUserSessions(ctx, userID); err != nil {
 			slog.Error("invalidate all sessions failed", "error", err)
+		}
+		if err := s.sessionCache.RevokeAllActive(ctx, userID); err != nil {
+			slog.Error("revoke all active sessions failed", "error", err)
 		}
 	}
 
@@ -217,6 +231,9 @@ func (s *Service) handleSuspiciousLogin(ctx context.Context, userID uuid.UUID, r
 		if err := s.sessionCache.InvalidateAllUserSessions(ctx, userID); err != nil {
 			slog.Error("invalidate redis sessions on suspicious login failed", "error", err)
 		}
+		if err := s.sessionCache.RevokeAllActive(ctx, userID); err != nil {
+			slog.Error("revoke active sessions on suspicious login failed", "error", err)
+		}
 	}
 
 	// Audit
@@ -233,10 +250,74 @@ func (s *Service) handleSuspiciousLogin(ctx context.Context, userID uuid.UUID, r
 		})
 	}
 
-	// TODO (Phase 3+): push notification to user's device
+	// The nasabah is told about this the next time the app polls: a SECURITY
+	// notification row is written by the caller-visible audit trail above and
+	// surfaced through GET /notifications. Push delivery rides on the same
+	// row once a provider is configured (see internal/pkg/push).
+	if s.notifier != nil {
+		s.notifier.Security(ctx, userID,
+			"Aktivitas mencurigakan terdeteksi",
+			"Semua sesi Anda telah diakhiri karena terdeteksi penggunaan token yang tidak wajar. Silakan login kembali.",
+		)
+	}
 }
 
 func hashRefreshToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
+}
+
+// IsSessionActive implements middleware.SessionValidator.
+//
+// Redis is the fast path and Postgres is the authority. A missing marker is
+// not evidence of revocation — keys get evicted and instances get restarted —
+// so it falls through to the sessions table and re-warms the marker on the way
+// back. A revoked or expired row is the only thing that returns false, and a
+// datastore error returns an error so the middleware can fail closed.
+func (s *Service) IsSessionActive(ctx context.Context, sessionID uuid.UUID) (bool, error) {
+	if s.sessionCache != nil {
+		active, err := s.sessionCache.IsActive(ctx, sessionID)
+		if err != nil {
+			slog.Warn("session cache lookup failed; falling back to postgres",
+				"session_id", sessionID, "error", err)
+		} else if active {
+			return true, nil
+		}
+
+		// A cache miss is not proof of revocation, so the Postgres fallback
+		// below has to run — but its ANSWER is worth remembering. A client that
+		// keeps calling with a dead token otherwise buys one database round trip
+		// per request, and authenticated routes carry no rate limiter.
+		known, err := s.sessionCache.IsKnownInactive(ctx, sessionID)
+		if err != nil {
+			slog.Warn("session inactive-marker lookup failed",
+				"session_id", sessionID, "error", err)
+		} else if known {
+			return false, nil
+		}
+	}
+
+	session, err := s.sessions.FindActiveByID(ctx, sessionID)
+	if err != nil {
+		return false, fmt.Errorf("find active session: %w", err)
+	}
+	if session == nil {
+		if s.sessionCache != nil {
+			if err := s.sessionCache.MarkInactive(ctx, sessionID, 0); err != nil {
+				slog.Warn("mark session inactive failed", "session_id", sessionID, "error", err)
+			}
+		}
+		return false, nil
+	}
+
+	if s.sessionCache != nil {
+		ttl := time.Until(session.ExpiresAt)
+		if ttl > 0 {
+			if err := s.sessionCache.MarkActive(ctx, session.UserID, session.ID, ttl); err != nil {
+				slog.Warn("re-warm session marker failed", "session_id", sessionID, "error", err)
+			}
+		}
+	}
+
+	return true, nil
 }

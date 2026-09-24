@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/holis12821/bca-mobile-api/internal/pkg/clientip"
 )
 
 func TestOnboardingAudit_CapturesContext(t *testing.T) {
@@ -13,6 +15,12 @@ func TestOnboardingAudit_CapturesContext(t *testing.T) {
 		captured = GetOnboardingAuditCtx(r.Context())
 		w.WriteHeader(http.StatusOK)
 	}))
+
+	// The request arrives from 192.0.2.1 (httptest's default RemoteAddr), which
+	// the resolver is told to trust as a proxy — so its forwarding header is
+	// believed. Without that trust the header is ignored; see the tests below.
+	resolver, _ := clientip.NewResolver([]string{"192.0.2.1"})
+	handler = RealIP(resolver)(handler)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/onboarding/sessions", nil)
 	req.Header.Set("X-Forwarded-For", "203.0.113.50")
@@ -61,20 +69,70 @@ func TestOnboardingAudit_AlwaysCapturesWhenMounted(t *testing.T) {
 	}
 }
 
-func TestExtractClientIP_XForwardedFor(t *testing.T) {
+// A forwarding header from an untrusted peer is spoofing, not information:
+// every one of these addresses lands in an audit log.
+func TestClientIP_IgnoresHeadersFromUntrustedPeer(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
-	ip := extractClientIP(req)
-	if ip != "1.2.3.4" {
-		t.Errorf("expected 1.2.3.4, got %s", ip)
+	req.Header.Set("X-Real-Ip", "10.0.0.1")
+
+	if ip := ClientIP(req); ip != "192.0.2.1" {
+		t.Errorf("expected the peer address 192.0.2.1, got %s", ip)
 	}
 }
 
-func TestExtractClientIP_XRealIP(t *testing.T) {
+func TestClientIP_TrustedProxyXForwardedFor(t *testing.T) {
+	resolver, bad := clientip.NewResolver([]string{"192.0.2.0/24"})
+	if len(bad) != 0 {
+		t.Fatalf("unexpected unparseable entries: %v", bad)
+	}
+
+	var got string
+	handler := RealIP(resolver)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got = ClientIP(r)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	// Client, then two proxy hops. The right-most non-trusted entry is the
+	// real client as far as our infrastructure can vouch for it.
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got != "5.6.7.8" {
+		t.Errorf("expected 5.6.7.8, got %s", got)
+	}
+}
+
+func TestClientIP_TrustedProxyXRealIP(t *testing.T) {
+	resolver, _ := clientip.NewResolver([]string{"192.0.2.1"})
+
+	var got string
+	handler := RealIP(resolver)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got = ClientIP(r)
+	}))
+
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Real-Ip", "10.0.0.1")
-	ip := extractClientIP(req)
-	if ip != "10.0.0.1" {
-		t.Errorf("expected 10.0.0.1, got %s", ip)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got != "10.0.0.1" {
+		t.Errorf("expected 10.0.0.1, got %s", got)
+	}
+}
+
+func TestClientIP_TrustedProxyRejectsJunkHeader(t *testing.T) {
+	resolver, _ := clientip.NewResolver([]string{"192.0.2.1"})
+
+	var got string
+	handler := RealIP(resolver)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got = ClientIP(r)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Forwarded-For", "not-an-ip")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got != "192.0.2.1" {
+		t.Errorf("expected fallback to peer address, got %s", got)
 	}
 }

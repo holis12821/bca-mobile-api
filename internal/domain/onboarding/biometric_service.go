@@ -100,25 +100,36 @@ func (s *BiometricService) ProcessBiometric(
 
 	// Audit: upload event
 	s.writeAudit(ctx, sessionID, AuditBiometricUploaded, "nasabah:"+session.DeviceID, map[string]any{
-		"face_photo_size":  len(facePhoto),
-		"frame_count":      len(livenessFrames),
-		"challenge_type":   meta.ChallengeType,
+		"face_photo_size": len(facePhoto),
+		"frame_count":     len(livenessFrames),
+		"challenge_type":  meta.ChallengeType,
 	}, ipAddress, userAgent)
 
 	// 4. Upload photos to storage (encrypted)
 	faceKey := fmt.Sprintf("%s/face_%s.jpg", sessionID, uuid.New().String())
+	uploaded := false
 	if s.storage != nil {
-		var encrypted []byte
+		encrypted := facePhoto
 		if s.aes != nil {
 			encrypted, err = s.aes.Encrypt(facePhoto)
 			if err != nil {
 				return nil, fmt.Errorf("encrypt face photo: %w", err)
 			}
-		} else {
-			encrypted = facePhoto
 		}
 		if _, err := s.storage.Upload(ctx, biometricPhotoBucket, faceKey, encrypted, "application/octet-stream"); err != nil {
 			return nil, fmt.Errorf("upload face photo: %w", err)
+		}
+		uploaded = true
+	}
+
+	// Any rejection below leaves a face photo in the bucket that no row points
+	// at, so it gets removed on the way out.
+	discardFace := func() {
+		if !uploaded {
+			return
+		}
+		if delErr := s.storage.Delete(ctx, biometricPhotoBucket, faceKey); delErr != nil {
+			slog.Error("discard face photo failed", "key", faceKey, "error", delErr)
 		}
 	}
 
@@ -136,6 +147,7 @@ func (s *BiometricService) ProcessBiometric(
 	// 6. Run biometric engine
 	analysis, err := s.engine.Analyze(ctx, facePhoto, livenessFrames, ktpPhotoData)
 	if err != nil {
+		discardFace()
 		return nil, fmt.Errorf("biometric analysis: %w", err)
 	}
 
@@ -144,24 +156,28 @@ func (s *BiometricService) ProcessBiometric(
 		s.writeAudit(ctx, sessionID, AuditBiometricFailed, "system", map[string]any{
 			"reason": "multiple_faces", "face_count": analysis.FaceCount,
 		}, ipAddress, userAgent)
+		discardFace()
 		return nil, apperr.BioMultipleFaces
 	}
 	if analysis.FaceCount == 0 {
 		s.writeAudit(ctx, sessionID, AuditBiometricFailed, "system", map[string]any{
 			"reason": "no_face_detected",
 		}, ipAddress, userAgent)
+		discardFace()
 		return nil, apperr.BioLowQuality
 	}
 	if analysis.Quality == "LOW" {
 		s.writeAudit(ctx, sessionID, AuditBiometricFailed, "system", map[string]any{
 			"reason": "low_quality",
 		}, ipAddress, userAgent)
+		discardFace()
 		return nil, apperr.BioLowQuality
 	}
 	if analysis.SpoofDetected {
 		s.writeAudit(ctx, sessionID, AuditBiometricFailed, "system", map[string]any{
 			"reason": "spoof_detected",
 		}, ipAddress, userAgent)
+		discardFace()
 		return nil, apperr.BioSpoofDetected
 	}
 
@@ -172,17 +188,23 @@ func (s *BiometricService) ProcessBiometric(
 		s.writeAudit(ctx, sessionID, AuditBiometricFailed, "system", map[string]any{
 			"reason": "liveness_failed", "score": analysis.LivenessScore,
 		}, ipAddress, userAgent)
+		discardFace()
 		return nil, apperr.BioLivenessFailed
 	}
 	if !faceMatchVerified {
 		s.writeAudit(ctx, sessionID, AuditBiometricFailed, "system", map[string]any{
 			"reason": "face_not_match", "score": analysis.FaceMatchScore,
 		}, ipAddress, userAgent)
+		discardFace()
 		return nil, apperr.BioFaceNotMatch
 	}
 
 	// 8. Store biometric result
-	bioID := "bio_" + generateShortID()
+	shortID, err := generateShortID()
+	if err != nil {
+		return nil, fmt.Errorf("generate biometric id: %w", err)
+	}
+	bioID := "bio_" + shortID
 	now := time.Now().UTC()
 
 	result := &BiometricResult{
@@ -195,13 +217,14 @@ func (s *BiometricService) ProcessBiometric(
 		FaceMatchVerified: faceMatchVerified,
 		FaceMatchScore:    analysis.FaceMatchScore,
 		ISOCompliant:      analysis.ISOCompliant,
-		SpoofDetected:     false,
+		SpoofDetected:     analysis.SpoofDetected,
 		FrameCount:        len(livenessFrames),
 		CreatedAt:         now,
 		AutoDeleteAt:      now.Add(biometricAutoDeleteTTL),
 	}
 
 	if err := s.biometrics.Create(ctx, result); err != nil {
+		discardFace()
 		return nil, fmt.Errorf("store biometric result: %w", err)
 	}
 
@@ -215,7 +238,6 @@ func (s *BiometricService) ProcessBiometric(
 	if s.cache != nil {
 		session.CurrentStep = StepVideoCall
 		session.StepsCompleted = completed
-		session.ExpiresAt = time.Now().Add(sessionTTL)
 		if cacheErr := s.cache.Store(ctx, session); cacheErr != nil {
 			slog.Error("cache step update failed", "error", cacheErr)
 		}
@@ -223,10 +245,10 @@ func (s *BiometricService) ProcessBiometric(
 
 	// Audit: verified
 	s.writeAudit(ctx, sessionID, AuditBiometricVerified, "system", map[string]any{
-		"biometric_id":    bioID,
-		"liveness_score":  analysis.LivenessScore,
+		"biometric_id":     bioID,
+		"liveness_score":   analysis.LivenessScore,
 		"face_match_score": analysis.FaceMatchScore,
-		"iso_compliant":   analysis.ISOCompliant,
+		"iso_compliant":    analysis.ISOCompliant,
 	}, ipAddress, userAgent)
 
 	return &BiometricResponse{

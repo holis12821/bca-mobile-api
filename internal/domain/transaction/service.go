@@ -14,23 +14,25 @@ import (
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/account"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/notify"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/pagination"
 )
 
 type Service struct {
-	mutations   MutationRepository
-	txns        TransactionRepository
-	inquiries   InquiryRepository
-	vtokens     VerificationTokenRepository
-	favorites   FavoriteTransferRepository
-	accounts    account.AccountRepository
-	executor    TransferExecutor
+	mutations        MutationRepository
+	txns             TransactionRepository
+	inquiries        InquiryRepository
+	vtokens          VerificationTokenRepository
+	favorites        FavoriteTransferRepository
+	accounts         account.AccountRepository
+	executor         TransferExecutor
 	inquiryCache     InquiryCache
 	vtokenCache      VerificationTokenCache
 	recentCache      RecentTransferCache
 	receiptCache     ReceiptCache
 	cacheInvalidator TransactionCacheInvalidator
 	idemStore        IdempotencyStore
+	notifier         *notify.Notifier
 	versions         account.VersionCounter
 }
 
@@ -48,6 +50,7 @@ type ServiceConfig struct {
 	ReceiptCache     ReceiptCache
 	CacheInvalidator TransactionCacheInvalidator
 	IdemStore        IdempotencyStore
+	Notifier         *notify.Notifier
 	Versions         account.VersionCounter
 }
 
@@ -66,14 +69,27 @@ func NewService(cfg ServiceConfig) *Service {
 		receiptCache:     cfg.ReceiptCache,
 		cacheInvalidator: cfg.CacheInvalidator,
 		idemStore:        cfg.IdemStore,
+		notifier:         cfg.Notifier,
 		versions:         cfg.Versions,
 	}
 }
 
 // ListMutations returns keyset-paginated mutations for an account.
+//
+// account_id comes from the query string and the repository filters on it
+// alone, so the ownership check has to happen here — without it any logged-in
+// user could page through another customer's statement.
 func (s *Service) ListMutations(ctx context.Context, userID uuid.UUID, accountID uuid.UUID, cursorStr string, limit int, period *DateRange) ([]MutationItem, bool, string, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 20
+	}
+
+	owned, err := s.accounts.FindOwnedByID(ctx, userID, accountID)
+	if err != nil {
+		return nil, false, "", fmt.Errorf("resolve account: %w", err)
+	}
+	if owned == nil {
+		return nil, false, "", apperr.SourceAccountForbidden
 	}
 
 	var cursor *MutationCursorValues
@@ -320,6 +336,39 @@ func (s *Service) CreateVerificationToken(ctx context.Context, userID uuid.UUID,
 	}, nil
 }
 
+// ConsumeVerificationToken burns a purpose-bound token issued by
+// POST /auth/pin/verify, checking that it belongs to this user and was issued
+// for this purpose. Single-use: a second call with the same token fails.
+//
+// Used by the endpoints that change security-relevant settings but move no
+// money — limits and profile — which previously accepted an access token
+// alone, so anyone holding one could raise their own daily ceiling.
+func (s *Service) ConsumeVerificationToken(ctx context.Context, userID uuid.UUID, rawToken, purpose string) error {
+	if rawToken == "" {
+		return apperr.VerificationTokenInvalid
+	}
+	if !ValidPurposes[purpose] {
+		return apperr.ValidationError
+	}
+	if s.vtokenCache == nil {
+		return apperr.InternalError
+	}
+
+	tokenHash := hashToken(rawToken)
+	tokenUserID, tokenPurpose, err := s.vtokenCache.ConsumeToken(ctx, tokenHash)
+	if err != nil {
+		return fmt.Errorf("consume vtoken: %w", err)
+	}
+	if tokenUserID == "" || tokenUserID != userID.String() || tokenPurpose != purpose {
+		return apperr.VerificationTokenInvalid
+	}
+
+	if err := s.vtokens.MarkUsed(ctx, tokenHash); err != nil {
+		slog.Warn("mark vtoken used in pg failed", "error", err)
+	}
+	return nil
+}
+
 func hashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
@@ -383,7 +432,19 @@ func toTransactionItem(t Transaction) TransactionItem {
 func (s *Service) GetReceipt(ctx context.Context, userID, txnID uuid.UUID) (*ReceiptResponse, error) {
 	txnIDStr := txnID.String()
 
-	// Check cache first (receipts are immutable, 24h TTL)
+	// Ownership FIRST, cache second. The cache is keyed by transaction id
+	// alone, so consulting it before this check handed any logged-in user a
+	// copy of somebody else's receipt for the 24 hours it stayed warm.
+	txn, err := s.txns.FindByID(ctx, userID, txnID)
+	if err != nil {
+		return nil, fmt.Errorf("find transaction: %w", err)
+	}
+	if txn == nil {
+		return nil, apperr.NotFound
+	}
+
+	// Receipts are immutable, so a hit here is safe now that the caller has
+	// been shown to own the transaction.
 	if s.receiptCache != nil {
 		cached, err := s.receiptCache.GetReceipt(ctx, txnIDStr)
 		if err != nil {
@@ -392,14 +453,6 @@ func (s *Service) GetReceipt(ctx context.Context, userID, txnID uuid.UUID) (*Rec
 		if cached != nil {
 			return cached, nil
 		}
-	}
-
-	txn, err := s.txns.FindByID(ctx, userID, txnID)
-	if err != nil {
-		return nil, fmt.Errorf("find transaction: %w", err)
-	}
-	if txn == nil {
-		return nil, apperr.NotFound
 	}
 
 	// Resolve source account info

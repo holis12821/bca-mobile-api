@@ -3,9 +3,11 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
@@ -25,17 +27,24 @@ func (r *OnboardingSessionRepo) Create(ctx context.Context, session *onboarding.
 		return fmt.Errorf("marshal steps: %w", err)
 	}
 
+	// Kolom kartu ikut ditulis di sini. Migrasi 000019 membuat ketiganya, tapi
+	// INSERT ini sempat tidak menyebutnya sama sekali: card_type yang dikirim
+	// nasabah tersimpan di memori, hilang begitu baris ditulis, dan submit
+	// menemukan sesi tanpa kartu. Kolom yang ada di migrasi harus ada di sini.
 	query := `
 		INSERT INTO onboarding_sessions
 			(id, session_id, device_id, product_type, current_step, tnc_version,
-			 steps_completed, created_at, updated_at, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+			 steps_completed, created_at, updated_at, expires_at,
+			 card_type, card_selected_at, card_catalog_version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`
 
 	_, err = r.pool.Exec(ctx, query,
 		session.ID, session.SessionID, session.DeviceID,
 		string(session.ProductType), string(session.CurrentStep), session.TNCVersion,
 		stepsJSON,
 		session.CreatedAt, session.UpdatedAt, session.ExpiresAt,
+		nullableText(session.CardType), session.CardSelectedAt,
+		nullableText(session.CardCatalogVersion),
 	)
 	if err != nil {
 		return fmt.Errorf("insert onboarding session: %w", err)
@@ -46,22 +55,25 @@ func (r *OnboardingSessionRepo) Create(ctx context.Context, session *onboarding.
 func (r *OnboardingSessionRepo) FindBySessionID(ctx context.Context, sessionID string) (*onboarding.Session, error) {
 	query := `
 		SELECT id, session_id, device_id, product_type, current_step, tnc_version,
-		       steps_completed, created_at, updated_at, expires_at, deleted_at
+		       steps_completed, created_at, updated_at, expires_at, deleted_at,
+		       card_type, card_selected_at, card_catalog_version
 		FROM onboarding_sessions
 		WHERE session_id = $1 AND deleted_at IS NULL`
 
 	var s onboarding.Session
 	var pt, step string
 	var stepsJSON []byte
+	var cardType, cardCatalogVersion *string
 
 	err := r.pool.QueryRow(ctx, query, sessionID).Scan(
 		&s.ID, &s.SessionID, &s.DeviceID,
 		&pt, &step, &s.TNCVersion,
 		&stepsJSON,
 		&s.CreatedAt, &s.UpdatedAt, &s.ExpiresAt, &s.DeletedAt,
+		&cardType, &s.CardSelectedAt, &cardCatalogVersion,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find onboarding session: %w", err)
@@ -69,6 +81,12 @@ func (r *OnboardingSessionRepo) FindBySessionID(ctx context.Context, sessionID s
 
 	s.ProductType = onboarding.ProductType(pt)
 	s.CurrentStep = onboarding.Step(step)
+	if cardType != nil {
+		s.CardType = *cardType
+	}
+	if cardCatalogVersion != nil {
+		s.CardCatalogVersion = *cardCatalogVersion
+	}
 
 	if err := json.Unmarshal(stepsJSON, &s.StepsCompleted); err != nil {
 		return nil, fmt.Errorf("unmarshal steps: %w", err)
@@ -96,14 +114,16 @@ func (r *OnboardingSessionRepo) UpdateStep(ctx context.Context, sessionID string
 	}
 
 	now := time.Now().UTC()
-	newExpiry := now.Add(24 * time.Hour)
 
+	// expires_at is deliberately untouched: a session lives 24h from creation.
+	// Refreshing it on every step produced a session that never expired as
+	// long as the client kept moving, contradicting ONBOARDING_SESSION_EXPIRED.
 	query := `
 		UPDATE onboarding_sessions
-		SET current_step = $2, steps_completed = $3, updated_at = $4, expires_at = $5
+		SET current_step = $2, steps_completed = $3, updated_at = $4
 		WHERE session_id = $1 AND deleted_at IS NULL`
 
-	tag, err := r.pool.Exec(ctx, query, sessionID, string(step), stepsJSON, now, newExpiry)
+	tag, err := r.pool.Exec(ctx, query, sessionID, string(step), stepsJSON, now)
 	if err != nil {
 		return fmt.Errorf("update step: %w", err)
 	}
@@ -111,6 +131,51 @@ func (r *OnboardingSessionRepo) UpdateStep(ctx context.Context, sessionID string
 		return fmt.Errorf("session not found")
 	}
 	return nil
+}
+
+// UpdateCard menyimpan pilihan kartu bersama langkah sesi dalam satu UPDATE.
+//
+// Kolom langkah lain tidak disebut sama sekali: mengganti kartu tidak boleh
+// menyentuh hasil OCR, biometrik, maupun kredensial yang sudah tersimpan (§8).
+func (r *OnboardingSessionRepo) UpdateCard(ctx context.Context, sessionID string, upd onboarding.SessionCardUpdate) error {
+	stepsJSON, err := json.Marshal(upd.StepsCompleted)
+	if err != nil {
+		return fmt.Errorf("marshal steps: %w", err)
+	}
+
+	query := `
+		UPDATE onboarding_sessions
+		SET card_type = $2,
+		    card_selected_at = $3,
+		    card_catalog_version = $4,
+		    current_step = $5,
+		    steps_completed = $6,
+		    updated_at = $7
+		WHERE session_id = $1 AND deleted_at IS NULL`
+
+	tag, err := r.pool.Exec(ctx, query, sessionID,
+		upd.CardType, upd.SelectedAt, nullableText(upd.CatalogVersion),
+		string(upd.CurrentStep), stepsJSON, time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("update session card: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("session not found")
+	}
+	return nil
+}
+
+// nullableText memetakan string kosong ke NULL.
+//
+// card_type punya foreign key ke card_products(card_type): string kosong akan
+// ditolak sebagai pelanggaran FK, sementara NULL adalah keadaan yang memang
+// dimaksud — sesi yang belum memilih kartu.
+func nullableText(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return &v
 }
 
 func (r *OnboardingSessionRepo) CountActiveByDevice(ctx context.Context, deviceID string, since time.Time) (int, error) {
@@ -273,7 +338,7 @@ func (r *OnboardingOCRResultRepo) FindBySessionID(ctx context.Context, sessionID
 		&result.CreatedAt, &result.AutoDeleteAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find ocr result: %w", err)
@@ -398,7 +463,7 @@ func (r *OnboardingPersonalDataRepo) FindBySessionID(ctx context.Context, sessio
 		&data.CreatedAt, &data.UpdatedAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find personal data: %w", err)
@@ -467,7 +532,7 @@ func (r *OnboardingBiometricRepo) FindBySessionID(ctx context.Context, sessionID
 		&result.CreatedAt, &result.AutoDeleteAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find biometric result: %w", err)
@@ -541,7 +606,7 @@ func (r *OnboardingVideoCallRepo) scanVideoCall(ctx context.Context, query, para
 		&vc.JoinedAt, &vc.StartedAt, &vc.EndedAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("scan video call: %w", err)
@@ -633,7 +698,7 @@ func (r *OnboardingCredentialRepo) FindBySessionID(ctx context.Context, sessionI
 		&cred.CreatedAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find credential: %w", err)

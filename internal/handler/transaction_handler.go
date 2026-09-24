@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/domain/transaction"
 	"github.com/holis12821/bca-mobile-api/internal/middleware"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/pdf"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/response"
 )
 
@@ -160,6 +162,84 @@ func (h *TransactionHandler) GetReceipt(w http.ResponseWriter, r *http.Request) 
 	}
 
 	response.Success(w, r, http.StatusOK, receipt)
+}
+
+// GetReceiptPDF handles GET /v1/transactions/{transaction_id}/receipt/pdf
+//
+// Same ownership rules as the JSON receipt — it goes through the same service
+// call, so a transaction that is not the caller's is a 404 here too.
+func (h *TransactionHandler) GetReceiptPDF(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
+	if err != nil {
+		response.Err(w, r, apperr.TokenInvalid)
+		return
+	}
+
+	txnID, err := uuid.Parse(chi.URLParam(r, "transaction_id"))
+	if err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	receipt, err := h.svc.GetReceipt(r.Context(), userID, txnID)
+	if err != nil {
+		h.handleError(w, r, err, "get receipt pdf")
+		return
+	}
+
+	body := renderReceiptPDF(receipt)
+
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf("attachment; filename=\"bukti-transaksi-%s.pdf\"", receipt.ReferenceNumber))
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		slog.Error("write receipt pdf failed",
+			"request_id", chimiddleware.GetReqID(r.Context()), "error", err)
+	}
+}
+
+// renderReceiptPDF lays the receipt out as a one-page document.
+func renderReceiptPDF(receipt *transaction.ReceiptResponse) []byte {
+	doc := pdf.New("Bukti Transaksi")
+
+	doc.Heading("BCA mobile", 18)
+	doc.Heading("Bukti Transaksi", 13)
+	doc.Rule()
+
+	doc.Field("Status", receipt.Status)
+	doc.Field("Nomor Referensi", receipt.ReferenceNumber)
+	doc.Field("Tanggal", receipt.Date+" "+receipt.Time)
+	doc.Rule()
+
+	doc.Field("Rekening Sumber", receipt.SourceAccount+"  "+receipt.SourceName)
+	if receipt.DestinationAccount != "" {
+		dest := receipt.DestinationAccount
+		if receipt.DestinationName != "" {
+			dest += "  " + receipt.DestinationName
+		}
+		doc.Field("Rekening Tujuan", dest)
+	}
+	if receipt.DestinationBank != "" {
+		doc.Field("Bank Tujuan", receipt.DestinationBank)
+	}
+	if receipt.ProviderName != "" {
+		doc.Field("Provider", receipt.ProviderName)
+	}
+	doc.Rule()
+
+	doc.Field("Nominal", receipt.Currency+" "+receipt.Amount)
+	doc.Field("Biaya Admin", receipt.Currency+" "+receipt.AdminFee)
+	doc.Field("Total", receipt.Currency+" "+receipt.Total)
+	if receipt.Notes != "" {
+		doc.Field("Berita", receipt.Notes)
+	}
+
+	doc.Rule()
+	doc.Text("Dokumen ini dihasilkan otomatis dan sah tanpa tanda tangan.")
+
+	return doc.Render()
 }
 
 func (h *TransactionHandler) handleError(w http.ResponseWriter, r *http.Request, err error, operation string) {

@@ -2,10 +2,13 @@ package onboarding
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/holis12821/bca-mobile-api/internal/pkg/metrics"
 )
 
 func setupMonitoringService() (*MonitoringService, *mockSessionRepo, *mockAuditRepo, *mockQueueCache) {
@@ -153,5 +156,113 @@ func TestRetentionPolicy(t *testing.T) {
 	}
 	if RetentionPolicy["credentials"] != 0 {
 		t.Error("credentials retention should be 0 (until account closed)")
+	}
+}
+
+// --- Alert rasio kartu tidak tersedia (§Prompt 8) ---
+//
+// Diuji dengan data sintetis: counter dinaikkan langsung, tanpa menjalankan
+// seluruh flow. Yang diuji di sini adalah aturan alert-nya, bukan jalan yang
+// menaikkan angkanya — itu sudah punya testnya sendiri.
+
+func monitoringWithMetrics() (*MonitoringService, *metrics.Registry) {
+	reg := metrics.NewRegistry()
+	svc := NewMonitoringService(MonitoringServiceConfig{
+		Sessions: newMockSessionRepo(),
+		Audit:    &mockAuditRepo{},
+		Metrics:  reg,
+	})
+	return svc, reg
+}
+
+func findAlert(status *MonitoringStatus, rule string) *MonitoringAlert {
+	for i := range status.Alerts {
+		if status.Alerts[i].Rule == rule {
+			return &status.Alerts[i]
+		}
+	}
+	return nil
+}
+
+func TestEvaluateAlerts_CardUnavailableRatioAboveThreshold(t *testing.T) {
+	svc, reg := monitoringWithMetrics()
+
+	// 30 pemilihan berhasil, 6 ditolak → 6/36 = 16,7%, di atas ambang 5%.
+	for i := 0; i < 30; i++ {
+		reg.Inc(metrics.CardSelected, metrics.Labels{"card_type": "PASPOR_BLUE"})
+	}
+	for i := 0; i < 6; i++ {
+		reg.Inc(metrics.CardUnavailable, metrics.Labels{
+			"card_type": "PASPOR_PLATINUM", "reason_key": "STOCK_EMPTY_IN_REGION",
+		})
+	}
+
+	alert := findAlert(svc.EvaluateAlerts(context.Background()), "CARD_UNAVAILABLE_RATIO_HIGH")
+	if alert == nil {
+		t.Fatal("alert tidak berbunyi padahal rasio 16,7%")
+	}
+	if !strings.Contains(alert.Message, "6 dari 36") {
+		t.Errorf("pesan alert harus menyebut angkanya: %q", alert.Message)
+	}
+}
+
+func TestEvaluateAlerts_CardUnavailableRatioBelowThreshold(t *testing.T) {
+	svc, reg := monitoringWithMetrics()
+
+	// 60 berhasil, 1 ditolak → 1,6%, di bawah ambang.
+	for i := 0; i < 60; i++ {
+		reg.Inc(metrics.CardSelected, metrics.Labels{"card_type": "PASPOR_BLUE"})
+	}
+	reg.Inc(metrics.CardUnavailable, metrics.Labels{"card_type": "PASPOR_GOLD"})
+
+	if alert := findAlert(svc.EvaluateAlerts(context.Background()), "CARD_UNAVAILABLE_RATIO_HIGH"); alert != nil {
+		t.Errorf("alert berbunyi untuk rasio normal: %q", alert.Message)
+	}
+}
+
+// Sampel kecil tidak boleh membunyikan alert: satu penolakan di antara tiga
+// pemilihan adalah 33% dan sepenuhnya normal di jam sepi.
+func TestEvaluateAlerts_CardUnavailableIgnoresSmallSample(t *testing.T) {
+	svc, reg := monitoringWithMetrics()
+
+	reg.Inc(metrics.CardSelected, metrics.Labels{"card_type": "PASPOR_BLUE"})
+	reg.Inc(metrics.CardSelected, metrics.Labels{"card_type": "PASPOR_BLUE"})
+	reg.Inc(metrics.CardUnavailable, metrics.Labels{"card_type": "PASPOR_GOLD"})
+
+	if alert := findAlert(svc.EvaluateAlerts(context.Background()), "CARD_UNAVAILABLE_RATIO_HIGH"); alert != nil {
+		t.Errorf("alert berbunyi untuk sampel kecil: %q", alert.Message)
+	}
+}
+
+// Penggantian kartu ikut menjadi penyebut: tanpa itu, rasio akan terlihat lebih
+// buruk daripada keadaan sebenarnya pada sesi yang bolak-balik mengganti kartu.
+func TestEvaluateAlerts_CardChangedCountsInDenominator(t *testing.T) {
+	svc, reg := monitoringWithMetrics()
+
+	for i := 0; i < 5; i++ {
+		reg.Inc(metrics.CardSelected, metrics.Labels{"card_type": "PASPOR_BLUE"})
+	}
+	for i := 0; i < 25; i++ {
+		reg.Inc(metrics.CardChanged, metrics.Labels{"from": "PASPOR_BLUE", "to": "PASPOR_GOLD"})
+	}
+	// 1 dari 31 = 3,2% — di bawah ambang HANYA kalau penggantian ikut dihitung.
+	reg.Inc(metrics.CardUnavailable, metrics.Labels{"card_type": "PASPOR_PLATINUM"})
+
+	if alert := findAlert(svc.EvaluateAlerts(context.Background()), "CARD_UNAVAILABLE_RATIO_HIGH"); alert != nil {
+		t.Errorf("penggantian kartu tidak masuk penyebut: %q", alert.Message)
+	}
+}
+
+// Tanpa registry, aturan ini dilewati — bukan panic, dan bukan membuat seluruh
+// endpoint monitoring gagal.
+func TestEvaluateAlerts_NoMetricsRegistryIsSafe(t *testing.T) {
+	svc := NewMonitoringService(MonitoringServiceConfig{
+		Sessions: newMockSessionRepo(),
+		Audit:    &mockAuditRepo{},
+	})
+
+	status := svc.EvaluateAlerts(context.Background())
+	if findAlert(status, "CARD_UNAVAILABLE_RATIO_HIGH") != nil {
+		t.Error("alert berbunyi tanpa registry")
 	}
 }

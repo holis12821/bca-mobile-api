@@ -12,11 +12,11 @@ import (
 func TestParseEMVCo_ValidStaticQR(t *testing.T) {
 	// Build a minimal valid EMVCo payload
 	qr := buildTLV(map[string]string{
-		"00": "01",                   // format indicator
-		"01": "11",                   // static
-		"59": "TOKO SEJAHTERA",       // merchant name
-		"60": "JAKARTA",              // merchant city
-		"58": "ID",                   // country
+		"00": "01",             // format indicator
+		"01": "11",             // static
+		"59": "TOKO SEJAHTERA", // merchant name
+		"60": "JAKARTA",        // merchant city
+		"58": "ID",             // country
 	})
 
 	decoded, err := ParseEMVCo(qr)
@@ -96,10 +96,7 @@ func TestParseTLV_Valid(t *testing.T) {
 }
 
 func TestParseTLV_MultipleFields(t *testing.T) {
-	raw := "000201" + "590413TOKO"
-	// Wait, length must be 2 digits. "59" + "04" + "TOKO" would be len 4
-	// but "13TOKO" is wrong. Let me build correctly.
-	raw = buildTLV(map[string]string{
+	raw := buildTLV(map[string]string{
 		"00": "01",
 		"59": "TOKO",
 	})

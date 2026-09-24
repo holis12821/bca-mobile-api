@@ -2,8 +2,11 @@ package onboarding
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 )
 
 // --- in-memory mocks for personal data service ---
@@ -48,18 +51,22 @@ func (m *mockOCRResultRepo) FindBySessionID(_ context.Context, sessionID string)
 }
 
 type mockOTPCache struct {
-	otps        map[string]string
-	attempts    map[string]int64
-	blocked     map[string]bool
-	blockExpiry map[string]time.Time
+	otps         map[string]string
+	attempts     map[string]int64
+	resends      map[string]int64
+	resendExpiry map[string]time.Time
+	blocked      map[string]bool
+	blockExpiry  map[string]time.Time
 }
 
 func newMockOTPCache() *mockOTPCache {
 	return &mockOTPCache{
-		otps:        make(map[string]string),
-		attempts:    make(map[string]int64),
-		blocked:     make(map[string]bool),
-		blockExpiry: make(map[string]time.Time),
+		otps:         make(map[string]string),
+		attempts:     make(map[string]int64),
+		resends:      make(map[string]int64),
+		resendExpiry: make(map[string]time.Time),
+		blocked:      make(map[string]bool),
+		blockExpiry:  make(map[string]time.Time),
 	}
 }
 
@@ -80,6 +87,37 @@ func (m *mockOTPCache) DeleteOTP(_ context.Context, sessionID string) error {
 func (m *mockOTPCache) IncrAttempt(_ context.Context, sessionID string) (int64, error) {
 	m.attempts[sessionID]++
 	return m.attempts[sessionID], nil
+}
+
+func (m *mockOTPCache) ResetAttempts(_ context.Context, sessionID string) error {
+	delete(m.attempts, sessionID)
+	return nil
+}
+
+func (m *mockOTPCache) IncrResend(_ context.Context, sessionID string) (int64, error) {
+	m.resends[sessionID]++
+	if m.resends[sessionID] == 1 {
+		m.resendExpiry[sessionID] = time.Now().Add(time.Hour)
+	}
+	return m.resends[sessionID], nil
+}
+
+func (m *mockOTPCache) ResendWindowRemaining(_ context.Context, sessionID string) (time.Duration, error) {
+	exp, ok := m.resendExpiry[sessionID]
+	if !ok {
+		return 0, nil
+	}
+	rem := time.Until(exp)
+	if rem < 0 {
+		return 0, nil
+	}
+	return rem, nil
+}
+
+func (m *mockOTPCache) ResetResend(_ context.Context, sessionID string) error {
+	delete(m.resends, sessionID)
+	delete(m.resendExpiry, sessionID)
+	return nil
 }
 
 func (m *mockOTPCache) IsBlocked(_ context.Context, sessionID string) (bool, error) {
@@ -402,10 +440,12 @@ func TestResendOTP_Success(t *testing.T) {
 	cache.data[sessionID].CurrentStep = StepOTPVerify
 
 	// Store personal data so resend can find the phone number
-	svc.personalData.Create(ctx, &PersonalData{
+	if err := svc.personalData.Create(ctx, &PersonalData{
 		SessionID: sessionID,
 		NomorHP:   "081234568889",
-	})
+	}); err != nil {
+		t.Fatalf("siapkan data pribadi: %v", err)
+	}
 
 	// Store initial OTP
 	otpCache.otps[sessionID] = hashOTP("111111")
@@ -443,13 +483,13 @@ func TestResendOTP_Success(t *testing.T) {
 	found := false
 	for _, log := range audit.logs {
 		if log.EventType == AuditOTPSent {
-			if reason, ok := log.Details["reason"].(string); ok && reason == "user_resend" {
+			if reason, ok := log.Details["reason"].(string); ok && reason == otpTriggerResend {
 				found = true
 			}
 		}
 	}
 	if !found {
-		t.Error("expected OTP_SENT audit log with reason=user_resend")
+		t.Error("expected OTP_SENT audit log with reason=resend")
 	}
 }
 
@@ -519,5 +559,315 @@ func TestGenerateOTP(t *testing.T) {
 			t.Errorf("OTP contains non-digit: %q", otp)
 			break
 		}
+	}
+}
+
+// --- OTP policy: resend quota, device binding, delivery failure ---
+
+// atOTPVerify puts a session on the OTP_VERIFY step with personal data stored,
+// which is what resend-otp needs to find a phone number.
+func atOTPVerify(t *testing.T, svc *PersonalDataService, sessionRepo *mockSessionRepo, cache *mockSessionCache, ocrRepo *mockOCRResultRepo) string {
+	t.Helper()
+	sessionID := createTestSession(sessionRepo, cache, ocrRepo)
+	sessionRepo.sessions[sessionID].CurrentStep = StepOTPVerify
+	cache.data[sessionID].CurrentStep = StepOTPVerify
+	if err := svc.personalData.Create(context.Background(), &PersonalData{
+		PersonalDataID: "pd_test123",
+		SessionID:      sessionID,
+		NomorHP:        "081234568889",
+	}); err != nil {
+		t.Fatalf("seed personal data: %v", err)
+	}
+	return sessionID
+}
+
+func asAppErr(t *testing.T, err error) apperr.Error {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	return apperr.From(err)
+}
+
+// details reaches into apperr.Error.Details, which is an untyped any.
+func details(t *testing.T, appErr apperr.Error) map[string]any {
+	t.Helper()
+	d, ok := appErr.Details.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map details, got %#v", appErr.Details)
+	}
+	return d
+}
+
+func TestResendOTP_QuotaExhausted(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, _, sms, _ := setupPDService()
+	ctx := context.Background()
+	sessionID := atOTPVerify(t, svc, sessionRepo, cache, ocrRepo)
+
+	for i := int64(1); i <= otpMaxResend; i++ {
+		if _, err := svc.ResendOTP(ctx, ResendOTPRequest{SessionID: sessionID}, "127.0.0.1", "ua"); err != nil {
+			t.Fatalf("resend %d should be allowed: %v", i, err)
+		}
+	}
+
+	_, err := svc.ResendOTP(ctx, ResendOTPRequest{SessionID: sessionID}, "127.0.0.1", "ua")
+	appErr := asAppErr(t, err)
+	if appErr.Code != apperr.RateLimitExceeded.Code {
+		t.Fatalf("expected RATE_LIMIT_EXCEEDED, got %s", appErr.Code)
+	}
+	if appErr.Status != 429 {
+		t.Errorf("expected 429, got %d", appErr.Status)
+	}
+	retry, ok := details(t, appErr)["retry_after_seconds"].(int)
+	if !ok {
+		t.Fatalf("details.retry_after_seconds missing or not an int: %#v", appErr.Details)
+	}
+	if retry <= 0 {
+		t.Errorf("retry_after_seconds should count down the quota window, got %d", retry)
+	}
+
+	// The rejected request must not have cost an SMS.
+	if len(sms.sent) != int(otpMaxResend) {
+		t.Errorf("expected %d SMS, got %d", otpMaxResend, len(sms.sent))
+	}
+}
+
+func TestResendOTP_InvalidatesPreviousCode(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, otpCache, sms, _ := setupPDService()
+	ctx := context.Background()
+	sessionID := atOTPVerify(t, svc, sessionRepo, cache, ocrRepo)
+
+	oldCode := "111111"
+	otpCache.otps[sessionID] = hashOTP(oldCode)
+
+	if _, err := svc.ResendOTP(ctx, ResendOTPRequest{SessionID: sessionID}, "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("resend failed: %v", err)
+	}
+
+	if _, err := svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: oldCode}, "127.0.0.1", "ua"); err == nil {
+		t.Fatal("the superseded code must stop verifying after a resend")
+	}
+
+	// The code that actually went out is the one that works.
+	newCode := sms.sent[len(sms.sent)-1].otp
+	if _, err := svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: newCode}, "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("the resent code should verify: %v", err)
+	}
+}
+
+func TestResendOTP_DoesNotResetFailureCounter(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, otpCache, _, _ := setupPDService()
+	ctx := context.Background()
+	sessionID := atOTPVerify(t, svc, sessionRepo, cache, ocrRepo)
+	otpCache.otps[sessionID] = hashOTP("847291")
+
+	// Four wrong guesses, then a resend, then one more wrong guess. If the
+	// resend refilled the budget the fifth failure would not block.
+	for i := 0; i < 4; i++ {
+		_, _ = svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: "000000"}, "127.0.0.1", "ua")
+	}
+	if _, err := svc.ResendOTP(ctx, ResendOTPRequest{SessionID: sessionID}, "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("resend failed: %v", err)
+	}
+	_, _ = svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: "000000"}, "127.0.0.1", "ua")
+
+	if !otpCache.blocked[sessionID] {
+		t.Error("a resend must not hand the nasabah a fresh attempt budget")
+	}
+}
+
+func TestRegenerateOTP_DoesNotSpendResendQuota(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, otpCache, _, _ := setupPDService()
+	ctx := context.Background()
+	sessionID := atOTPVerify(t, svc, sessionRepo, cache, ocrRepo)
+	otpCache.otps[sessionID] = hashOTP("847291")
+
+	// Three failures trigger one automatic regeneration.
+	for i := 0; i < otpRegenAt; i++ {
+		_, _ = svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: "000000"}, "127.0.0.1", "ua")
+	}
+
+	if otpCache.resends[sessionID] != 0 {
+		t.Errorf("automatic regeneration must not charge the nasabah's quota, spent %d", otpCache.resends[sessionID])
+	}
+	// All three nasabah-requested resends are still available.
+	for i := int64(1); i <= otpMaxResend; i++ {
+		if _, err := svc.ResendOTP(ctx, ResendOTPRequest{SessionID: sessionID}, "127.0.0.1", "ua"); err != nil {
+			t.Fatalf("resend %d should still be allowed: %v", i, err)
+		}
+	}
+}
+
+func TestVerifyOTP_BlockedDoesNotGrowCounter(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, otpCache, _, audit := setupPDService()
+	ctx := context.Background()
+	sessionID := atOTPVerify(t, svc, sessionRepo, cache, ocrRepo)
+
+	otpCache.blocked[sessionID] = true
+	otpCache.blockExpiry[sessionID] = time.Now().Add(otpBlockTime)
+	before := otpCache.attempts[sessionID]
+
+	_, err := svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: "000000"}, "127.0.0.1", "ua")
+	appErr := asAppErr(t, err)
+	if appErr.Code != apperr.OTPBlocked.Code {
+		t.Fatalf("expected OTP_BLOCKED, got %s", appErr.Code)
+	}
+	if _, ok := details(t, appErr)["retry_after_seconds"]; !ok {
+		t.Error("OTP_BLOCKED must carry details.retry_after_seconds")
+	}
+	if otpCache.attempts[sessionID] != before {
+		t.Error("an attempt refused by the block must not extend the lockout")
+	}
+
+	// A refusal while blocked is still an OTP_FAILED event.
+	found := false
+	for _, log := range audit.logs {
+		if log.EventType == AuditOTPFailed && log.Details["reason"] == "blocked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected OTP_FAILED audit row with reason=blocked")
+	}
+}
+
+func TestVerifyOTP_ExpiredIsAudited(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, _, _, audit := setupPDService()
+	ctx := context.Background()
+	sessionID := atOTPVerify(t, svc, sessionRepo, cache, ocrRepo)
+	// No OTP stored at all — the same state an expired key leaves behind.
+
+	_, err := svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: "000000"}, "127.0.0.1", "ua")
+	if appErr := asAppErr(t, err); appErr.Code != apperr.OTPExpired.Code {
+		t.Fatalf("expected OTP_EXPIRED, got %s", appErr.Code)
+	}
+
+	found := false
+	for _, log := range audit.logs {
+		if log.EventType == AuditOTPFailed && log.Details["reason"] == "expired" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected OTP_FAILED audit row with reason=expired")
+	}
+}
+
+func TestOTP_RejectsSessionFromAnotherDevice(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, otpCache, _, _ := setupPDService()
+	ctx := context.Background()
+	sessionID := atOTPVerify(t, svc, sessionRepo, cache, ocrRepo) // session.DeviceID == "dev_test"
+	otpCache.otps[sessionID] = hashOTP("847291")
+
+	_, err := svc.VerifyOTP(ctx, VerifyOTPRequest{
+		SessionID: sessionID,
+		OTPCode:   "847291",
+		DeviceID:  "dev_someone_else",
+	}, "127.0.0.1", "ua")
+	if appErr := asAppErr(t, err); appErr.Code != apperr.OnboardingNotFound.Code {
+		t.Fatalf("verify from a foreign device should look like an unknown session, got %s", appErr.Code)
+	}
+
+	_, err = svc.ResendOTP(ctx, ResendOTPRequest{SessionID: sessionID, DeviceID: "dev_someone_else"}, "127.0.0.1", "ua")
+	if appErr := asAppErr(t, err); appErr.Code != apperr.OnboardingNotFound.Code {
+		t.Fatalf("resend from a foreign device should look like an unknown session, got %s", appErr.Code)
+	}
+
+	// The matching device still gets through, and a client that sends no
+	// header at all is not locked out.
+	if _, err := svc.VerifyOTP(ctx, VerifyOTPRequest{
+		SessionID: sessionID,
+		OTPCode:   "847291",
+		DeviceID:  "dev_test",
+	}, "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("the owning device should verify: %v", err)
+	}
+}
+
+// failingSMS stands in for a gateway that is down, or the unconfigured
+// placeholder a non-development deployment gets.
+type failingSMS struct{ calls int }
+
+func (f *failingSMS) SendOTP(_ context.Context, _, _ string) error {
+	f.calls++
+	return errors.New("gateway unreachable")
+}
+
+func TestOTP_DeliveryFailureIsReported(t *testing.T) {
+	sessionRepo := newMockSessionRepo()
+	cache := newMockSessionCache()
+	ocrRepo := newMockOCRResultRepo()
+	pdRepo := newMockPersonalDataRepo()
+	otpCache := newMockOTPCache()
+	sms := &failingSMS{}
+
+	svc := NewPersonalDataService(PersonalDataServiceConfig{
+		Sessions:     sessionRepo,
+		Cache:        cache,
+		OCRResults:   ocrRepo,
+		PersonalData: pdRepo,
+		OTPCache:     otpCache,
+		SMS:          sms,
+		Audit:        &mockAuditRepo{},
+	})
+
+	ctx := context.Background()
+	sessionID := createTestSession(sessionRepo, cache, ocrRepo)
+
+	_, err := svc.SavePersonalData(ctx, SavePersonalDataRequest{
+		SessionID:    sessionID,
+		OCRID:        "ocr_test123",
+		PersonalData: validPersonalDataInput(),
+	}, "127.0.0.1", "ua")
+	if appErr := asAppErr(t, err); appErr.Code != apperr.OTPDeliveryFailed.Code {
+		t.Fatalf("expected OTP_DELIVERY_FAILED, got %s", appErr.Code)
+	}
+
+	// Issuance is not cancelled by the failure: the step advanced and the
+	// code is stored, so resend-otp is a real way out.
+	if sessionRepo.sessions[sessionID].CurrentStep != StepOTPVerify {
+		t.Errorf("session should still advance to OTP_VERIFY, got %s", sessionRepo.sessions[sessionID].CurrentStep)
+	}
+	if otpCache.otps[sessionID] == "" {
+		t.Error("the OTP should remain stored and verifiable")
+	}
+
+	if _, err := svc.ResendOTP(ctx, ResendOTPRequest{SessionID: sessionID}, "127.0.0.1", "ua"); err == nil {
+		t.Error("a resend that never left the building must not answer 200")
+	}
+}
+
+func TestVerifyOTP_WrongStep(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, otpCache, _, _ := setupPDService()
+	ctx := context.Background()
+
+	// Session is still at PERSONAL_DATA, and a stale code is lying around.
+	sessionID := createTestSession(sessionRepo, cache, ocrRepo)
+	otpCache.otps[sessionID] = hashOTP("847291")
+
+	_, err := svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: "847291"}, "127.0.0.1", "ua")
+	if appErr := asAppErr(t, err); appErr.Code != "ONBOARDING_INVALID_STEP" {
+		t.Fatalf("expected ONBOARDING_INVALID_STEP, got %s", appErr.Code)
+	}
+}
+
+func TestOTP_RejectsExpiredSession(t *testing.T) {
+	svc, sessionRepo, cache, ocrRepo, otpCache, _, _ := setupPDService()
+	ctx := context.Background()
+	sessionID := atOTPVerify(t, svc, sessionRepo, cache, ocrRepo)
+	otpCache.otps[sessionID] = hashOTP("847291")
+
+	expired := time.Now().Add(-time.Minute)
+	sessionRepo.sessions[sessionID].ExpiresAt = expired
+	cache.data[sessionID].ExpiresAt = expired
+
+	_, err := svc.VerifyOTP(ctx, VerifyOTPRequest{SessionID: sessionID, OTPCode: "847291"}, "127.0.0.1", "ua")
+	if appErr := asAppErr(t, err); appErr.Code != apperr.OnboardingSessionExpired.Code {
+		t.Fatalf("verify: expected ONBOARDING_SESSION_EXPIRED, got %s", appErr.Code)
+	}
+
+	_, err = svc.ResendOTP(ctx, ResendOTPRequest{SessionID: sessionID}, "127.0.0.1", "ua")
+	if appErr := asAppErr(t, err); appErr.Code != apperr.OnboardingSessionExpired.Code {
+		t.Fatalf("resend: expected ONBOARDING_SESSION_EXPIRED, got %s", appErr.Code)
 	}
 }

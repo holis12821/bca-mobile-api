@@ -2,10 +2,12 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/auth"
@@ -54,10 +56,41 @@ func (r *SessionRepo) FindByRefreshTokenHash(ctx context.Context, hash string) (
 		&ip, &s.AuthMethod, &s.ExpiresAt, &s.CreatedAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find session by hash: %w", err)
+	}
+	if ip != nil {
+		s.IPAddress = *ip
+	}
+	return &s, nil
+}
+
+// FindActiveByID returns the session if it exists, is unrevoked and unexpired.
+//
+// The Auth middleware falls back to this when Redis has no live marker, so a
+// cache eviction cannot log everybody out and a Redis flush cannot resurrect a
+// revoked session. It returns the whole row (not just a boolean) so the caller
+// can re-warm the marker with the right user id.
+func (r *SessionRepo) FindActiveByID(ctx context.Context, sessionID uuid.UUID) (*auth.Session, error) {
+	const query = `
+		SELECT id, user_id, device_id, refresh_token_hash,
+		       ip_address, auth_method, expires_at, created_at
+		FROM sessions
+		WHERE id = $1 AND revoked_at IS NULL AND expires_at > NOW()`
+
+	var s auth.Session
+	var ip *string
+	err := r.pool.QueryRow(ctx, query, sessionID).Scan(
+		&s.ID, &s.UserID, &s.DeviceID, &s.RefreshTokenHash,
+		&ip, &s.AuthMethod, &s.ExpiresAt, &s.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find active session: %w", err)
 	}
 	if ip != nil {
 		s.IPAddress = *ip

@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -37,7 +36,7 @@ func OnboardingAudit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auditCtx := &OnboardingAuditContext{
 			RequestID: chimiddleware.GetReqID(r.Context()),
-			IPAddress: extractClientIP(r),
+			IPAddress: ClientIP(r),
 			UserAgent: r.UserAgent(),
 			Method:    r.Method,
 			Path:      r.URL.Path,
@@ -69,22 +68,4 @@ func OnboardingAudit(next http.Handler) http.Handler {
 			"ip", auditCtx.IPAddress,
 		)
 	})
-}
-
-func extractClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i > 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	if xri := r.Header.Get("X-Real-Ip"); xri != "" {
-		return xri
-	}
-	// Strip port from RemoteAddr
-	addr := r.RemoteAddr
-	if i := strings.LastIndex(addr, ":"); i > 0 {
-		return addr[:i]
-	}
-	return addr
 }

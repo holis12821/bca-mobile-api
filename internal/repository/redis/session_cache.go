@@ -33,9 +33,32 @@ func userSessionsKey(userID uuid.UUID) string {
 	return fmt.Sprintf("sessions:user:%s", userID.String())
 }
 
+// deviceKeyFor prefers the client-supplied device id — the value the JWT
+// carries and every delete path passes — and falls back to the devices row
+// UUID only for a caller that has not set it.
+func deviceKeyFor(session *auth.Session) string {
+	if session.DeviceKey != "" {
+		return session.DeviceKey
+	}
+	return session.DeviceID.String()
+}
+
+// activeSessionKey marks a session id as live. The access token carries sid,
+// so this is what the Auth middleware can check on every request without
+// knowing anything else about the caller.
+func activeSessionKey(sessionID uuid.UUID) string {
+	return "session:active:" + sessionID.String()
+}
+
+// userActiveSessionsKey is the set of live session ids for a user, so
+// logout-all does not need SCAN.
+func userActiveSessionsKey(userID uuid.UUID) string {
+	return "sessions:active:user:" + userID.String()
+}
+
 // StoreSession stores session data as a Redis Hash with TTL 15 minutes.
 func (sc *SessionCache) StoreSession(ctx context.Context, session *auth.Session, displayName string, authMethod string) error {
-	key := sessionKey(session.UserID, session.DeviceID.String())
+	key := sessionKey(session.UserID, deviceKeyFor(session))
 
 	pipe := sc.client.Pipeline()
 	pipe.HSet(ctx, key, map[string]any{
@@ -55,6 +78,99 @@ func (sc *SessionCache) StoreSession(ctx context.Context, session *auth.Session,
 		return fmt.Errorf("store session: %w", err)
 	}
 	return nil
+}
+
+// MarkActive records the session as live for ttl (the refresh token lifetime).
+// Auth middleware reads this; Revoke* clears it.
+func (sc *SessionCache) MarkActive(ctx context.Context, userID, sessionID uuid.UUID, ttl time.Duration) error {
+	pipe := sc.client.Pipeline()
+	pipe.Set(ctx, activeSessionKey(sessionID), userID.String(), ttl)
+	pipe.SAdd(ctx, userActiveSessionsKey(userID), sessionID.String())
+	pipe.Expire(ctx, userActiveSessionsKey(userID), ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("mark session active: %w", err)
+	}
+	return nil
+}
+
+// IsActive reports whether the session id is marked live.
+//
+// A miss is not proof of revocation — the key can be evicted or the instance
+// restarted — so the caller falls back to Postgres. found=false means "ask the
+// database", never "reject".
+func (sc *SessionCache) IsActive(ctx context.Context, sessionID uuid.UUID) (bool, error) {
+	n, err := sc.client.Exists(ctx, activeSessionKey(sessionID)).Result()
+	if err != nil {
+		return false, fmt.Errorf("check session active: %w", err)
+	}
+	return n > 0, nil
+}
+
+// inactiveSessionKey marks a session id that Postgres has confirmed is dead.
+func inactiveSessionKey(sessionID uuid.UUID) string {
+	return "session:inactive:" + sessionID.String()
+}
+
+// negativeSessionTTL is how long a confirmed-dead session is remembered.
+//
+// Short on purpose. A revoked session never becomes live again, so a longer TTL
+// would also be correct, but a minute is already enough to absorb a client that
+// keeps retrying with a dead token — which is the whole point — while keeping the
+// blast radius small if this marker is ever written for the wrong reason.
+const negativeSessionTTL = time.Minute
+
+// MarkInactive records that Postgres confirmed this session is unusable.
+//
+// Without it, every request carrying a revoked-but-unexpired access token ran a
+// Postgres query: the live marker is gone, so IsActive misses and the fallback
+// fires again and again. Authenticated routes have no rate limiter, so one
+// logged-out client could keep a database round trip per request going for the
+// remaining 15 minutes of its token.
+func (sc *SessionCache) MarkInactive(ctx context.Context, sessionID uuid.UUID, ttl time.Duration) error {
+	if ttl <= 0 {
+		ttl = negativeSessionTTL
+	}
+	if err := sc.client.Set(ctx, inactiveSessionKey(sessionID), "1", ttl).Err(); err != nil {
+		return fmt.Errorf("mark session inactive: %w", err)
+	}
+	return nil
+}
+
+// IsKnownInactive reports whether a confirmed-dead marker exists.
+func (sc *SessionCache) IsKnownInactive(ctx context.Context, sessionID uuid.UUID) (bool, error) {
+	n, err := sc.client.Exists(ctx, inactiveSessionKey(sessionID)).Result()
+	if err != nil {
+		return false, fmt.Errorf("check session inactive: %w", err)
+	}
+	return n > 0, nil
+}
+
+// RevokeActive clears the live marker for a single session.
+func (sc *SessionCache) RevokeActive(ctx context.Context, userID, sessionID uuid.UUID) error {
+	pipe := sc.client.Pipeline()
+	pipe.Del(ctx, activeSessionKey(sessionID))
+	pipe.SRem(ctx, userActiveSessionsKey(userID), sessionID.String())
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("revoke active session: %w", err)
+	}
+	return nil
+}
+
+// RevokeAllActive clears every live marker for a user.
+func (sc *SessionCache) RevokeAllActive(ctx context.Context, userID uuid.UUID) error {
+	setKey := userActiveSessionsKey(userID)
+	ids, err := sc.client.SMembers(ctx, setKey).Result()
+	if err != nil {
+		return fmt.Errorf("list active sessions: %w", err)
+	}
+
+	keys := make([]string, 0, len(ids)+1)
+	for _, id := range ids {
+		keys = append(keys, "session:active:"+id)
+	}
+	keys = append(keys, setKey)
+
+	return sc.client.Del(ctx, keys...).Err()
 }
 
 // AddToUserSessions adds a device to the user's session set.

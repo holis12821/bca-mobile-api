@@ -27,6 +27,9 @@ type UserRepository interface {
 	// FindByID finds a user by their ID.
 	FindByID(ctx context.Context, userID uuid.UUID) (*User, error)
 
+	// UpdateAccessCodeHash updates the user's login credential.
+	UpdateAccessCodeHash(ctx context.Context, userID uuid.UUID, newHash string) error
+
 	// UpdatePINHash updates the user's PIN hash.
 	UpdatePINHash(ctx context.Context, userID uuid.UUID, newHash string) error
 }
@@ -48,6 +51,11 @@ type SessionRepository interface {
 
 	// FindByRefreshTokenHash finds an active (non-revoked) session by its refresh token hash.
 	FindByRefreshTokenHash(ctx context.Context, hash string) (*Session, error)
+
+	// FindActiveByID returns the session if it exists, is unrevoked and
+	// unexpired. This is the authoritative answer the Auth middleware falls
+	// back to when the Redis marker is missing.
+	FindActiveByID(ctx context.Context, sessionID uuid.UUID) (*Session, error)
 
 	// UpdateRefreshToken atomically swaps the refresh token hash and resets expires_at.
 	UpdateRefreshToken(ctx context.Context, sessionID uuid.UUID, newHash string, expiresAt time.Time) error
@@ -73,6 +81,29 @@ type SessionCache interface {
 	// InvalidateAllUserSessions removes all cached sessions for a user
 	// using the sessions:user:{id} Set (no SCAN).
 	InvalidateAllUserSessions(ctx context.Context, userID uuid.UUID) error
+
+	// MarkActive records a session id as live for ttl.
+	MarkActive(ctx context.Context, userID, sessionID uuid.UUID, ttl time.Duration) error
+
+	// IsActive reports whether a session id is still marked live. A false
+	// result means "not in cache", not "revoked" — the caller must confirm
+	// against Postgres before rejecting.
+	IsActive(ctx context.Context, sessionID uuid.UUID) (bool, error)
+
+	// MarkInactive remembers, for ttl, that Postgres has confirmed a session is
+	// not usable. Written ONLY after Postgres has said so.
+	MarkInactive(ctx context.Context, sessionID uuid.UUID, ttl time.Duration) error
+
+	// IsKnownInactive reports whether a confirmed-inactive marker exists. Unlike
+	// IsActive, a true result here IS proof: Postgres answered it, and a session
+	// never goes from revoked back to live.
+	IsKnownInactive(ctx context.Context, sessionID uuid.UUID) (bool, error)
+
+	// RevokeActive clears the live marker for one session.
+	RevokeActive(ctx context.Context, userID, sessionID uuid.UUID) error
+
+	// RevokeAllActive clears every live marker for a user.
+	RevokeAllActive(ctx context.Context, userID uuid.UUID) error
 }
 
 // TokenRevocationCache tracks revoked refresh token hashes in Redis.

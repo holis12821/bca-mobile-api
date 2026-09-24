@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,14 +30,14 @@ type VideoCallService struct {
 }
 
 type VideoCallServiceConfig struct {
-	Sessions        SessionRepository
-	Cache           SessionCache
-	VideoCalls      VideoCallRepository
-	QueueCache      VideoCallQueueCache
-	JWTManager      *crypto.JWTManager
-	Audit           AuditRepository
+	Sessions         SessionRepository
+	Cache            SessionCache
+	VideoCalls       VideoCallRepository
+	QueueCache       VideoCallQueueCache
+	JWTManager       *crypto.JWTManager
+	Audit            AuditRepository
 	SignalingBaseURL string
-	Clock           func() time.Time // optional; defaults to time.Now
+	Clock            func() time.Time // optional; defaults to time.Now
 }
 
 func NewVideoCallService(cfg VideoCallServiceConfig) *VideoCallService {
@@ -91,20 +92,30 @@ func (s *VideoCallService) JoinQueue(ctx context.Context, req JoinQueueRequest, 
 	}
 	if existing != nil && (existing.Status == VCStatusQueued || existing.Status == VCStatusActive) {
 		// Already in queue — return current position
-		pos, _ := s.queueCache.Position(ctx, existing.QueueID)
-		qLen, _ := s.queueCache.Length(ctx)
+		pos, err := s.queueCache.Position(ctx, existing.QueueID)
+		if err != nil {
+			slog.Error("queue position lookup failed", "queue_id", existing.QueueID, "error", err)
+		}
+		signalingURL, err := s.buildSignalingURL(req.SessionID, existing.QueueID, RoleNasabah)
+		if err != nil {
+			return nil, fmt.Errorf("signaling url: %w", err)
+		}
 		return &JoinQueueResponse{
 			QueueID:              existing.QueueID,
 			QueueNumber:          existing.QueueNumber,
 			Position:             pos,
 			EstimatedWaitSeconds: pos * avgCallDurationSeconds,
 			OperatingHours:       defaultOperatingHours(),
-			SignalingURL:         s.buildSignalingURL(req.SessionID, existing.QueueID, qLen),
+			SignalingURL:         signalingURL,
 		}, nil
 	}
 
 	// 4. Generate queue ID and number
-	queueID := "q_" + generateShortID()
+	shortID, err := generateShortID()
+	if err != nil {
+		return nil, fmt.Errorf("generate queue id: %w", err)
+	}
+	queueID := "q_" + shortID
 	seqNum, err := s.queueCache.IncrDailyCounter(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("incr queue counter: %w", err)
@@ -132,7 +143,15 @@ func (s *VideoCallService) JoinQueue(ctx context.Context, req JoinQueueRequest, 
 	}
 
 	// 6. Get position
-	pos, _ := s.queueCache.Position(ctx, queueID)
+	pos, err := s.queueCache.Position(ctx, queueID)
+	if err != nil {
+		slog.Error("queue position lookup failed", "queue_id", queueID, "error", err)
+	}
+
+	signalingURL, err := s.buildSignalingURL(req.SessionID, queueID, RoleNasabah)
+	if err != nil {
+		return nil, fmt.Errorf("signaling url: %w", err)
+	}
 
 	// Audit
 	s.writeAudit(ctx, req.SessionID, AuditVideoCallQueued, "nasabah:"+session.DeviceID, map[string]any{
@@ -147,7 +166,7 @@ func (s *VideoCallService) JoinQueue(ctx context.Context, req JoinQueueRequest, 
 		Position:             pos,
 		EstimatedWaitSeconds: pos * avgCallDurationSeconds,
 		OperatingHours:       defaultOperatingHours(),
-		SignalingURL:         s.buildSignalingURL(req.SessionID, queueID, pos),
+		SignalingURL:         signalingURL,
 	}, nil
 }
 
@@ -171,7 +190,28 @@ func (s *VideoCallService) SubmitResult(ctx context.Context, req SubmitVideoCall
 		return nil, apperr.ValidationError
 	}
 
-	// 3. Update video call record
+	// 3. Replay guard. A result that has already been recorded is returned as
+	// it stands: re-applying it would re-run the step transition below and drag
+	// a session that has since reached REVIEW or COMPLETED back to CREDENTIALS.
+	if vc.Status == VCStatusCompleted {
+		session, err := s.resolveSession(ctx, req.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		slog.Warn("video call result replayed, ignoring",
+			"queue_id", req.QueueID,
+			"session_id", req.SessionID,
+			"stored_result", string(vc.Result),
+			"submitted_result", req.Result,
+		)
+		return &SubmitVideoCallResultResponse{
+			SessionID:   req.SessionID,
+			Result:      string(vc.Result),
+			CurrentStep: session.CurrentStep,
+		}, nil
+	}
+
+	// 4. Update video call record
 	if err := s.videoCalls.UpdateResult(ctx, req.QueueID,
 		result, req.AgentEmployeeID, "",
 		req.Notes, req.RecordingID,
@@ -181,28 +221,43 @@ func (s *VideoCallService) SubmitResult(ctx context.Context, req SubmitVideoCall
 		return nil, fmt.Errorf("update video call result: %w", err)
 	}
 
-	// 4. Remove from queue
-	_ = s.queueCache.Remove(ctx, req.QueueID)
+	// 5. Remove from queue
+	if remErr := s.queueCache.Remove(ctx, req.QueueID); remErr != nil {
+		slog.Error("remove from video call queue failed", "queue_id", req.QueueID, "error", remErr)
+	}
 
-	// 5. If approved, transition session step
+	// 6. If approved, transition session step
 	nextStep := StepVideoCall // stay if rejected
 	if result == VCResultApproved {
 		session, err := s.resolveSession(ctx, req.SessionID)
 		if err != nil {
 			return nil, err
 		}
-		completed := session.StepsCompleted
-		completed.VideoCallVerified = true
-		if err := s.sessions.UpdateStep(ctx, req.SessionID, StepCredentials, completed); err != nil {
-			return nil, fmt.Errorf("update step: %w", err)
+		nextStep = session.CurrentStep
+
+		// The step machine decides, not the caller: an approval for a session
+		// that has already moved past VIDEO_CALL is recorded on the call record
+		// and otherwise left alone.
+		if CanTransition(session.CurrentStep, StepCredentials) {
+			completed := session.StepsCompleted
+			completed.VideoCallVerified = true
+			if err := s.sessions.UpdateStep(ctx, req.SessionID, StepCredentials, completed); err != nil {
+				return nil, fmt.Errorf("update step: %w", err)
+			}
+			if s.cache != nil {
+				session.CurrentStep = StepCredentials
+				session.StepsCompleted = completed
+				if cacheErr := s.cache.Store(ctx, session); cacheErr != nil {
+					slog.Error("cache step update failed", "session_id", req.SessionID, "error", cacheErr)
+				}
+			}
+			nextStep = StepCredentials
+		} else {
+			slog.Warn("video call approved for a session past VIDEO_CALL",
+				"session_id", req.SessionID,
+				"current_step", string(session.CurrentStep),
+			)
 		}
-		if s.cache != nil {
-			session.CurrentStep = StepCredentials
-			session.StepsCompleted = completed
-			session.ExpiresAt = time.Now().Add(sessionTTL)
-			_ = s.cache.Store(ctx, session)
-		}
-		nextStep = StepCredentials
 	}
 
 	// Audit
@@ -221,21 +276,50 @@ func (s *VideoCallService) SubmitResult(ctx context.Context, req SubmitVideoCall
 	}, nil
 }
 
-func (s *VideoCallService) buildSignalingURL(sessionID, queueID string, _ int64) string {
-	// Generate short-lived JWT for signaling auth
-	token := ""
-	if s.jwt != nil {
-		t, err := s.jwt.GenerateSignalingToken(sessionID, queueID, signalingTokenTTL)
-		if err != nil {
-			slog.Error("generate signaling token failed", "error", err)
-		} else {
-			token = t
+// buildSignalingURL mints a short-lived signaling token carrying the caller's
+// role. The role is in the token, never in the query string, so a nasabah
+// cannot connect as the agent side of their own call.
+func (s *VideoCallService) buildSignalingURL(sessionID, queueID string, role string) (string, error) {
+	if s.jwt == nil {
+		return "", fmt.Errorf("signaling requires a JWT manager")
+	}
+	token, err := s.jwt.GenerateSignalingToken(sessionID, queueID, role, signalingTokenTTL)
+	if err != nil {
+		return "", fmt.Errorf("generate signaling token: %w", err)
+	}
+	return fmt.Sprintf("%s/v1/onboarding/video-call/signal?token=%s", s.sigBaseURL, url.QueryEscape(token)), nil
+}
+
+// AgentSignalingURL issues an agent-side signaling URL for a queued call. Only
+// the internal CS endpoints reach this — see the internal route group.
+func (s *VideoCallService) AgentSignalingURL(ctx context.Context, queueID string) (*AgentSignalingResponse, error) {
+	vc, err := s.videoCalls.FindByQueueID(ctx, queueID)
+	if err != nil {
+		return nil, fmt.Errorf("find video call: %w", err)
+	}
+	if vc == nil {
+		return nil, apperr.OnboardingNotFound
+	}
+	if vc.Status == VCStatusCompleted || vc.Status == VCStatusCancelled {
+		return nil, apperr.Error{
+			Status:  422,
+			Code:    "VIDEO_CALL_NOT_ACTIVE",
+			Message: "Sesi video call sudah selesai.",
 		}
 	}
-	if token == "" {
-		token = "dev-token-" + sessionID
+
+	signalingURL, err := s.buildSignalingURL(vc.SessionID, queueID, RoleAgent)
+	if err != nil {
+		return nil, err
 	}
-	return fmt.Sprintf("%s/v1/onboarding/video-call/signal?token=%s", s.sigBaseURL, token)
+
+	return &AgentSignalingResponse{
+		QueueID:      queueID,
+		SessionID:    vc.SessionID,
+		QueueNumber:  vc.QueueNumber,
+		SignalingURL: signalingURL,
+		ExpiresAt:    time.Now().UTC().Add(signalingTokenTTL),
+	}, nil
 }
 
 func (s *VideoCallService) resolveSession(ctx context.Context, sessionID string) (*Session, error) {

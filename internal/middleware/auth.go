@@ -2,8 +2,11 @@ package middleware
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/google/uuid"
 
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
@@ -13,7 +16,7 @@ import (
 type ctxKey int
 
 const (
-	ctxUserID    ctxKey = iota
+	ctxUserID ctxKey = iota
 	ctxSessionID
 	ctxDeviceID
 )
@@ -36,8 +39,22 @@ func DeviceIDFromCtx(ctx context.Context) string {
 	return v
 }
 
+// SessionValidator answers whether the session behind an access token is still
+// live. §2.1 of docs/04-SECURITY.md lists this as steps 12 and 13 of every
+// authenticated request; until it existed, verifying the JWT signature was the
+// whole check, so logging out revoked the refresh token while the access token
+// kept working — including for transfers — for the rest of its 15 minutes.
+type SessionValidator interface {
+	// IsSessionActive reports whether sessionID is still usable.
+	IsSessionActive(ctx context.Context, sessionID uuid.UUID) (bool, error)
+}
+
 // Auth verifies the Bearer access token and injects user/session/device IDs into context.
-func Auth(jwtMgr *crypto.JWTManager) func(http.Handler) http.Handler {
+//
+// validator may be nil, which skips the session check — that is only for tests
+// that construct a router without a datastore. Production wiring always passes
+// one; router.New logs loudly if it cannot.
+func Auth(jwtMgr *crypto.JWTManager, validator SessionValidator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token := extractBearerToken(r)
@@ -54,6 +71,29 @@ func Auth(jwtMgr *crypto.JWTManager) func(http.Handler) http.Handler {
 				}
 				response.Err(w, r, apperr.TokenInvalid)
 				return
+			}
+
+			if validator != nil {
+				sessionID, err := uuid.Parse(claims.SessionID)
+				if err != nil {
+					response.Err(w, r, apperr.TokenInvalid)
+					return
+				}
+
+				active, err := validator.IsSessionActive(r.Context(), sessionID)
+				if err != nil {
+					// Fail closed. A token whose session cannot be confirmed
+					// must not move money; the alternative is that a datastore
+					// outage silently re-enables every revoked session.
+					slog.Error("session validation failed",
+						"session_id", claims.SessionID, "error", err)
+					response.Err(w, r, apperr.InternalError)
+					return
+				}
+				if !active {
+					response.Err(w, r, apperr.SessionRevoked)
+					return
+				}
 			}
 
 			ctx := r.Context()

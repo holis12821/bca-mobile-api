@@ -36,7 +36,12 @@ type CreateUserResult struct {
 }
 
 const (
-	OTPCacheTTL      = 5 * time.Minute
-	RegistrationTTL  = 30 * time.Minute
-	MaxDocSize       = 5 * 1024 * 1024 // 5MB
+	OTPCacheTTL     = 5 * time.Minute
+	RegistrationTTL = 30 * time.Minute
+	MaxDocSize      = 5 * 1024 * 1024 // 5MB
 )
+
+// SMSGateway delivers the registration OTP. Satisfied by internal/pkg/sms.
+type SMSGateway interface {
+	SendOTP(ctx context.Context, phone, otp string) error
+}

@@ -72,8 +72,8 @@ func TestSetCredentials_Success(t *testing.T) {
 
 	resp, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
-		AccessCodeEncrypted: "Abc123",
-		PINEncrypted:        "789456",
+		AccessCodeEncrypted: "Kd7m2q",
+		PINEncrypted:        "284917",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
 
@@ -119,8 +119,8 @@ func TestSetCredentials_WrongStep(t *testing.T) {
 
 	_, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
-		AccessCodeEncrypted: "Abc123",
-		PINEncrypted:        "789456",
+		AccessCodeEncrypted: "Kd7m2q",
+		PINEncrypted:        "284917",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
 
@@ -137,7 +137,7 @@ func TestSetCredentials_WeakAccessCode_AllSame(t *testing.T) {
 	_, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
 		AccessCodeEncrypted: "aaaaaa",
-		PINEncrypted:        "789456",
+		PINEncrypted:        "284917",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
 
@@ -154,7 +154,7 @@ func TestSetCredentials_WeakAccessCode_Sequential(t *testing.T) {
 	_, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
 		AccessCodeEncrypted: "abcdef",
-		PINEncrypted:        "789456",
+		PINEncrypted:        "284917",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
 
@@ -170,7 +170,7 @@ func TestSetCredentials_WeakPIN_AllSame(t *testing.T) {
 
 	_, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
-		AccessCodeEncrypted: "Abc123",
+		AccessCodeEncrypted: "Kd7m2q",
 		PINEncrypted:        "111111",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
@@ -187,7 +187,7 @@ func TestSetCredentials_WeakPIN_Sequential(t *testing.T) {
 
 	_, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
-		AccessCodeEncrypted: "Abc123",
+		AccessCodeEncrypted: "Kd7m2q",
 		PINEncrypted:        "123456",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
@@ -222,7 +222,7 @@ func TestSetCredentials_EmptyFields(t *testing.T) {
 	_, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
 		AccessCodeEncrypted: "",
-		PINEncrypted:        "789456",
+		PINEncrypted:        "284917",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
 
@@ -239,8 +239,8 @@ func TestSetCredentials_Idempotent(t *testing.T) {
 	// First call — creates credential and transitions step
 	resp1, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
-		AccessCodeEncrypted: "Abc123",
-		PINEncrypted:        "789456",
+		AccessCodeEncrypted: "Kd7m2q",
+		PINEncrypted:        "284917",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
 	if err != nil {
@@ -250,7 +250,7 @@ func TestSetCredentials_Idempotent(t *testing.T) {
 	// Second call — should return existing credential without creating duplicate
 	resp2, err := svc.SetCredentials(ctx, SetCredentialsRequest{
 		SessionID:           sessionID,
-		AccessCodeEncrypted: "Xyz987",
+		AccessCodeEncrypted: "Qm4v8t",
 		PINEncrypted:        "654321",
 		EncryptionKeyID:     "key_001",
 	}, "127.0.0.1", "test")
@@ -280,7 +280,12 @@ func TestIsSequential(t *testing.T) {
 		{"abcdef", true},
 		{"fedcba", true},
 		{"135791", false},
-		{"Abc123", false},
+		// Three consecutive characters are enough, wherever they sit: "Abc123"
+		// carries two such runs. The old implementation needed four and let
+		// this through, contradicting its own documentation.
+		{"Abc123", true},
+		{"ab12cd", false}, // runs of two only
+		{"k3lmn9", true},  // "lmn" in the middle
 		{"ab", false},
 		{"111111", false},
 		{"192837", false},

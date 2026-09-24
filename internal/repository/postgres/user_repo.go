@@ -26,6 +26,7 @@ func NewUserRepo(pool *pgxpool.Pool) *UserRepo {
 func (r *UserRepo) FindByDeviceID(ctx context.Context, deviceID string) (*auth.User, error) {
 	query := `
 		SELECT u.id, u.full_name, u.display_name, u.pin_hash, u.pin_salt,
+		       COALESCE(u.access_code_hash, ''),
 		       u.status, u.locked_until, u.failed_pin_attempts, u.max_pin_attempts,
 		       u.last_login_at
 		FROM users u
@@ -38,6 +39,7 @@ func (r *UserRepo) FindByDeviceID(ctx context.Context, deviceID string) (*auth.U
 	err := r.pool.QueryRow(ctx, query, deviceID).Scan(
 		&user.ID, &user.FullName, &user.DisplayName,
 		&user.PINHash, &user.PINSalt,
+		&user.AccessCodeHash,
 		&user.Status, &user.LockedUntil,
 		&user.FailedPINAttempts, &user.MaxPINAttempts,
 		&user.LastLoginAt,
@@ -98,6 +100,7 @@ func (r *UserRepo) SetLockedUntil(ctx context.Context, userID uuid.UUID, lockedU
 func (r *UserRepo) FindByID(ctx context.Context, userID uuid.UUID) (*auth.User, error) {
 	query := `
 		SELECT id, full_name, display_name, pin_hash, pin_salt,
+		       COALESCE(access_code_hash, ''),
 		       status, locked_until, failed_pin_attempts, max_pin_attempts,
 		       last_login_at
 		FROM users
@@ -107,6 +110,7 @@ func (r *UserRepo) FindByID(ctx context.Context, userID uuid.UUID) (*auth.User, 
 	err := r.pool.QueryRow(ctx, query, userID).Scan(
 		&user.ID, &user.FullName, &user.DisplayName,
 		&user.PINHash, &user.PINSalt,
+		&user.AccessCodeHash,
 		&user.Status, &user.LockedUntil,
 		&user.FailedPINAttempts, &user.MaxPINAttempts,
 		&user.LastLoginAt,
@@ -120,9 +124,18 @@ func (r *UserRepo) FindByID(ctx context.Context, userID uuid.UUID) (*auth.User, 
 	return &user, nil
 }
 
+// UpdateAccessCodeHash updates the user's login credential ("kode akses").
+func (r *UserRepo) UpdateAccessCodeHash(ctx context.Context, userID uuid.UUID, newHash string) error {
+	query := `UPDATE users SET access_code_hash = $2, updated_at = NOW() WHERE id = $1`
+	if _, err := r.pool.Exec(ctx, query, userID, newHash); err != nil {
+		return fmt.Errorf("update access code hash: %w", err)
+	}
+	return nil
+}
+
 // UpdatePINHash updates the user's PIN hash.
 func (r *UserRepo) UpdatePINHash(ctx context.Context, userID uuid.UUID, newHash string) error {
-	query := `UPDATE users SET pin_hash = $2 WHERE id = $1`
+	query := `UPDATE users SET pin_hash = $2, updated_at = NOW() WHERE id = $1`
 	_, err := r.pool.Exec(ctx, query, userID, newHash)
 	if err != nil {
 		return fmt.Errorf("update pin hash: %w", err)

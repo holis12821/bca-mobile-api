@@ -14,6 +14,10 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 )
 
+// sequentialRunLength is how many consecutive characters (e.g. "234", "cba")
+// are enough to call a credential sequential and reject it.
+const sequentialRunLength = 3
+
 var (
 	accessCodeRegex = regexp.MustCompile(`^[a-zA-Z0-9]{6}$`)
 	pinRegex        = regexp.MustCompile(`^[0-9]{6}$`)
@@ -75,11 +79,13 @@ func (s *CredentialService) SetCredentials(ctx context.Context, req SetCredentia
 		}
 	}
 
-	if req.AccessCodeEncrypted == "" || req.PINEncrypted == "" {
+	// 4. Required fields. encryption_key_id is NOT NULL in the credentials
+	// table, so leaving it unchecked turned a client mistake into a 500.
+	if req.AccessCodeEncrypted == "" || req.PINEncrypted == "" || req.EncryptionKeyID == "" {
 		return nil, apperr.ValidationError
 	}
 
-	// 2. Decrypt access code and PIN
+	// 5. Decrypt access code and PIN
 	accessCode, err := s.decryptCredential(req.AccessCodeEncrypted)
 	if err != nil {
 		slog.Error("decrypt access code failed", "error", err)
@@ -91,22 +97,22 @@ func (s *CredentialService) SetCredentials(ctx context.Context, req SetCredentia
 		return nil, apperr.CredDecryptionFailed
 	}
 
-	// 3. Validate access code rules
+	// 6. Validate access code rules
 	if err := validateAccessCode(accessCode); err != nil {
 		return nil, err
 	}
 
-	// 4. Validate PIN rules
+	// 7. Validate PIN rules
 	if err := validatePIN(pin); err != nil {
 		return nil, err
 	}
 
-	// 5. PIN must differ from access code
+	// 8. PIN must differ from access code
 	if strings.EqualFold(pin, accessCode) {
 		return nil, apperr.CredSameAsAccessCode
 	}
 
-	// 6. Hash with Argon2id
+	// 9. Hash with Argon2id
 	accessCodeHash, err := crypto.HashPassword(ctx, accessCode, crypto.DefaultArgon2Params)
 	if err != nil {
 		return nil, fmt.Errorf("hash access code: %w", err)
@@ -116,8 +122,12 @@ func (s *CredentialService) SetCredentials(ctx context.Context, req SetCredentia
 		return nil, fmt.Errorf("hash pin: %w", err)
 	}
 
-	// 7. Store
-	credID := "cred_" + generateShortID()
+	// 10. Store
+	shortID, err := generateShortID()
+	if err != nil {
+		return nil, fmt.Errorf("generate credential id: %w", err)
+	}
+	credID := "cred_" + shortID
 	cred := &Credential{
 		ID:              uuid.New(),
 		CredentialID:    credID,
@@ -132,7 +142,7 @@ func (s *CredentialService) SetCredentials(ctx context.Context, req SetCredentia
 		return nil, fmt.Errorf("store credentials: %w", err)
 	}
 
-	// 8. Transition step: CREDENTIALS → REVIEW
+	// 11. Transition step: CREDENTIALS → REVIEW
 	completed := session.StepsCompleted
 	completed.CredentialsSet = true
 	if err := s.sessions.UpdateStep(ctx, req.SessionID, StepReview, completed); err != nil {
@@ -142,20 +152,21 @@ func (s *CredentialService) SetCredentials(ctx context.Context, req SetCredentia
 	if s.cache != nil {
 		session.CurrentStep = StepReview
 		session.StepsCompleted = completed
-		session.ExpiresAt = time.Now().Add(24 * time.Hour)
-		_ = s.cache.Store(ctx, session)
+		if cacheErr := s.cache.Store(ctx, session); cacheErr != nil {
+			slog.Error("cache step update failed", "session_id", req.SessionID, "error", cacheErr)
+		}
 	}
 
 	// Audit — NEVER include plaintext credentials
 	s.writeAudit(ctx, req.SessionID, AuditCredentialsSet, "nasabah:"+session.DeviceID, map[string]any{
-		"credential_id":    credID,
+		"credential_id":     credID,
 		"encryption_key_id": req.EncryptionKeyID,
 	}, ipAddress, userAgent)
 
 	return &SetCredentialsResponse{
-		CredentialID:           credID,
+		CredentialID:            credID,
 		BiometricLoginAvailable: true,
-		CurrentStep:            StepReview,
+		CurrentStep:             StepReview,
 	}, nil
 }
 
@@ -220,28 +231,33 @@ func isAllSameChar(s string) bool {
 	return true
 }
 
-// isSequential checks if the string forms an arithmetic sequence.
-// Detects both ascending and descending sequences like "123456", "abcdef", "654321".
-// Uses sliding window: 3+ consecutive characters with same diff counts as sequential.
+// isSequential reports whether the string contains a run of at least
+// sequentialRunLength characters stepping by ±1 — "123456", "abcdef", "654321",
+// and also "ab1234", where the run sits inside an otherwise random string.
+//
+// runLength counts characters, not gaps: a pair one apart is already a run of
+// two. The previous version seeded the counter at 1 for a pair, so it only
+// fired at four characters while claiming three in its comment.
 func isSequential(s string) bool {
-	if len(s) < 3 {
+	if len(s) < sequentialRunLength {
 		return false
 	}
 
-	consecutiveCount := 1
-	prevDiff := int(s[1]) - int(s[0])
-
-	for i := 2; i < len(s); i++ {
+	runLength := 1
+	for i := 1; i < len(s); i++ {
 		diff := int(s[i]) - int(s[i-1])
-		if diff == prevDiff && (diff == 1 || diff == -1) {
-			consecutiveCount++
-			if consecutiveCount >= 3 {
+		if diff == 1 || diff == -1 {
+			if i >= 2 && diff == int(s[i-1])-int(s[i-2]) {
+				runLength++ // same direction as the previous step: the run continues
+			} else {
+				runLength = 2 // a new run starts at this pair
+			}
+			if runLength >= sequentialRunLength {
 				return true
 			}
-		} else {
-			consecutiveCount = 1
-			prevDiff = diff
+			continue
 		}
+		runLength = 1
 	}
 
 	return false

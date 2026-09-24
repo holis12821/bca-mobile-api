@@ -47,7 +47,13 @@ func RateLimit(limiter *redis.RateLimiter, keyFunc func(*http.Request) string, l
 					retryAfter = 1
 				}
 				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-				response.Err(w, r, apperr.RateLimitExceeded)
+				// retry_after_seconds juga masuk ke body, bukan hanya header:
+				// klien mobile yang memakai wrapper HTTP sering tidak meneruskan
+				// header ke lapisan yang menampilkan pesan, sementara body
+				// selalu sampai. Sebelumnya details selalu null.
+				response.ErrWithDetails(w, r, apperr.RateLimitExceeded, map[string]any{
+					"retry_after_seconds": retryAfter,
+				})
 				return
 			}
 

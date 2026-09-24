@@ -5,6 +5,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -16,6 +19,28 @@ import (
 )
 
 const maxKTPUploadSize = 10 << 20 // 10 MB
+
+// multipartMemory is how much of a multipart upload is buffered in RAM before
+// the rest spills to a temp file (removed by net/http when the request ends).
+//
+// It used to be the whole upload ceiling, so a biometric request held 50 MB in
+// the form AND another copy in the []byte the handler read out of it — 100 MB of
+// heap per concurrent upload, which is how a handful of simultaneous uploads
+// turned into an OOM kill rather than a slow response.
+const multipartMemory = 1 << 20 // 1 MB
+
+// maxLivenessFramesRead caps how many liveness frames are read into memory.
+//
+// The domain rejects anything above five (minLivenessFrames/maxLivenessFrames in
+// biometric_service.go) — but that check used to run only after this handler had
+// already read every frame the client sent, up to the full 50 MB. One frame past
+// the limit is enough for the domain to still answer with its own error.
+const maxLivenessFramesRead = 6
+
+// otpCodeFormat rejects anything that is not exactly six digits before the
+// request reaches the service. A malformed code is a shape error, not a wrong
+// guess, and must not spend one of the nasabah's five attempts.
+var otpCodeFormat = regexp.MustCompile(`^[0-9]{6}$`)
 
 type OnboardingHandler struct {
 	sessionService      *onboarding.SessionService
@@ -66,6 +91,20 @@ func (h *OnboardingHandler) CreateSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Wilayah dan versi aplikasi tidak datang dari body (§7). Keduanya sempat
+	// tidak pernah diisi sama sekali: akibatnya kartu selalu divalidasi
+	// terhadap katalog nasional — kartu yang habis di satu wilayah tetap bisa
+	// dipilih di wilayah itu — dan fallback client lama tidak pernah aktif.
+	regionCode, ok := normalizeRegionCode(r.URL.Query().Get("region_code"))
+	if !ok {
+		response.ErrWithDetails(w, r, apperr.ValidationError, map[string]any{
+			"invalid_field": "region_code",
+		})
+		return
+	}
+	req.RegionCode = regionCode
+	req.AppVersion = strings.TrimSpace(r.Header.Get("X-App-Version"))
+
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
@@ -75,7 +114,12 @@ func (h *OnboardingHandler) CreateSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	response.Success(w, r, http.StatusCreated, resp)
+	// meta.catalog_outdated memberi tahu client bahwa biaya yang tampil di
+	// layarnya berasal dari katalog yang sudah bergeser, supaya layar Ringkasan
+	// menyegarkan diri sebelum nasabah menyetujui biaya yang salah.
+	response.SuccessWithMeta(w, r, http.StatusCreated, resp, func(m *response.Meta) {
+		m.CatalogOutdated = resp.CatalogOutdated
+	})
 }
 
 // GetSession handles GET /v1/onboarding/sessions/{session_id}
@@ -118,7 +162,7 @@ func (h *OnboardingHandler) CancelSession(w http.ResponseWriter, r *http.Request
 func (h *OnboardingHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxKTPUploadSize)
 
-	if err := r.ParseMultipartForm(maxKTPUploadSize); err != nil {
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
@@ -146,6 +190,11 @@ func (h *OnboardingHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 		FlashUsed:    r.FormValue("flash_used") == "true",
 		AutoCaptured: r.FormValue("auto_captured") == "true",
 		Resolution:   r.FormValue("resolution"),
+		// Quality signals measured by the capture SDK. Absent fields stay nil
+		// and are treated as "not reported" rather than as a passing score.
+		SharpnessScore:  optionalFloat(r.FormValue("sharpness_score")),
+		GlareScore:      optionalFloat(r.FormValue("glare_score")),
+		CornersDetected: optionalInt(r.FormValue("corners_detected")),
 	}
 
 	clientIP := extractIP(r)
@@ -210,11 +259,12 @@ func (h *OnboardingHandler) VerifyOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.SessionID == "" || req.OTPCode == "" {
+	if req.SessionID == "" || !otpCodeFormat.MatchString(req.OTPCode) {
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
 
+	req.DeviceID = r.Header.Get("X-Device-ID")
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
@@ -239,6 +289,7 @@ func (h *OnboardingHandler) ResendOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.DeviceID = r.Header.Get("X-Device-ID")
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
@@ -256,7 +307,7 @@ func (h *OnboardingHandler) ProcessBiometric(w http.ResponseWriter, r *http.Requ
 	const maxBiometricUpload = 50 << 20 // 50 MB (face + frames)
 	r.Body = http.MaxBytesReader(w, r.Body, maxBiometricUpload)
 
-	if err := r.ParseMultipartForm(maxBiometricUpload); err != nil {
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
@@ -284,6 +335,11 @@ func (h *OnboardingHandler) ProcessBiometric(w http.ResponseWriter, r *http.Requ
 	var livenessFrames [][]byte
 	if r.MultipartForm != nil && r.MultipartForm.File != nil {
 		for _, fh := range r.MultipartForm.File["liveness_frames"] {
+			// Stop at one past the domain's ceiling: the request is already
+			// doomed, and reading the rest only costs heap.
+			if len(livenessFrames) >= maxLivenessFramesRead {
+				break
+			}
 			f, err := fh.Open()
 			if err != nil {
 				continue
@@ -398,7 +454,7 @@ func (h *OnboardingHandler) SetCredentials(w http.ResponseWriter, r *http.Reques
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
-	if req.SessionID == "" || req.AccessCodeEncrypted == "" || req.PINEncrypted == "" {
+	if req.SessionID == "" || req.AccessCodeEncrypted == "" || req.PINEncrypted == "" || req.EncryptionKeyID == "" {
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
@@ -419,10 +475,10 @@ func (h *OnboardingHandler) SetCredentials(w http.ResponseWriter, r *http.Reques
 func (h *OnboardingHandler) GetEncryptionPublicKey(w http.ResponseWriter, r *http.Request) {
 	if h.pinKeys == nil {
 		response.Success(w, r, http.StatusOK, map[string]any{
-			"algorithm": "RSA-OAEP-SHA256",
-			"key_id":    "dev-mode",
+			"algorithm":      "RSA-OAEP-SHA256",
+			"key_id":         "dev-mode",
 			"public_key_pem": "",
-			"note":      "Dev mode: send plaintext credentials (no encryption needed).",
+			"note":           "Dev mode: send plaintext credentials (no encryption needed).",
 		})
 		return
 	}
@@ -438,6 +494,33 @@ func (h *OnboardingHandler) GetEncryptionPublicKey(w http.ResponseWriter, r *htt
 		"key_id":         "pin-key-v1",
 		"public_key_pem": string(pemBytes),
 	})
+}
+
+// IssueAgentSignalingToken handles POST /v1/onboarding/video-call/agent-token
+//
+// Internal only. The CS backend calls it when an agent picks up a queued call;
+// the returned URL carries a signed agent role, so the WebSocket side no longer
+// has to believe a ?role= query parameter.
+func (h *OnboardingHandler) IssueAgentSignalingToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		QueueID string `json:"queue_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if req.QueueID == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	resp, err := h.videoCallService.AgentSignalingURL(r.Context(), req.QueueID)
+	if err != nil {
+		h.handleErr(w, r, "issue agent signaling token failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, resp)
 }
 
 // GetAuditTrail handles GET /v1/onboarding/sessions/{session_id}/audit
@@ -461,6 +544,33 @@ func (h *OnboardingHandler) GetAuditTrail(w http.ResponseWriter, r *http.Request
 func (h *OnboardingHandler) GetMonitoringStatus(w http.ResponseWriter, r *http.Request) {
 	status := h.monitoringService.EvaluateAlerts(r.Context())
 	response.Success(w, r, http.StatusOK, status)
+}
+
+// optionalFloat parses a form value that may be absent. An unparseable value
+// is treated the same as an absent one: the quality gate then has no signal,
+// rather than a wrong one.
+func optionalFloat(raw string) *float64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return nil
+	}
+	return &v
+}
+
+func optionalInt(raw string) *int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return nil
+	}
+	return &v
 }
 
 // handleErr converts domain errors to HTTP responses, logging internal errors.

@@ -2,8 +2,10 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/auth"
@@ -32,7 +34,7 @@ func (r *BiometricRepo) FindActiveByKeyID(ctx context.Context, keyID string) (*a
 		&k.BiometricType, &k.Attestation, &k.IsActive, &k.CreatedAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find biometric key: %w", err)

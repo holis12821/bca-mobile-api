@@ -3,8 +3,13 @@ package onboarding
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,15 +24,15 @@ const (
 )
 
 type OCRService struct {
-	sessions   SessionRepository
-	cache      SessionCache
-	ocrResults OCRResultRepository
-	ocrEngine  OCREngine
-	dukcapil   DukcapilClient
-	storage    ObjectStorage
+	sessions    SessionRepository
+	cache       SessionCache
+	ocrResults  OCRResultRepository
+	ocrEngine   OCREngine
+	dukcapil    DukcapilClient
+	storage     ObjectStorage
 	rateLimiter OCRRateLimiter
-	aes        *crypto.AES
-	audit      AuditRepository
+	aes         *crypto.AES
+	audit       AuditRepository
 }
 
 type OCRServiceConfig struct {
@@ -57,16 +62,20 @@ func NewOCRService(cfg OCRServiceConfig) *OCRService {
 }
 
 // ProcessKTP handles the full OCR pipeline:
-// 1. Validate session step == OCR
-// 2. Rate limit check
-// 3. Upload photo to object storage
-// 4. Run OCR engine
-// 5. Parse KTP fields
-// 6. Validate NIK
-// 7. Verify via Dukcapil
-// 8. Assess photo quality
-// 9. Store results (encrypted PII)
-// 10. Transition session to PERSONAL_DATA
+//  1. Validate session step == OCR
+//  2. Rate limit check
+//  3. Run OCR engine
+//  4. Parse KTP fields
+//  5. Validate NIK
+//  6. Verify via Dukcapil
+//  7. Assess photo quality
+//  8. Upload photo to object storage (encrypted at rest)
+//  9. Store results (encrypted PII)
+//  10. Transition session to PERSONAL_DATA
+//
+// The upload deliberately comes after every rejection path: a photo that fails
+// NIK parsing, Dukcapil, or the quality gate must never be left sitting in the
+// bucket, and anything written after it is cleaned up on failure.
 func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData []byte, captureMeta DeviceCaptureMeta, ipAddress, userAgent string) (*OCRResponse, error) {
 	// 1. Resolve session and validate step
 	session, err := s.resolveSession(ctx, sessionID)
@@ -95,30 +104,12 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 
 	// Audit: upload event
 	s.writeAudit(ctx, sessionID, AuditOCRUploaded, "nasabah:"+session.DeviceID, map[string]any{
-		"image_size":   len(imageData),
-		"flash_used":   captureMeta.FlashUsed,
+		"image_size":    len(imageData),
+		"flash_used":    captureMeta.FlashUsed,
 		"auto_captured": captureMeta.AutoCaptured,
 	}, ipAddress, userAgent)
 
-	// 3. Upload photo to object storage (encrypted at rest)
-	photoKey := fmt.Sprintf("%s/%s.jpg", sessionID, uuid.New().String())
-	var photoPath string
-	if s.storage != nil {
-		// Encrypt image before uploading
-		encrypted, encErr := s.aes.Encrypt(imageData)
-		if encErr != nil {
-			return nil, fmt.Errorf("encrypt ktp photo: %w", encErr)
-		}
-		path, uploadErr := s.storage.Upload(ctx, ocrPhotoBucket, photoKey, encrypted, "application/octet-stream")
-		if uploadErr != nil {
-			return nil, fmt.Errorf("upload ktp photo: %w", uploadErr)
-		}
-		photoPath = path
-	} else {
-		photoPath = "local://" + photoKey
-	}
-
-	// 4. Run OCR engine
+	// 3. Run OCR engine
 	var rawText string
 	var confidence float64
 	if s.ocrEngine != nil {
@@ -128,10 +119,10 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		}
 	}
 
-	// 5. Parse KTP fields from raw text
+	// 4. Parse KTP fields from raw text
 	ktpData := ParseKTPFromText(rawText)
 
-	// 6. Validate NIK format
+	// 5. Validate NIK format
 	if ktpData.NIK == "" {
 		return nil, apperr.OCRNotKTP
 	}
@@ -139,13 +130,19 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		return nil, apperr.OCRNotKTP
 	}
 
-	// 7. Verify via Dukcapil
+	// 6. Verify via Dukcapil
 	dukcapilMatch := false
 	if s.dukcapil != nil {
 		match, dErr := s.dukcapil.VerifyNIK(ctx, ktpData.NIK, ktpData.NamaLengkap)
 		if dErr != nil {
-			// Timeout is retryable
-			return nil, apperr.OCRDukcapilTimeout
+			// Only a genuine timeout is retryable; anything else is an
+			// upstream fault and must not masquerade as one.
+			if isTimeout(dErr) {
+				slog.Warn("dukcapil verify timed out", "session_id", sessionID, "error", dErr)
+				return nil, apperr.OCRDukcapilTimeout
+			}
+			slog.Error("dukcapil verify failed", "session_id", sessionID, "error", dErr)
+			return nil, apperr.OCRDukcapilUnavailable
 		}
 		dukcapilMatch = match
 		if !match {
@@ -156,8 +153,9 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		dukcapilMatch = true
 	}
 
-	// 8. Assess photo quality (simplified; production uses CV model)
-	quality := assessPhotoQuality(captureMeta)
+	// 7. Assess photo quality from what the capture SDK measured plus the
+	// engine's own confidence.
+	quality := assessPhotoQuality(captureMeta, confidence)
 	if quality.Sharpness == "LOW" {
 		return nil, apperr.OCRPhotoBlurry
 	}
@@ -168,19 +166,44 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		return nil, apperr.OCRCornersMissing
 	}
 
+	// 8. Upload photo to object storage (encrypted at rest)
+	photoObjectKey := fmt.Sprintf("%s/%s.jpg", sessionID, uuid.New().String())
+	var photoPath string
+	if s.storage != nil {
+		encrypted, encErr := s.encryptBytes(imageData)
+		if encErr != nil {
+			return nil, fmt.Errorf("encrypt ktp photo: %w", encErr)
+		}
+		path, uploadErr := s.storage.Upload(ctx, ocrPhotoBucket, photoObjectKey, encrypted, "application/octet-stream")
+		if uploadErr != nil {
+			return nil, fmt.Errorf("upload ktp photo: %w", uploadErr)
+		}
+		photoPath = path
+	} else {
+		photoPath = "local://" + photoObjectKey
+	}
+
 	// 9. Encrypt PII and store results
-	ocrID := "ocr_" + generateShortID()
+	shortID, err := generateShortID()
+	if err != nil {
+		s.discardPhoto(ctx, photoObjectKey)
+		return nil, fmt.Errorf("generate ocr id: %w", err)
+	}
+	ocrID := "ocr_" + shortID
 
 	nikEnc, err := s.encryptField(ktpData.NIK)
 	if err != nil {
+		s.discardPhoto(ctx, photoObjectKey)
 		return nil, fmt.Errorf("encrypt nik: %w", err)
 	}
 	namaEnc, err := s.encryptField(ktpData.NamaLengkap)
 	if err != nil {
+		s.discardPhoto(ctx, photoObjectKey)
 		return nil, fmt.Errorf("encrypt nama: %w", err)
 	}
 	alamatEnc, err := s.encryptField(ktpData.Alamat)
 	if err != nil {
+		s.discardPhoto(ctx, photoObjectKey)
 		return nil, fmt.Errorf("encrypt alamat: %w", err)
 	}
 
@@ -203,6 +226,7 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 	result.Extracted.Alamat = alamatEnc
 
 	if err := s.ocrResults.Create(ctx, result); err != nil {
+		s.discardPhoto(ctx, photoObjectKey)
 		return nil, fmt.Errorf("store ocr result: %w", err)
 	}
 
@@ -213,11 +237,10 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		return nil, fmt.Errorf("update step: %w", err)
 	}
 
-	// Update cache
+	// Update cache (expiry is fixed at creation — see SessionService.TransitionStep)
 	if s.cache != nil {
 		session.CurrentStep = StepPersonalData
 		session.StepsCompleted = completed
-		session.ExpiresAt = time.Now().Add(sessionTTL)
 		if cacheErr := s.cache.Store(ctx, session); cacheErr != nil {
 			slog.Error("cache step update failed", "error", cacheErr)
 		}
@@ -239,6 +262,27 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		PhotoQuality:  quality,
 		CurrentStep:   StepPersonalData,
 	}, nil
+}
+
+// discardPhoto removes an already-uploaded KTP photo when a later step fails.
+// Best effort: a failure here is logged, never returned — the caller is already
+// on an error path and the object has an auto-delete lifecycle behind it.
+func (s *OCRService) discardPhoto(ctx context.Context, key string) {
+	if s.storage == nil || key == "" {
+		return
+	}
+	if err := s.storage.Delete(ctx, ocrPhotoBucket, key); err != nil {
+		slog.Error("discard ktp photo failed", "key", key, "error", err)
+	}
+}
+
+// isTimeout reports whether err is a deadline/timeout rather than a hard fault.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // GetOCRResult retrieves the OCR result for a session, decrypting PII fields.
@@ -265,6 +309,16 @@ func (s *OCRService) GetOCRResult(ctx context.Context, sessionID string) (*OCRRe
 	}
 
 	return result, nil
+}
+
+// encryptBytes encrypts raw bytes when a PII key is configured. Without one
+// (local dev, AES_KEY unset) the bytes pass through — the same nil-tolerance
+// encryptField and BiometricService already have.
+func (s *OCRService) encryptBytes(plaintext []byte) ([]byte, error) {
+	if s.aes == nil {
+		return plaintext, nil
+	}
+	return s.aes.Encrypt(plaintext)
 }
 
 func (s *OCRService) encryptField(plaintext string) (string, error) {
@@ -350,19 +404,75 @@ func (s *OCRService) writeAudit(ctx context.Context, sessionID string, eventType
 	}
 }
 
-// assessPhotoQuality performs a simplified quality check.
-// In production, this would use a computer vision model.
-func assessPhotoQuality(meta DeviceCaptureMeta) PhotoQuality {
+// Quality thresholds. The capture SDK on the device reports scores on a 0-100
+// scale; the OCR engine reports its own confidence the same way.
+const (
+	minSharpnessScore  = 60.0 // below this the KTP text is not reliably readable
+	maxGlareScore      = 50.0 // above this a reflection covers part of the card
+	minOCRConfidence   = 75.0 // engine confidence that low means a bad capture
+	requiredKTPCorners = 4
+	minCaptureWidth    = 640
+	minCaptureHeight   = 480
+)
+
+// assessPhotoQuality judges the capture from the signals actually available:
+// what the device's capture SDK measured, the frame resolution, and how
+// confident the OCR engine was in its own reading.
+//
+// Every signal is optional — a client that reports nothing is not punished for
+// it — but when a signal arrives and it is bad, the capture is rejected. That
+// is the difference from the previous version, which always returned HIGH and
+// so made OCR_PHOTO_BLURRY, OCR_GLARE_DETECTED and OCR_CORNERS_MISSING
+// unreachable.
+func assessPhotoQuality(meta DeviceCaptureMeta, ocrConfidence float64) PhotoQuality {
 	q := PhotoQuality{
 		Sharpness:         "HIGH",
 		GlareDetected:     false,
 		AllCornersVisible: true,
 	}
 
-	// If flash was used, there's a higher chance of glare
-	if meta.FlashUsed {
-		q.GlareDetected = false // still allow, but flag is available
+	if meta.SharpnessScore != nil && *meta.SharpnessScore < minSharpnessScore {
+		q.Sharpness = "LOW"
+	}
+
+	// A confident engine reading is itself evidence the frame was legible;
+	// a weak one on a card we did manage to parse means a marginal capture.
+	if ocrConfidence > 0 && ocrConfidence < minOCRConfidence {
+		q.Sharpness = "LOW"
+	}
+
+	if w, h, ok := parseResolution(meta.Resolution); ok && (w < minCaptureWidth || h < minCaptureHeight) {
+		q.Sharpness = "LOW"
+	}
+
+	// Flash on its own is not a rejection — it only raises the prior. The
+	// measured glare score decides.
+	if meta.GlareScore != nil && *meta.GlareScore >= maxGlareScore {
+		q.GlareDetected = true
+	}
+
+	if meta.CornersDetected != nil && *meta.CornersDetected < requiredKTPCorners {
+		q.AllCornersVisible = false
 	}
 
 	return q
+}
+
+// parseResolution reads a "1920x1080" capture resolution. Returns ok=false for
+// anything it cannot make sense of, which the caller treats as "no signal".
+func parseResolution(res string) (width, height int, ok bool) {
+	res = strings.ToLower(strings.TrimSpace(res))
+	wStr, hStr, found := strings.Cut(res, "x")
+	if !found {
+		return 0, 0, false
+	}
+	w, err := strconv.Atoi(strings.TrimSpace(wStr))
+	if err != nil || w <= 0 {
+		return 0, 0, false
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(hStr))
+	if err != nil || h <= 0 {
+		return 0, 0, false
+	}
+	return w, h, true
 }

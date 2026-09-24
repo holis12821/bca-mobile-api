@@ -54,6 +54,20 @@ func (m *mockSessionRepo) UpdateStep(_ context.Context, sessionID string, step S
 	return nil
 }
 
+func (m *mockSessionRepo) UpdateCard(_ context.Context, sessionID string, upd SessionCardUpdate) error {
+	s := m.sessions[sessionID]
+	if s == nil {
+		return nil
+	}
+	s.CardType = upd.CardType
+	s.CardCatalogVersion = upd.CatalogVersion
+	selectedAt := upd.SelectedAt
+	s.CardSelectedAt = &selectedAt
+	s.CurrentStep = upd.CurrentStep
+	s.StepsCompleted = upd.StepsCompleted
+	return nil
+}
+
 func (m *mockSessionRepo) CountActiveByDevice(_ context.Context, deviceID string, _ time.Time) (int, error) {
 	return m.counts[deviceID], nil
 }
@@ -262,8 +276,8 @@ func TestCanTransition(t *testing.T) {
 	}{
 		{StepTNC, StepOCR, true},
 		{StepOCR, StepPersonalData, true},
-		{StepOCR, StepBiometric, false},     // skipping steps
-		{StepCompleted, StepReview, false},   // backwards
+		{StepOCR, StepBiometric, false},    // skipping steps
+		{StepCompleted, StepReview, false}, // backwards
 		{StepReview, StepCompleted, true},
 	}
 

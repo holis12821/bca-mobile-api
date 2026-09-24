@@ -188,6 +188,23 @@ func setupExecService(opts ...func(*execDeps)) (*transaction.Service, *execDeps)
 	return svc, d
 }
 
+// ownAccount registers an ACTIVE account belonging to userID, so the ownership
+// gate in ExecuteTransfer has something to find. Tests that omit it are
+// asserting the gate itself.
+func ownAccount(d *execDeps, userID, accountID uuid.UUID) {
+	d.accounts.accounts = append(d.accounts.accounts, account.Account{
+		ID:            accountID,
+		UserID:        userID,
+		AccountNumber: "1234567890",
+		AccountType:   "TAHAPAN",
+		AccountLabel:  "Tahapan BCA",
+		Currency:      "IDR",
+		Balance:       decimal.NewFromInt(10_000_000),
+		IsPrimary:     true,
+		Status:        "ACTIVE",
+	})
+}
+
 func makeTestInquiry(userID uuid.UUID) *transaction.Inquiry {
 	fee := decimal.Zero
 	amount := decimal.NewFromInt(100000)
@@ -357,10 +374,12 @@ func TestExecuteTransfer_InsufficientBalance(t *testing.T) {
 	rawToken := "insuf"
 	storeVToken(deps, rawToken, userID, "TRANSFER")
 	deps.inqCache.inquiries[inquiry.ID.String()] = inquiry
+	sourceAccID := uuid.New()
+	ownAccount(deps, userID, sourceAccID)
 
 	_, _, err := svc.ExecuteTransfer(context.Background(), userID, transaction.ExecuteTransferRequest{
 		InquiryID:         inquiry.ID.String(),
-		SourceAccountID:   uuid.New().String(),
+		SourceAccountID:   sourceAccID.String(),
 		VerificationToken: rawToken,
 	}, "key-6")
 
@@ -383,10 +402,12 @@ func TestExecuteTransfer_DailyLimitExceeded(t *testing.T) {
 	rawToken := "limit"
 	storeVToken(deps, rawToken, userID, "TRANSFER")
 	deps.inqCache.inquiries[inquiry.ID.String()] = inquiry
+	sourceAccID := uuid.New()
+	ownAccount(deps, userID, sourceAccID)
 
 	_, _, err := svc.ExecuteTransfer(context.Background(), userID, transaction.ExecuteTransferRequest{
 		InquiryID:         inquiry.ID.String(),
-		SourceAccountID:   uuid.New().String(),
+		SourceAccountID:   sourceAccID.String(),
 		VerificationToken: rawToken,
 	}, "key-7")
 

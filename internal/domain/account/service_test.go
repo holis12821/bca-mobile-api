@@ -11,6 +11,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/account"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 )
 
 // --- Mock implementations ---
@@ -32,6 +33,15 @@ func (r *mockAccountRepo) FindActiveByUserID(_ context.Context, userID uuid.UUID
 func (r *mockAccountRepo) FindByAccountNumber(_ context.Context, accountNumber string) (*account.Account, error) {
 	for _, a := range r.accounts {
 		if a.AccountNumber == accountNumber {
+			return &a, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *mockAccountRepo) FindOwnedByID(_ context.Context, userID, accountID uuid.UUID) (*account.Account, error) {
+	for _, a := range r.accounts {
+		if a.ID == accountID && a.UserID == userID {
 			return &a, nil
 		}
 	}
@@ -61,12 +71,19 @@ func (r *mockProfileRepo) UpdateSettings(_ context.Context, _ uuid.UUID, _ accou
 type mockLimitRepo struct {
 	mu     sync.Mutex
 	limits map[uuid.UUID][]account.TransactionLimit
+	used   map[uuid.UUID]map[string]decimal.Decimal
 }
 
 func (r *mockLimitRepo) FindByUserID(_ context.Context, userID uuid.UUID) ([]account.TransactionLimit, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.limits[userID], nil
+}
+
+func (r *mockLimitRepo) UsedToday(_ context.Context, userID uuid.UUID, _ string) (map[string]decimal.Decimal, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.used[userID], nil
 }
 
 func (r *mockLimitRepo) UpdateLimit(_ context.Context, userID uuid.UUID, limitType string, update account.LimitUpdate) error {
@@ -200,12 +217,24 @@ func newTestService(accounts []account.Account, profile *account.UserProfile, li
 	svc := account.NewService(account.ServiceConfig{
 		Accounts:      &mockAccountRepo{accounts: accounts},
 		Profiles:      &mockProfileRepo{profiles: profileMap},
-		Limits:        &mockLimitRepo{limits: limitMap},
+		Limits:        &mockLimitRepo{limits: limitMap, used: map[uuid.UUID]map[string]decimal.Decimal{}},
 		Notifications: &mockNotifRepo{notifications: notifs},
 		Versions:      vc,
 	})
+	svc.SetVerificationTokenConsumer(&mockVTokenConsumer{})
 
 	return svc, vc
+}
+
+// mockVTokenConsumer accepts the token "vtk_ok" for any purpose and rejects
+// everything else, so the tests can exercise both sides of the gate.
+type mockVTokenConsumer struct{}
+
+func (mockVTokenConsumer) ConsumeVerificationToken(_ context.Context, _ uuid.UUID, rawToken, _ string) error {
+	if rawToken == "vtk_ok" {
+		return nil
+	}
+	return apperr.VerificationTokenInvalid
 }
 
 // --- Tests ---
@@ -308,13 +337,50 @@ func TestUpdateTransactionLimit_HappyPath(t *testing.T) {
 	svc, _ := newTestService(nil, nil, limits, nil)
 
 	newLimit := decimal.NewFromInt(75000000)
-	err := svc.UpdateTransactionLimit(context.Background(), userID, account.UpdateLimitRequest{
+	got, err := svc.UpdateTransactionLimit(context.Background(), userID, account.UpdateLimitRequest{
+		VerificationToken: "vtk_ok",
 		Limits: map[string]account.LimitUpdate{
 			"TRANSFER_INTERNAL": {DailyLimit: &newLimit},
 		},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil || got.Limits["transfer_internal_daily"] != "75000000.00" {
+		t.Fatalf("expected the new limit in the response, got %+v", got)
+	}
+}
+
+// Raising a daily ceiling is a security decision; an access token alone used to
+// be enough for it.
+func TestUpdateTransactionLimit_RequiresVerificationToken(t *testing.T) {
+	userID := uuid.New()
+	limits := []account.TransactionLimit{
+		{ID: uuid.New(), UserID: userID, LimitType: "TRANSFER_INTERNAL", DailyLimit: decimal.NewFromInt(50000000)},
+	}
+	svc, _ := newTestService(nil, nil, limits, nil)
+
+	newLimit := decimal.NewFromInt(75000000)
+	_, err := svc.UpdateTransactionLimit(context.Background(), userID, account.UpdateLimitRequest{
+		VerificationToken: "not-a-real-token",
+		Limits: map[string]account.LimitUpdate{
+			"TRANSFER_INTERNAL": {DailyLimit: &newLimit},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected the limit change to be refused without a valid verification token")
+	}
+	if apperr.From(err).Code != apperr.VerificationTokenInvalid.Code {
+		t.Fatalf("expected VERIFICATION_TOKEN_INVALID, got %v", err)
+	}
+
+	// And the stored limit must be untouched.
+	after, err := svc.GetTransactionLimits(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Limits["transfer_internal_daily"] != "50000000.00" {
+		t.Fatalf("limit changed despite a rejected token: %s", after.Limits["transfer_internal_daily"])
 	}
 }
 
@@ -327,7 +393,8 @@ func TestUpdateTransactionLimit_ExceedsCeiling(t *testing.T) {
 	svc, _ := newTestService(nil, nil, limits, nil)
 
 	overCeiling := decimal.NewFromInt(999000000) // exceeds 20M ceiling
-	err := svc.UpdateTransactionLimit(context.Background(), userID, account.UpdateLimitRequest{
+	_, err := svc.UpdateTransactionLimit(context.Background(), userID, account.UpdateLimitRequest{
+		VerificationToken: "vtk_ok",
 		Limits: map[string]account.LimitUpdate{
 			"EWALLET": {DailyLimit: &overCeiling},
 		},
@@ -341,7 +408,8 @@ func TestUpdateTransactionLimit_InvalidType(t *testing.T) {
 	svc, _ := newTestService(nil, nil, nil, nil)
 
 	newLimit := decimal.NewFromInt(1000)
-	err := svc.UpdateTransactionLimit(context.Background(), uuid.New(), account.UpdateLimitRequest{
+	_, err := svc.UpdateTransactionLimit(context.Background(), uuid.New(), account.UpdateLimitRequest{
+		VerificationToken: "vtk_ok",
 		Limits: map[string]account.LimitUpdate{
 			"INVALID_TYPE": {DailyLimit: &newLimit},
 		},
@@ -461,7 +529,8 @@ func TestVersionCounter_Invalidation(t *testing.T) {
 	svc, vc := newTestService(nil, nil, limits, nil)
 
 	newLimit := decimal.NewFromInt(60000000)
-	err := svc.UpdateTransactionLimit(context.Background(), userID, account.UpdateLimitRequest{
+	_, err := svc.UpdateTransactionLimit(context.Background(), userID, account.UpdateLimitRequest{
+		VerificationToken: "vtk_ok",
 		Limits: map[string]account.LimitUpdate{
 			"TRANSFER_INTERNAL": {DailyLimit: &newLimit},
 		},

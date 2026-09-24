@@ -268,6 +268,7 @@ func (s *Service) createBiometricSession(ctx context.Context, user *User, device
 		ID:               sessionID,
 		UserID:           user.ID,
 		DeviceID:         device.ID,
+		DeviceKey:        device.DeviceID,
 		RefreshTokenHash: refreshHash,
 		IPAddress:        clientIP,
 		AuthMethod:       authMethod,
@@ -285,6 +286,9 @@ func (s *Service) createBiometricSession(ctx context.Context, user *User, device
 		}
 		if err := s.sessionCache.AddToUserSessions(ctx, user.ID, device.DeviceID); err != nil {
 			slog.Error("add biometric user session failed", "error", err)
+		}
+		if err := s.sessionCache.MarkActive(ctx, user.ID, sessionID, s.refreshTTL); err != nil {
+			slog.Error("mark biometric session active failed", "error", err)
 		}
 	}
 

@@ -179,6 +179,15 @@ func (r *mockAccountRepo) FindByAccountNumber(_ context.Context, number string) 
 	return nil, nil
 }
 
+func (r *mockAccountRepo) FindOwnedByID(_ context.Context, userID, accountID uuid.UUID) (*account.Account, error) {
+	for _, a := range r.accounts {
+		if a.ID == accountID && a.UserID == userID {
+			return &a, nil
+		}
+	}
+	return nil, nil
+}
+
 type mockVersionCounter struct {
 	versions map[string]int64
 }
@@ -194,6 +203,23 @@ func (vc *mockVersionCounter) IncrVersion(_ context.Context, resource string, us
 }
 
 // --- Helper ---
+
+// ownedAccounts builds a one-element repo fixture so the ownership gate in
+// ListMutations has something to find. Tests that leave it out are asserting
+// the gate itself.
+func ownedAccounts(userID, accountID uuid.UUID) *mockAccountRepo {
+	return &mockAccountRepo{accounts: []account.Account{{
+		ID:            accountID,
+		UserID:        userID,
+		AccountNumber: "1234567890",
+		AccountType:   "TAHAPAN",
+		AccountLabel:  "Tahapan BCA",
+		Currency:      "IDR",
+		Balance:       decimal.NewFromInt(1_000_000),
+		IsPrimary:     true,
+		Status:        "ACTIVE",
+	}}}
+}
 
 func newTestService(opts ...func(*transaction.ServiceConfig)) *transaction.Service {
 	cfg := transaction.ServiceConfig{
@@ -236,6 +262,7 @@ func TestListMutations_HappyPath(t *testing.T) {
 
 	svc := newTestService(func(cfg *transaction.ServiceConfig) {
 		cfg.Mutations = &mockMutationRepo{mutations: mutations}
+		cfg.Accounts = ownedAccounts(userID, accountID)
 	})
 
 	items, hasMore, nextCursor, err := svc.ListMutations(context.Background(), userID, accountID, "", 3, nil)
@@ -276,6 +303,7 @@ func TestListMutations_Page2DifferentFromPage1(t *testing.T) {
 
 	svc := newTestService(func(cfg *transaction.ServiceConfig) {
 		cfg.Mutations = &mockMutationRepo{mutations: mutations}
+		cfg.Accounts = ownedAccounts(userID, accountID)
 	})
 
 	// Page 1
@@ -304,6 +332,7 @@ func TestListMutations_Page2DifferentFromPage1(t *testing.T) {
 
 func TestListMutations_SharedDatesNotDropped(t *testing.T) {
 	accountID := uuid.New()
+	userID := uuid.New()
 	sameDate := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 
 	// 4 mutations on the same date — cursor must not drop any
@@ -325,10 +354,11 @@ func TestListMutations_SharedDatesNotDropped(t *testing.T) {
 
 	svc := newTestService(func(cfg *transaction.ServiceConfig) {
 		cfg.Mutations = &mockMutationRepo{mutations: mutations}
+		cfg.Accounts = ownedAccounts(userID, accountID)
 	})
 
 	// Get all 4
-	items, _, _, err := svc.ListMutations(context.Background(), uuid.New(), accountID, "", 10, nil)
+	items, _, _, err := svc.ListMutations(context.Background(), userID, accountID, "", 10, nil)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}

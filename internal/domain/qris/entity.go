@@ -9,12 +9,12 @@ import (
 
 // DecodedQRIS holds the parsed fields from an EMVCo QRIS payload.
 type DecodedQRIS struct {
-	MerchantName string          `json:"merchant_name"`
-	MerchantCity string          `json:"merchant_city"`
-	Amount       decimal.Decimal `json:"amount"`
-	IsAmountFixed bool           `json:"is_amount_fixed"`
-	QRISID       string          `json:"qris_id"`
-	ExpiresAt    string          `json:"expires_at"`
+	MerchantName  string          `json:"merchant_name"`
+	MerchantCity  string          `json:"merchant_city"`
+	Amount        decimal.Decimal `json:"amount"`
+	IsAmountFixed bool            `json:"is_amount_fixed"`
+	QRISID        string          `json:"qris_id"`
+	ExpiresAt     string          `json:"expires_at"`
 }
 
 // DecodeRequest is the request for POST /qris/decode.
@@ -24,11 +24,11 @@ type DecodeRequest struct {
 
 // PayRequest is the request for POST /qris/pay.
 type PayRequest struct {
-	IdempotencyKey    string  `json:"idempotency_key"`
-	QRISID            string  `json:"qris_id" validate:"required"`
-	SourceAccountID   string  `json:"source_account_id" validate:"required"`
-	Amount            int64   `json:"amount" validate:"required"`
-	VerificationToken string  `json:"verification_token" validate:"required"`
+	IdempotencyKey    string `json:"idempotency_key"`
+	QRISID            string `json:"qris_id" validate:"required"`
+	SourceAccountID   string `json:"source_account_id" validate:"required"`
+	Amount            int64  `json:"amount" validate:"required"`
+	VerificationToken string `json:"verification_token" validate:"required"`
 }
 
 // PayResponse is returned from POST /qris/pay.

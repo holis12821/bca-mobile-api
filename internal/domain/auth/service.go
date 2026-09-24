@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/notify"
 )
 
 // DummyPINHash is used for constant-time response on unknown devices.
@@ -44,6 +46,7 @@ type Service struct {
 	jwtMgr             *crypto.JWTManager
 	nonceCheck         crypto.NonceChecker
 	audit              *AuditService
+	notifier           *notify.Notifier
 	accessTTL          time.Duration
 	refreshTTL         time.Duration
 }
@@ -62,6 +65,7 @@ type ServiceConfig struct {
 	JWTManager         *crypto.JWTManager
 	NonceChecker       crypto.NonceChecker
 	Audit              *AuditService
+	Notifier           *notify.Notifier
 	AccessTTL          time.Duration
 	RefreshTTL         time.Duration
 }
@@ -85,6 +89,7 @@ func NewService(cfg ServiceConfig) *Service {
 		jwtMgr:             cfg.JWTManager,
 		nonceCheck:         cfg.NonceChecker,
 		audit:              cfg.Audit,
+		notifier:           cfg.Notifier,
 		accessTTL:          cfg.AccessTTL,
 		refreshTTL:         refreshTTL,
 	}
@@ -160,8 +165,12 @@ func (s *Service) LoginByPIN(ctx context.Context, req LoginRequest, clientIP str
 		}
 	}
 
-	// Verify PIN with Argon2id
-	match, err := crypto.VerifyPassword(ctx, payload.PIN, user.PINHash)
+	// Verify the LOGIN credential with Argon2id.
+	//
+	// For a user onboarded through /v1/onboarding that is the kode akses they
+	// chose; for users created before access_code_hash existed it falls back to
+	// the PIN. The transaction PIN is checked separately, by VerifyPIN.
+	match, err := crypto.VerifyPassword(ctx, payload.PIN, user.LoginCredential())
 	if err != nil {
 		return nil, fmt.Errorf("verify pin: %w", err)
 	}
@@ -306,11 +315,14 @@ func (s *Service) handleSuccessfulLogin(ctx context.Context, user *User, req Log
 		ID:               sessionID,
 		UserID:           user.ID,
 		DeviceID:         device.ID,
+		DeviceKey:        req.DeviceID,
 		RefreshTokenHash: refreshHash,
 		IPAddress:        clientIP,
 		AuthMethod:       "PIN",
-		ExpiresAt:        time.Now().Add(168 * time.Hour), // refresh token TTL
-		CreatedAt:        time.Now(),
+		// s.refreshTTL, not a hardcoded 168h: the row and the token it belongs
+		// to have to expire together, whatever JWT_REFRESH_TOKEN_TTL says.
+		ExpiresAt: time.Now().Add(s.refreshTTL),
+		CreatedAt: time.Now(),
 	}
 
 	// Store in PostgreSQL
@@ -326,6 +338,11 @@ func (s *Service) handleSuccessfulLogin(ctx context.Context, user *User, req Log
 		}
 		if err := s.sessionCache.AddToUserSessions(ctx, user.ID, req.DeviceID); err != nil {
 			slog.Error("add to user sessions failed", "error", err)
+		}
+		// The live marker the Auth middleware reads. Best-effort: a failure
+		// here only means the middleware falls through to Postgres.
+		if err := s.sessionCache.MarkActive(ctx, user.ID, sessionID, s.refreshTTL); err != nil {
+			slog.Error("mark session active failed", "error", err)
 		}
 	}
 
@@ -437,13 +454,39 @@ func (s *Service) VerifyPIN(ctx context.Context, userID uuid.UUID, deviceID, pin
 }
 
 // ChangePIN verifies the old PIN and sets a new one.
-func (s *Service) ChangePIN(ctx context.Context, userID uuid.UUID, req ChangePINRequest, clientIP string) error {
+//
+// The old-PIN check is a PIN check like any other, so it goes through the same
+// rate limiter, lockout and nonce replay guards as login. Without them a
+// stolen access token gave an attacker an unlimited oracle for guessing the
+// PIN, and a captured pin_encrypted blob could be replayed within the 60s
+// timestamp window.
+func (s *Service) ChangePIN(ctx context.Context, userID uuid.UUID, sessionID *uuid.UUID, req ChangePINRequest, clientIP string) error {
+	if s.rateLimiter != nil {
+		result, err := s.rateLimiter.CheckPINVerify(ctx, userID.String())
+		if err != nil {
+			return apperr.InternalError
+		}
+		if result != nil && !result.Allowed {
+			return apperr.RateLimitExceeded
+		}
+	}
+
 	user, err := s.users.FindByID(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("find user: %w", err)
 	}
 	if user == nil {
 		return apperr.NotFound
+	}
+
+	if s.lockout != nil {
+		lockStatus, err := s.lockout.IsLocked(ctx, user.ID.String())
+		if err != nil {
+			return fmt.Errorf("check lockout: %w", err)
+		}
+		if lockStatus.Locked {
+			return apperr.AccountLocked
+		}
 	}
 
 	// Decrypt old PIN
@@ -454,6 +497,15 @@ func (s *Service) ChangePIN(ctx context.Context, userID uuid.UUID, req ChangePIN
 	if err := crypto.ValidatePINTimestamp(oldPayload, crypto.MaxPINTimestampSkew); err != nil {
 		return apperr.OldPINMismatch
 	}
+	if s.nonceCheck != nil {
+		fresh, err := s.nonceCheck.CheckAndMark(oldPayload.Nonce)
+		if err != nil {
+			return fmt.Errorf("nonce check: %w", err)
+		}
+		if !fresh {
+			return apperr.OldPINMismatch
+		}
+	}
 
 	// Verify old PIN
 	match, err := crypto.VerifyPassword(ctx, oldPayload.PIN, user.PINHash)
@@ -461,6 +513,13 @@ func (s *Service) ChangePIN(ctx context.Context, userID uuid.UUID, req ChangePIN
 		return fmt.Errorf("verify old pin: %w", err)
 	}
 	if !match {
+		// Counts toward the lockout budget, exactly as a failed login does.
+		if err := s.handleFailedPIN(ctx, user, "", clientIP); err != nil {
+			var appErr apperr.Error
+			if errors.As(err, &appErr) && appErr.Status == 423 {
+				return err
+			}
+		}
 		return apperr.OldPINMismatch
 	}
 
@@ -492,14 +551,44 @@ func (s *Service) ChangePIN(ctx context.Context, userID uuid.UUID, req ChangePIN
 		return fmt.Errorf("update pin hash: %w", err)
 	}
 
+	// A successful change clears the failure budget.
+	if err := s.users.ResetFailedAttempts(ctx, userID); err != nil {
+		slog.Error("reset failed attempts after pin change failed", "error", err)
+	}
+
+	// Changing the PIN ends every other session. If the change was made by
+	// somebody who should not have been there, the legitimate owner's next
+	// action is a re-login; if it was the owner, the other devices re-auth
+	// with the new PIN. Either way a stolen token does not outlive the change.
+	if err := s.sessions.RevokeByUserID(ctx, userID); err != nil {
+		slog.Error("revoke sessions after pin change failed", "error", err)
+	}
+	if s.sessionCache != nil {
+		if err := s.sessionCache.InvalidateAllUserSessions(ctx, userID); err != nil {
+			slog.Error("invalidate session cache after pin change failed", "error", err)
+		}
+		if err := s.sessionCache.RevokeAllActive(ctx, userID); err != nil {
+			slog.Error("revoke active sessions after pin change failed", "error", err)
+		}
+	}
+
 	// Audit
 	if s.audit != nil {
 		s.audit.Log(&AuditEntry{
 			UserID:       &userID,
+			SessionID:    sessionID,
 			Action:       "PIN_CHANGED",
 			ResourceType: "auth",
 			IPAddress:    clientIP,
+			Metadata:     map[string]any{"sessions_revoked": true},
 		})
+	}
+
+	if s.notifier != nil {
+		s.notifier.Security(ctx, userID,
+			"Kode akses berhasil diubah",
+			"Kode akses m-BCA Anda baru saja diubah. Semua perangkat lain telah dikeluarkan. Jika ini bukan Anda, segera hubungi Halo BCA.",
+		)
 	}
 
 	return nil
@@ -508,4 +597,131 @@ func (s *Service) ChangePIN(ctx context.Context, userID uuid.UUID, req ChangePIN
 func hashToken(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(h[:])
+}
+
+// ChangeAccessCode replaces the kode akses used at login.
+//
+// POST /auth/pin/change changes the transaction PIN; this changes the
+// credential the app asks for when it opens. They are separate secrets in
+// m-BCA, and before access_code_hash was persisted there was no way to change
+// the second one at all.
+func (s *Service) ChangeAccessCode(ctx context.Context, userID uuid.UUID, sessionID *uuid.UUID, req ChangePINRequest, clientIP string) error {
+	if s.rateLimiter != nil {
+		result, err := s.rateLimiter.CheckPINVerify(ctx, userID.String())
+		if err != nil {
+			return apperr.InternalError
+		}
+		if result != nil && !result.Allowed {
+			return apperr.RateLimitExceeded
+		}
+	}
+
+	user, err := s.users.FindByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("find user: %w", err)
+	}
+	if user == nil {
+		return apperr.NotFound
+	}
+
+	if s.lockout != nil {
+		lockStatus, err := s.lockout.IsLocked(ctx, user.ID.String())
+		if err != nil {
+			return fmt.Errorf("check lockout: %w", err)
+		}
+		if lockStatus.Locked {
+			return apperr.AccountLocked
+		}
+	}
+
+	oldPayload, err := s.pinKeys.DecryptPIN(req.OldPINEncrypted)
+	if err != nil {
+		return apperr.OldPINMismatch
+	}
+	if err := crypto.ValidatePINTimestamp(oldPayload, crypto.MaxPINTimestampSkew); err != nil {
+		return apperr.OldPINMismatch
+	}
+	if s.nonceCheck != nil {
+		fresh, err := s.nonceCheck.CheckAndMark(oldPayload.Nonce)
+		if err != nil {
+			return fmt.Errorf("nonce check: %w", err)
+		}
+		if !fresh {
+			return apperr.OldPINMismatch
+		}
+	}
+
+	match, err := crypto.VerifyPassword(ctx, oldPayload.PIN, user.LoginCredential())
+	if err != nil {
+		return fmt.Errorf("verify old access code: %w", err)
+	}
+	if !match {
+		if err := s.handleFailedPIN(ctx, user, "", clientIP); err != nil {
+			var appErr apperr.Error
+			if errors.As(err, &appErr) && appErr.Status == 423 {
+				return err
+			}
+		}
+		return apperr.OldPINMismatch
+	}
+
+	newPayload, err := s.pinKeys.DecryptPIN(req.NewPINEncrypted)
+	if err != nil {
+		return apperr.ValidationError
+	}
+	if err := crypto.ValidatePINTimestamp(newPayload, crypto.MaxPINTimestampSkew); err != nil {
+		return apperr.ValidationError
+	}
+	if newPayload.PIN == oldPayload.PIN {
+		return apperr.Error{
+			Status:  422,
+			Code:    "VALIDATION_ERROR",
+			Message: "Kode akses baru tidak boleh sama dengan yang lama.",
+		}
+	}
+
+	newHash, err := crypto.HashPassword(ctx, newPayload.PIN, crypto.DefaultArgon2Params)
+	if err != nil {
+		return fmt.Errorf("hash new access code: %w", err)
+	}
+	if err := s.users.UpdateAccessCodeHash(ctx, userID, newHash); err != nil {
+		return fmt.Errorf("update access code: %w", err)
+	}
+	if err := s.users.ResetFailedAttempts(ctx, userID); err != nil {
+		slog.Error("reset failed attempts after access code change failed", "error", err)
+	}
+
+	// Same reasoning as ChangePIN: the login credential changed, so every
+	// session established with the old one ends.
+	if err := s.sessions.RevokeByUserID(ctx, userID); err != nil {
+		slog.Error("revoke sessions after access code change failed", "error", err)
+	}
+	if s.sessionCache != nil {
+		if err := s.sessionCache.InvalidateAllUserSessions(ctx, userID); err != nil {
+			slog.Error("invalidate session cache after access code change failed", "error", err)
+		}
+		if err := s.sessionCache.RevokeAllActive(ctx, userID); err != nil {
+			slog.Error("revoke active sessions after access code change failed", "error", err)
+		}
+	}
+
+	if s.audit != nil {
+		s.audit.Log(&AuditEntry{
+			UserID:       &userID,
+			SessionID:    sessionID,
+			Action:       "ACCESS_CODE_CHANGED",
+			ResourceType: "auth",
+			IPAddress:    clientIP,
+			Metadata:     map[string]any{"sessions_revoked": true},
+		})
+	}
+
+	if s.notifier != nil {
+		s.notifier.Security(ctx, userID,
+			"Kode akses berhasil diubah",
+			"Kode akses m-BCA Anda baru saja diubah. Semua perangkat lain telah dikeluarkan. Jika ini bukan Anda, segera hubungi Halo BCA.",
+		)
+	}
+
+	return nil
 }

@@ -2,8 +2,11 @@ package onboarding
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/holis12821/bca-mobile-api/internal/pkg/metrics"
 )
 
 // MonitoringService evaluates alert rules and provides system health metrics.
@@ -11,12 +14,17 @@ type MonitoringService struct {
 	sessions   SessionRepository
 	audit      AuditRepository
 	queueCache VideoCallQueueCache
+
+	// metrics opsional: tanpa registry, aturan alert yang bersandar pada counter
+	// dilewati, bukan membuat seluruh endpoint monitoring gagal.
+	metrics *metrics.Registry
 }
 
 type MonitoringServiceConfig struct {
 	Sessions   SessionRepository
 	Audit      AuditRepository
 	QueueCache VideoCallQueueCache
+	Metrics    *metrics.Registry
 }
 
 func NewMonitoringService(cfg MonitoringServiceConfig) *MonitoringService {
@@ -24,8 +32,20 @@ func NewMonitoringService(cfg MonitoringServiceConfig) *MonitoringService {
 		sessions:   cfg.Sessions,
 		audit:      cfg.Audit,
 		queueCache: cfg.QueueCache,
+		metrics:    cfg.Metrics,
 	}
 }
+
+// Ambang alert rasio kartu tidak tersedia (§Prompt 8).
+const (
+	cardUnavailableWindow = 15 * time.Minute
+	cardUnavailableRatio  = 0.05
+
+	// minSample menahan alert dari beberapa kejadian pertama. Tanpa itu, satu
+	// penolakan di tengah lima pemilihan sudah 20% dan alert berbunyi untuk
+	// keadaan yang sepenuhnya normal di jam sepi.
+	cardUnavailableMinSample = 20
+)
 
 // GetAuditTrail returns the full audit trail for a session.
 func (s *MonitoringService) GetAuditTrail(ctx context.Context, sessionID string) (*GetAuditTrailResponse, error) {
@@ -74,6 +94,15 @@ func (s *MonitoringService) EvaluateAlerts(ctx context.Context) *MonitoringStatu
 		}
 	}
 
+	// 2. Rasio kartu tidak tersedia (§Prompt 8).
+	//
+	// Rasio, bukan jumlah mutlak: pemilihan kartu yang naik dua kali lipat juga
+	// menaikkan jumlah penolakan tanpa ada yang salah. Yang menandakan
+	// konfigurasi stok keliru adalah PORSI penolakan yang melonjak.
+	if alert := s.evaluateCardUnavailableRatio(); alert != nil {
+		status.Alerts = append(status.Alerts, *alert)
+	}
+
 	// Additional alert rules are evaluated by periodic background jobs.
 	// The rules below describe what should be monitored:
 	//
@@ -100,10 +129,50 @@ func (s *MonitoringService) EvaluateAlerts(ctx context.Context) *MonitoringStatu
 
 // RetentionPolicy defines data retention schedules per POJK regulation.
 var RetentionPolicy = map[string]time.Duration{
-	"audit_logs":      7 * 365 * 24 * time.Hour, // 7 years
-	"session_data":    30 * 24 * time.Hour,       // 30 days after completion
-	"ktp_photos":      30 * 24 * time.Hour,       // 30 days
+	"audit_logs":       7 * 365 * 24 * time.Hour, // 7 years
+	"session_data":     30 * 24 * time.Hour,      // 30 days after completion
+	"ktp_photos":       30 * 24 * time.Hour,      // 30 days
 	"biometric_photos": 7 * 24 * time.Hour,       // 7 days (UU PDP)
 	"video_recordings": 5 * 365 * 24 * time.Hour, // 5 years (POJK)
-	"credentials":     0,                          // until account closed
+	"credentials":      0,                        // until account closed
+}
+
+// evaluateCardUnavailableRatio menilai porsi penolakan CARD_TYPE_UNAVAILABLE
+// terhadap seluruh pemilihan kartu dalam 15 menit terakhir.
+//
+// Di atas 5% adalah pertanda konfigurasi stok salah, bukan perilaku nasabah:
+// nasabah memilih kartu yang ditawarkan layar, dan layar hanya menawarkan kartu
+// yang katalog sebut tersedia. Penolakan yang sering berarti katalog
+// mengatakan dua hal yang berbeda.
+func (s *MonitoringService) evaluateCardUnavailableRatio() *MonitoringAlert {
+	if s.metrics == nil {
+		return nil
+	}
+
+	unavailable := s.metrics.WindowSum(metrics.CardUnavailable, cardUnavailableWindow)
+	selected := s.metrics.WindowSum(metrics.CardSelected, cardUnavailableWindow)
+	changed := s.metrics.WindowSum(metrics.CardChanged, cardUnavailableWindow)
+
+	// Penyebutnya adalah SELURUH upaya pemilihan: yang berhasil (pilih + ganti)
+	// dan yang ditolak. Memakai hanya yang berhasil akan membuat rasio meledak
+	// justru ketika hampir semuanya ditolak — saat penyebutnya mendekati nol.
+	attempts := selected + changed + unavailable
+	if attempts < cardUnavailableMinSample {
+		return nil
+	}
+
+	ratio := float64(unavailable) / float64(attempts)
+	if ratio <= cardUnavailableRatio {
+		return nil
+	}
+
+	return &MonitoringAlert{
+		Rule:     "CARD_UNAVAILABLE_RATIO_HIGH",
+		Severity: "WARNING",
+		Message: fmt.Sprintf(
+			"%.1f%% pemilihan kartu ditolak CARD_TYPE_UNAVAILABLE dalam %s (%d dari %d). "+
+				"Periksa availability_status dan stok per wilayah di katalog, bukan perilaku nasabah.",
+			ratio*100, cardUnavailableWindow, unavailable, attempts),
+		Triggered: true,
+	}
 }

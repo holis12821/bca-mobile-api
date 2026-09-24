@@ -37,6 +37,9 @@ func (m *mockUserRepo) SetLockedUntil(_ context.Context, _ uuid.UUID, _ *time.Ti
 func (m *mockUserRepo) FindByID(_ context.Context, _ uuid.UUID) (*auth.User, error) {
 	return m.user, nil
 }
+func (m *mockUserRepo) UpdateAccessCodeHash(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
 func (m *mockUserRepo) UpdatePINHash(_ context.Context, _ uuid.UUID, _ string) error {
 	return nil
 }
@@ -61,10 +64,26 @@ func newMockSessionRepo() *mockSessionRepo {
 	}
 }
 
+// copySession returns a detached copy, the way the real repository does.
+//
+// postgres.SessionRepo scans every lookup into a fresh struct, so two
+// concurrent refreshes never touch the same memory. Handing out the stored
+// pointer instead made the mock — not the code under test — the thing that
+// raced: one goroutine read session.ExpiresAt while another rotated it, and
+// -race failed TestRefreshToken_ConcurrentRace on every run. Mirror the real
+// repository so the test exercises the service, not a mock artifact.
+func copySession(s *auth.Session) *auth.Session {
+	if s == nil {
+		return nil
+	}
+	dup := *s
+	return &dup
+}
+
 func (m *mockSessionRepo) Create(_ context.Context, s *auth.Session) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.sessions[s.RefreshTokenHash] = s
+	m.sessions[s.RefreshTokenHash] = copySession(s)
 	return nil
 }
 
@@ -75,7 +94,21 @@ func (m *mockSessionRepo) FindByRefreshTokenHash(_ context.Context, hash string)
 	if !ok {
 		return nil, nil
 	}
-	return s, nil
+	return copySession(s), nil
+}
+
+func (m *mockSessionRepo) FindActiveByID(_ context.Context, sessionID uuid.UUID) (*auth.Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.revoked[sessionID] {
+		return nil, nil
+	}
+	for _, s := range m.sessions {
+		if s.ID == sessionID && s.ExpiresAt.After(time.Now()) {
+			return copySession(s), nil
+		}
+	}
+	return nil, nil
 }
 
 func (m *mockSessionRepo) UpdateRefreshToken(_ context.Context, sessionID uuid.UUID, newHash string, expiresAt time.Time) error {
@@ -144,6 +177,25 @@ func (m *mockSessionCache) DeleteSession(_ context.Context, userID uuid.UUID, de
 	return nil
 }
 
+func (m *mockSessionCache) MarkActive(_ context.Context, _, _ uuid.UUID, _ time.Duration) error {
+	return nil
+}
+func (m *mockSessionCache) IsActive(_ context.Context, _ uuid.UUID) (bool, error) {
+	// Report "not cached" so the validator falls through to the repo, which is
+	// the path these tests care about.
+	return false, nil
+}
+func (m *mockSessionCache) MarkInactive(_ context.Context, _ uuid.UUID, _ time.Duration) error {
+	return nil
+}
+
+// Report "not remembered" so the validator keeps falling through to the repo,
+// which is the path these tests exercise.
+func (m *mockSessionCache) IsKnownInactive(_ context.Context, _ uuid.UUID) (bool, error) {
+	return false, nil
+}
+func (m *mockSessionCache) RevokeActive(_ context.Context, _, _ uuid.UUID) error { return nil }
+func (m *mockSessionCache) RevokeAllActive(_ context.Context, _ uuid.UUID) error { return nil }
 func (m *mockSessionCache) InvalidateAllUserSessions(_ context.Context, _ uuid.UUID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -301,15 +353,11 @@ func TestRefreshToken_HappyPath(t *testing.T) {
 	svc, sessionRepo, tokenRevocation, auditRepo, jwtMgr := setupService(t)
 	ctx := context.Background()
 
-	// Get the user ID from the mock
-	userID := uuid.UUID{}
-	for _, s := range sessionRepo.sessions {
-		userID = s.UserID
-		break
-	}
-	// No sessions yet, create via JWT
+	// Belum ada sesi pada titik ini, jadi user id diambil dari klaim JWT.
+	// Sebelumnya ada loop yang membaca sessionRepo lebih dulu, tapi nilainya
+	// selalu ditimpa baris di bawah — tidak berpengaruh apa pun.
 	claims := getClaims(t, jwtMgr)
-	userID = uuid.MustParse(claims)
+	userID := uuid.MustParse(claims)
 
 	refreshToken, sessionID := createTestSession(t, jwtMgr, sessionRepo, userID)
 	oldHash := hashToken(refreshToken)

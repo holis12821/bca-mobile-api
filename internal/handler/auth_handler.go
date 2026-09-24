@@ -3,7 +3,6 @@ package handler
 import (
 	"encoding/json"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 
@@ -305,10 +304,60 @@ func (h *AuthHandler) ChangePIN(w http.ResponseWriter, r *http.Request) {
 
 	clientIP := extractIP(r)
 
-	if err := h.authService.ChangePIN(r.Context(), userID, req, clientIP); err != nil {
+	// The session id is passed through so the audit entry names the session
+	// that performed the change — every other session is revoked by it.
+	var sessionID *uuid.UUID
+	if sid, err := uuid.Parse(middleware.SessionIDFromCtx(r.Context())); err == nil {
+		sessionID = &sid
+	}
+
+	if err := h.authService.ChangePIN(r.Context(), userID, sessionID, req, clientIP); err != nil {
 		appErr := apperr.From(err)
 		if appErr.Code == apperr.InternalError.Code {
 			slog.Error("change pin failed",
+				"request_id", chimiddleware.GetReqID(r.Context()),
+				"error", err,
+			)
+		}
+		response.Err(w, r, appErr)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, map[string]string{
+		"message": "PIN transaksi berhasil diubah.",
+	})
+}
+
+// ChangeAccessCode handles POST /v1/auth/access-code/change (requires auth middleware).
+//
+// The kode akses is the credential POST /auth/login/pin verifies; the PIN that
+// POST /auth/pin/change replaces is the one that authorises transactions.
+func (h *AuthHandler) ChangeAccessCode(w http.ResponseWriter, r *http.Request) {
+	userID, err := uuid.Parse(middleware.UserIDFromCtx(r.Context()))
+	if err != nil {
+		response.Err(w, r, apperr.TokenInvalid)
+		return
+	}
+
+	var req auth.ChangePINRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if req.OldPINEncrypted == "" || req.NewPINEncrypted == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	var sessionID *uuid.UUID
+	if sid, err := uuid.Parse(middleware.SessionIDFromCtx(r.Context())); err == nil {
+		sessionID = &sid
+	}
+
+	if err := h.authService.ChangeAccessCode(r.Context(), userID, sessionID, req, extractIP(r)); err != nil {
+		appErr := apperr.From(err)
+		if appErr.Code == apperr.InternalError.Code {
+			slog.Error("change access code failed",
 				"request_id", chimiddleware.GetReqID(r.Context()),
 				"error", err,
 			)
@@ -330,21 +379,12 @@ func extractBearerToken(r *http.Request) string {
 	return ""
 }
 
+// extractIP returns the caller's address as resolved by the RealIP middleware.
+//
+// It used to parse X-Forwarded-For here, and the onboarding audit middleware
+// parsed it again with slightly different rules — both trusting the header from
+// any caller. One resolver now owns that decision, and it only believes a
+// forwarding header when the connection came from a configured proxy.
 func extractIP(r *http.Request) string {
-	// Check X-Forwarded-For first (behind reverse proxy)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP (client IP) — may be comma-separated
-		if idx := strings.IndexByte(xff, ','); idx != -1 {
-			xff = xff[:idx]
-		}
-		return strings.TrimSpace(xff)
-	}
-	// Check X-Real-IP
-	if xri := r.Header.Get("X-Real-Ip"); xri != "" {
-		return strings.TrimSpace(xri)
-	}
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return ip
-	}
-	return r.RemoteAddr
+	return middleware.ClientIP(r)
 }

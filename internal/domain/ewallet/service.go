@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +16,7 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/domain/account"
 	"github.com/holis12821/bca-mobile-api/internal/domain/transaction"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/notify"
 )
 
 var wib = func() *time.Location {
@@ -35,6 +37,7 @@ type Service struct {
 	providerCache    ProviderCache
 	cacheInvalidator transaction.TransactionCacheInvalidator
 	idemStore        transaction.IdempotencyStore
+	notifier         *notify.Notifier
 	versions         account.VersionCounter
 }
 
@@ -48,6 +51,7 @@ type ServiceConfig struct {
 	ProviderCache    ProviderCache
 	CacheInvalidator transaction.TransactionCacheInvalidator
 	IdemStore        transaction.IdempotencyStore
+	Notifier         *notify.Notifier
 	Versions         account.VersionCounter
 }
 
@@ -62,6 +66,7 @@ func NewService(cfg ServiceConfig) *Service {
 		providerCache:    cfg.ProviderCache,
 		cacheInvalidator: cfg.CacheInvalidator,
 		idemStore:        cfg.IdemStore,
+		notifier:         cfg.Notifier,
 		versions:         cfg.Versions,
 	}
 }
@@ -127,6 +132,17 @@ func (s *Service) CreateInquiry(ctx context.Context, userID uuid.UUID, req Inqui
 		return nil, apperr.ValidationError
 	}
 
+	// The source account has to belong to the caller. This used to be resolved
+	// only for display, and an account that was not theirs simply produced an
+	// empty source_account in the response while the top-up still went through.
+	sourceAccount, err := s.accounts.FindOwnedByID(ctx, userID, sourceAccountID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve source account: %w", err)
+	}
+	if sourceAccount == nil {
+		return nil, apperr.SourceAccountForbidden
+	}
+
 	adminFee := provider.AdminFee
 	totalAmount := amount.Add(adminFee)
 	inquiryID := uuid.New()
@@ -157,23 +173,9 @@ func (s *Service) CreateInquiry(ctx context.Context, userID uuid.UUID, req Inqui
 		}
 	}
 
-	// Mask phone for response
-	maskedPhone := req.PhoneNumber
-	if len(maskedPhone) > 8 {
-		maskedPhone = maskedPhone[:4] + "****" + maskedPhone[len(maskedPhone)-4:]
-	}
+	maskedPhone := account.MaskPhone(req.PhoneNumber)
 
-	// Resolve source account number for response
-	sourceNumber := ""
-	accounts, err := s.accounts.FindActiveByUserID(ctx, userID)
-	if err == nil {
-		for _, a := range accounts {
-			if a.ID == sourceAccountID {
-				sourceNumber = a.AccountNumber
-				break
-			}
-		}
-	}
+	sourceNumber := sourceAccount.AccountNumber
 
 	return &InquiryResponse{
 		InquiryID:        inquiryID.String(),
@@ -208,11 +210,35 @@ func (s *Service) ExecuteTopUp(ctx context.Context, userID uuid.UUID, req TopUpR
 		}
 	}
 
+	// A failed top-up gives the inquiry and the verification token back — see
+	// the equivalent comment in transaction.ExecuteTransfer. Nothing was
+	// written, so making the nasabah redo the PIN prompt is pure friction.
 	releaseIdem := true
+	var restoreInquiry *transaction.Inquiry
+	restoreVToken := ""
 	defer func() {
-		if releaseIdem && s.idemStore != nil {
-			if err := s.idemStore.Release(ctx, userID.String(), idemKey); err != nil {
+		if !releaseIdem {
+			return
+		}
+		// Detached: landing here with a cancelled context usually means the
+		// client gave up, and that is precisely when the key has to be released
+		// so their retry is not answered with a 409.
+		undoCtx, cancelUndo := transaction.PostCommitContext(ctx)
+		defer cancelUndo()
+
+		if s.idemStore != nil {
+			if err := s.idemStore.Release(undoCtx, userID.String(), idemKey); err != nil {
 				slog.Error("release idempotency key failed", "error", err)
+			}
+		}
+		if restoreInquiry != nil && s.inquiryCache != nil && time.Now().Before(restoreInquiry.ExpiresAt) {
+			if err := s.inquiryCache.StoreInquiry(undoCtx, restoreInquiry); err != nil {
+				slog.Warn("restore ewallet inquiry failed", "error", err)
+			}
+		}
+		if restoreVToken != "" && s.vtokenCache != nil {
+			if err := s.vtokenCache.StoreToken(undoCtx, restoreVToken, userID.String(), "EWALLET_TOPUP"); err != nil {
+				slog.Warn("restore ewallet verification token failed", "error", err)
 			}
 		}
 	}()
@@ -226,6 +252,7 @@ func (s *Service) ExecuteTopUp(ctx context.Context, userID uuid.UUID, req TopUpR
 	if vtokenUserID == "" || vtokenUserID != userID.String() || vtokenPurpose != "EWALLET_TOPUP" {
 		return nil, false, apperr.VerificationTokenInvalid
 	}
+	restoreVToken = tokenHash
 
 	// Step 3: Consume inquiry
 	inquiry, err := s.inquiryCache.ConsumeInquiry(ctx, req.InquiryID)
@@ -235,6 +262,7 @@ func (s *Service) ExecuteTopUp(ctx context.Context, userID uuid.UUID, req TopUpR
 	if inquiry == nil || inquiry.UserID != userID {
 		return nil, false, apperr.InquiryExpired
 	}
+	restoreInquiry = inquiry
 
 	// Extract fields from inquiry
 	providerID := ""
@@ -270,6 +298,14 @@ func (s *Service) ExecuteTopUp(ctx context.Context, userID uuid.UUID, req TopUpR
 		return nil, false, apperr.ValidationError
 	}
 
+	sourceAccount, err := s.accounts.FindOwnedByID(ctx, userID, sourceAccountID)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve source account: %w", err)
+	}
+	if sourceAccount == nil {
+		return nil, false, apperr.SourceAccountForbidden
+	}
+
 	now := time.Now().In(wib)
 
 	params := ExecuteTopUpParams{
@@ -292,34 +328,26 @@ func (s *Service) ExecuteTopUp(ctx context.Context, userID uuid.UUID, req TopUpR
 		return nil, false, err
 	}
 
+	// Committed. Follow-up work runs detached so a client that hung up cannot
+	// leave the balance cache stale or the idempotent response unwritten.
+	postCtx, cancelPost := transaction.PostCommitContext(ctx)
+	defer cancelPost()
+
 	// Cache invalidation for source user
 	parties := []transaction.AffectedParty{
 		{UserID: userID.String(), AccountID: sourceAccountID.String()},
 	}
 	if s.cacheInvalidator != nil {
-		if err := s.cacheInvalidator.InvalidateTransactionCaches(ctx, parties); err != nil {
+		if err := s.cacheInvalidator.InvalidateTransactionCaches(postCtx, parties); err != nil {
 			slog.Error("cache invalidation failed", "error", err)
 		}
 	}
 
-	// Resolve source info
-	sourceName := ""
-	sourceNumber := ""
-	accounts, err := s.accounts.FindActiveByUserID(ctx, userID)
-	if err == nil {
-		for _, a := range accounts {
-			if a.ID == sourceAccountID {
-				sourceNumber = a.AccountNumber
-				sourceName = a.AccountLabel
-				break
-			}
-		}
-	}
+	// Source info — already resolved by the ownership check above.
+	sourceName := sourceAccount.AccountLabel
+	sourceNumber := sourceAccount.AccountNumber
 
-	maskedPhone := inquiry.DestinationAccount
-	if len(maskedPhone) > 8 {
-		maskedPhone = maskedPhone[:4] + "****" + maskedPhone[len(maskedPhone)-4:]
-	}
+	maskedPhone := account.MaskPhone(inquiry.DestinationAccount)
 
 	resp := &TopUpResponse{
 		TransactionID:    txn.ID.String(),
@@ -336,13 +364,29 @@ func (s *Service) ExecuteTopUp(ctx context.Context, userID uuid.UUID, req TopUpR
 		CreatedAt:        txn.CreatedAt.UTC().Format(time.RFC3339),
 	}
 
-	// Persist idempotent response
 	releaseIdem = false
+
+	if s.notifier != nil {
+		s.notifier.Transaction(postCtx, userID,
+			"Top up e-wallet berhasil",
+			fmt.Sprintf("Top up %s ke %s (%s) berhasil. Ref: %s",
+				formatIDR(totalAmount), providerName, maskedPhone, txn.ReferenceNumber),
+			"bcamobile://transaction/"+txn.ID.String(),
+			map[string]any{
+				"transaction_id":   txn.ID.String(),
+				"reference_number": txn.ReferenceNumber,
+				"amount":           amount.StringFixed(2),
+				"provider":         providerName,
+			},
+		)
+	}
+
+	// Persist idempotent response
 	if s.idemStore != nil {
 		respJSON, err := json.Marshal(resp)
 		if err != nil {
 			slog.Error("marshal idempotent response failed", "error", err)
-		} else if err := s.idemStore.Persist(ctx, userID.String(), idemKey, string(respJSON)); err != nil {
+		} else if err := s.idemStore.Persist(postCtx, userID.String(), idemKey, string(respJSON)); err != nil {
 			slog.Error("persist idempotent response failed", "error", err)
 		}
 	}
@@ -372,4 +416,23 @@ func toProviderItems(providers []Provider) []ProviderItem {
 func hashVToken(rawToken string) string {
 	h := sha256.Sum256([]byte(rawToken))
 	return hex.EncodeToString(h[:])
+}
+
+// formatIDR renders a decimal as "Rp1.234.567".
+func formatIDR(d decimal.Decimal) string {
+	digits := d.Truncate(0).Abs().String()
+
+	var b strings.Builder
+	b.Grow(len(digits) + len(digits)/3 + 3)
+	b.WriteString("Rp")
+	if d.IsNegative() {
+		b.WriteString("-")
+	}
+	for i, r := range digits {
+		if i > 0 && (len(digits)-i)%3 == 0 {
+			b.WriteString(".")
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

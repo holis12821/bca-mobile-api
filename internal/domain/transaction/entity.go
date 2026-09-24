@@ -128,18 +128,18 @@ type InquiryResponse struct {
 
 // MutationItem is a single item in the mutations list response.
 type MutationItem struct {
-	ID              string         `json:"id"`
-	MutationType    string         `json:"mutation_type"`
-	Amount          string         `json:"amount"`
-	BalanceBefore   string         `json:"balance_before"`
-	BalanceAfter    string         `json:"balance_after"`
-	Description     string         `json:"description"`
-	Detail          string         `json:"detail,omitempty"`
-	Category        string         `json:"category,omitempty"`
-	ReferenceNumber string         `json:"reference_number,omitempty"`
-	TransactionDate string         `json:"transaction_date"`
-	TransactionTime string         `json:"transaction_time"`
-	CreatedAt       string         `json:"created_at"`
+	ID              string `json:"id"`
+	MutationType    string `json:"mutation_type"`
+	Amount          string `json:"amount"`
+	BalanceBefore   string `json:"balance_before"`
+	BalanceAfter    string `json:"balance_after"`
+	Description     string `json:"description"`
+	Detail          string `json:"detail,omitempty"`
+	Category        string `json:"category,omitempty"`
+	ReferenceNumber string `json:"reference_number,omitempty"`
+	TransactionDate string `json:"transaction_date"`
+	TransactionTime string `json:"transaction_time"`
+	CreatedAt       string `json:"created_at"`
 }
 
 // TransactionItem is a single item in the transaction history response.
@@ -185,11 +185,12 @@ type PINVerifyResponse struct {
 
 // Valid purposes for verification tokens.
 var ValidPurposes = map[string]bool{
-	"TRANSFER":      true,
-	"EWALLET_TOPUP": true,
-	"QRIS_PAYMENT":  true,
-	"CHANGE_LIMIT":  true,
-	"CHANGE_PIN":    true,
+	"TRANSFER":       true,
+	"EWALLET_TOPUP":  true,
+	"QRIS_PAYMENT":   true,
+	"CHANGE_LIMIT":   true,
+	"CHANGE_PIN":     true,
+	"CHANGE_PROFILE": true,
 }
 
 // ExecuteTransferRequest is the request body for POST /transfer/execute.
@@ -234,23 +235,23 @@ type TransferDestination struct {
 
 // ReceiptResponse is the response for GET /transactions/{id}/receipt.
 type ReceiptResponse struct {
-	TransactionID   string `json:"transaction_id"`
-	Type            string `json:"type"`
-	Status          string `json:"status"`
-	Date            string `json:"date"`
-	Time            string `json:"time"`
-	ReferenceNumber string `json:"reference_number"`
-	SourceAccount   string `json:"source_account,omitempty"`
-	SourceName      string `json:"source_name,omitempty"`
+	TransactionID      string `json:"transaction_id"`
+	Type               string `json:"type"`
+	Status             string `json:"status"`
+	Date               string `json:"date"`
+	Time               string `json:"time"`
+	ReferenceNumber    string `json:"reference_number"`
+	SourceAccount      string `json:"source_account,omitempty"`
+	SourceName         string `json:"source_name,omitempty"`
 	DestinationAccount string `json:"destination_account,omitempty"`
 	DestinationName    string `json:"destination_name,omitempty"`
 	DestinationBank    string `json:"destination_bank,omitempty"`
-	ProviderName    string `json:"provider_name,omitempty"`
-	Amount          string `json:"amount"`
-	AdminFee        string `json:"admin_fee"`
-	Total           string `json:"total"`
-	Currency        string `json:"currency"`
-	Notes           string `json:"notes,omitempty"`
+	ProviderName       string `json:"provider_name,omitempty"`
+	Amount             string `json:"amount"`
+	AdminFee           string `json:"admin_fee"`
+	Total              string `json:"total"`
+	Currency           string `json:"currency"`
+	Notes              string `json:"notes,omitempty"`
 }
 
 // Valid transfer types.

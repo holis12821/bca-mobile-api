@@ -79,7 +79,9 @@ func (h *RegistrationHandler) UploadDocument(w http.ResponseWriter, r *http.Requ
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, registration.MaxDocSize)
-	if err := r.ParseMultipartForm(registration.MaxDocSize); err != nil {
+	// maxMemory, not the upload ceiling: see multipartMemory. MaxBytesReader
+	// above is what actually caps the upload.
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
@@ -110,9 +112,16 @@ func (h *RegistrationHandler) UploadDocument(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Reset file reader
+	// Reset file reader.
+	//
+	// Seek yang gagal berarti isi file tidak bisa dibaca ulang dari awal, jadi
+	// yang tersimpan nanti akan terpotong. Ditolak, bukan diabaikan: dokumen
+	// KTP setengah tersimpan lebih buruk daripada unggahan yang gagal terang.
 	if seeker, ok := file.(io.Seeker); ok {
-		seeker.Seek(0, io.SeekStart)
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
 	}
 
 	// Save file

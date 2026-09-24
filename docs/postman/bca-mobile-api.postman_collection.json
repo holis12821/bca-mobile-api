@@ -27,6 +27,11 @@
     {
       "key": "pin",
       "value": "123456"
+    },
+    {
+      "key": "internal_base_url",
+      "value": "http://localhost:8080/internal/v1",
+      "type": "string"
     }
   ],
   "item": [
@@ -328,7 +333,7 @@
                 "verify"
               ]
             },
-            "description": "Purpose yang sah: `TRANSFER`, `EWALLET_TOPUP`, `QRIS_PAYMENT`, `CHANGE_LIMIT`, `CHANGE_PIN`.\n\nToken terikat ke user + purpose, sekali pakai, umur 120 detik. Token `EWALLET_TOPUP` ditolak oleh `/transfer/execute`."
+            "description": "purpose menentukan endpoint mana yang menerima token ini: TRANSFER, EWALLET_TOPUP, QRIS_PAYMENT, CHANGE_LIMIT, CHANGE_PIN, CHANGE_PROFILE. Token sekali pakai dan berlaku 120 detik; purpose yang tidak cocok ditolak."
           }
         },
         {
@@ -569,6 +574,58 @@
               ]
             }
           }
+        },
+        {
+          "name": "Biometric Challenge (GET)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/auth/biometric/challenge?device_id={{device_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "biometric",
+                "challenge?device_id={{device_id}}"
+              ]
+            },
+            "description": "Varian GET yang didokumentasikan di spec. Server melayani GET dan POST untuk path ini, jadi klien bebas memilih."
+          }
+        },
+        {
+          "name": "Change Access Code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"old_pin_encrypted\": \"{{pin_encrypted}}\",\n  \"new_pin_encrypted\": \"{{new_pin_encrypted}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/auth/access-code/change",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "access-code",
+                "change"
+              ]
+            },
+            "description": "Mengubah KODE AKSES (kredensial login). Berbeda dari /auth/pin/change yang mengubah PIN transaksi. Keduanya mencabut semua sesi lain, jadi access token yang sedang dipakai Postman ikut mati — login ulang setelahnya."
+          }
         }
       ]
     },
@@ -673,7 +730,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"email\": \"nurholis.baru@example.com\",\n  \"otp_code\": \"123456\"\n}"
+              "raw": "{\n  \"email\": \"nurholis.baru@example.com\",\n  \"otp_code\": \"{{profile_otp}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/account/profile",
@@ -684,7 +741,8 @@
                 "account",
                 "profile"
               ]
-            }
+            },
+            "description": "Jalankan \"Request Profile OTP\" lebih dulu — di APP_ENV=development kodenya otomatis tersimpan ke variabel {{profile_otp}}. OTP salah 5 kali menghanguskan kode (OTP_BLOCKED) dan harus minta ulang."
           }
         },
         {
@@ -725,7 +783,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"limits\": {\n    \"TRANSFER_INTERNAL\": {\n      \"daily_limit\": \"75000000\"\n    }\n  }\n}"
+              "raw": "{\n  \"verification_token\": \"{{verification_token}}\",\n  \"limits\": {\n    \"TRANSFER_INTERNAL\": {\n      \"daily_limit\": 75000000\n    }\n  }\n}"
             },
             "url": {
               "raw": "{{base_url}}/account/transaction-limit",
@@ -737,7 +795,97 @@
                 "transaction-limit"
               ]
             },
-            "description": "Ada plafon sisi server: transfer ≤ Rp 100 jt/hari, e-wallet ≤ Rp 20 jt/hari, QRIS ≤ Rp 5 jt/transaksi. Di atas itu → 422."
+            "description": "Wajib verification_token dengan purpose CHANGE_LIMIT — ambil dulu lewat Auth > PIN Verify (ubah purpose menjadi \"CHANGE_LIMIT\"). Tanpa itu jawabannya 401 VERIFICATION_TOKEN_INVALID. Bentuk datar juga diterima, mis. {\"limits\": {\"transfer_internal_daily\": 75000000}}. Response memuat limit baru beserta pemakaian hari ini."
+          }
+        },
+        {
+          "name": "Request Profile OTP",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success' && body.data.otp_debug) {",
+                  "  pm.environment.set('profile_otp', body.data.otp_debug);",
+                  "  console.log('profile_otp tersimpan:', body.data.otp_debug);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/account/profile/otp",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "profile",
+                "otp"
+              ]
+            },
+            "description": "OTP dikirim ke nomor HP terdaftar. Di APP_ENV=development kodenya ikut di response sebagai otp_debug, karena SMS gateway hanya menulis log."
+          }
+        },
+        {
+          "name": "Get Transaction Limit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/account/transaction-limit",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "transaction-limit"
+              ]
+            },
+            "description": "Limit berlaku plus pemakaian hari ini (tanggal WIB)."
+          }
+        },
+        {
+          "name": "Register Push Token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"push_token\": \"fcm-token-contoh\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/account/device/push-token",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "device",
+                "push-token"
+              ]
+            },
+            "description": "Perangkat diambil dari klaim did pada access token, bukan dari body."
           }
         }
       ]
@@ -948,6 +1096,26 @@
                 "recent"
               ]
             }
+          }
+        },
+        {
+          "name": "Receipt (PDF)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transactions/{{transaction_id}}/receipt/pdf",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "transactions",
+                "{{transaction_id}}",
+                "receipt",
+                "pdf"
+              ]
+            },
+            "description": "Mengembalikan application/pdf. Aturan kepemilikan sama dengan versi JSON."
           }
         }
       ]
@@ -1419,6 +1587,60 @@
       "description": "Alur buka rekening: Session → OCR e-KTP → Personal Data → OTP → Biometrik → Video Call → Credentials → Submit.\n\nSemua provider eksternal (OCR, Dukcapil, biometrik, SMS, core banking) memakai implementasi mock di dalam proses — tidak ada panggilan keluar.\n\n**WebSocket signaling** (`/v1/onboarding/video-call/signal`) tidak bisa disimpan dalam file collection. Buat manual: New → WebSocket Request → `ws://localhost:8080/v1/onboarding/video-call/signal?token=<signaling_token>&role=nasabah`. Lewat ngrok, skemanya `wss://`.",
       "item": [
         {
+          "name": "0. Get Card Catalog",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (pm.response.code === 200 && body.status === 'success') {",
+                  "  pm.environment.set('card_catalog_version', body.data.catalog_version);",
+                  "  pm.environment.set('card_type', body.data.default_card_type);",
+                  "  console.log('katalog', body.data.catalog_version, '| default:', body.data.default_card_type);",
+                  "} else {",
+                  "  console.error(body.error && body.error.code);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Device-Id",
+                "value": "device-postman-001"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/onboarding/products/TAHAPAN_BCA/cards",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "products",
+                "TAHAPAN_BCA",
+                "cards"
+              ],
+              "query": [
+                {
+                  "key": "region_code",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Kode wilayah; kosong = katalog nasional. Ketersediaan kartu bisa berbeda per wilayah."
+                }
+              ]
+            },
+            "description": "Katalog kartu Paspor per produk. Publik: tanpa Authorization dan tanpa session_id, tapi `X-Device-Id` wajib — itu satu-satunya identitas untuk membatasi laju (60/jam per device).\n\nRespons ber-`ETag` dan `Cache-Control`; kirim `If-None-Match` untuk mendapat `304`.\n\nSisipan pilih kartu mati (`FEATURE_CARD_SELECTION=false`) → `404 CARD_CATALOG_EMPTY`.\n\nKontrak: docs/08-PILIH-KARTU-API-SPEC.md §4."
+          }
+        },
+        {
           "name": "1. Create Session",
           "event": [
             {
@@ -1450,7 +1672,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"product_type\": \"TAHAPAN_BCA\",\n  \"device_id\": \"device-postman-001\",\n  \"accepted_tnc_version\": \"v1.0\"\n}"
+              "raw": "{\n  \"product_type\": \"TAHAPAN_BCA\",\n  \"device_id\": \"device-postman-001\",\n  \"accepted_tnc_version\": \"v1.0\",\n  \"card_type\": \"{{card_type}}\",\n  \"card_catalog_version\": \"{{card_catalog_version}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/onboarding/sessions",
@@ -1462,7 +1684,55 @@
                 "sessions"
               ]
             },
-            "description": "`product_type` yang sah: `TAHAPAN_BCA`, `TAHAPAN_XPRESI`, `TABUNGANKU`. Nilai lain → `ONBOARDING_PRODUCT_UNAVAILABLE`.\n\nSesi berlaku 24 jam."
+            "description": "`product_type` yang sah: `TAHAPAN_BCA`, `TAHAPAN_XPRESI`, `TABUNGANKU`. Nilai lain → `ONBOARDING_PRODUCT_UNAVAILABLE`.\n\nSesi berlaku 24 jam.\n\n`card_type` dan `card_catalog_version` opsional, dan hanya berarti bila `FEATURE_CARD_SELECTION` menyala:\n\n- sisipan mati → `current_step: OCR`, tanpa `card`\n- `card_type` terisi & tersedia → `current_step: OCR`, respons memuat `card`\n- `card_type` kosong → `current_step: CARD_SELECTION`, lanjutkan ke request 1b\n- `card_type` tidak dikenal → `422 CARD_TYPE_INVALID`; tidak tersedia → `409 CARD_TYPE_UNAVAILABLE`\n\nJalankan request 0 lebih dulu supaya `{{card_type}}` dan `{{card_catalog_version}}` terisi. Versi katalog yang tertinggal → `meta.catalog_outdated: true`."
+          }
+        },
+        {
+          "name": "1b. Set / Change Card",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  console.log('kartu:', body.data.card.card_type, '| step:', body.data.current_step);",
+                  "} else {",
+                  "  console.error(body.error && body.error.code);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"card_type\": \"{{card_type}}\",\n  \"card_catalog_version\": \"{{card_catalog_version}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/sessions/{{session_id}}/card",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "sessions",
+                "{{session_id}}",
+                "card"
+              ]
+            },
+            "description": "Pilih atau ganti kartu pada sesi berjalan. Dipakai saat melanjutkan draf yang berhenti di `CARD_SELECTION`, atau mengganti kartu dari layar Ringkasan.\n\n`current_step` yang dibalas adalah langkah sesi yang SEBENARNYA — sesi di `REVIEW` tetap `REVIEW`. Client menavigasi mengikuti nilai itu.\n\nBoleh selama `steps_completed.submitted == false`; setelah submit → `409 CARD_LOCKED`. Batas laju 10 per sesi per jam.\n\nKontrak: docs/08-PILIH-KARTU-API-SPEC.md §8."
           }
         },
         {
@@ -1534,6 +1804,24 @@
                 {
                   "key": "resolution",
                   "value": "1920x1080",
+                  "type": "text"
+                },
+                {
+                  "key": "sharpness_score",
+                  "value": "92",
+                  "description": "Skor ketajaman 0-100 dari capture SDK. < 60 ditolak sebagai buram (opsional).",
+                  "type": "text"
+                },
+                {
+                  "key": "glare_score",
+                  "value": "5",
+                  "description": "Skor pantulan 0-100. >= 50 ditolak sebagai glare (opsional).",
+                  "type": "text"
+                },
+                {
+                  "key": "corners_detected",
+                  "value": "4",
+                  "description": "Jumlah sudut KTP terdeteksi (0-4). < 4 ditolak (opsional).",
                   "type": "text"
                 }
               ]
@@ -1613,6 +1901,11 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}",
+                "description": "Opsional. Bila dikirim harus cocok dengan device pembuat session."
               }
             ],
             "body": {
@@ -1628,7 +1921,8 @@
                 "onboarding",
                 "verify-otp"
               ]
-            }
+            },
+            "description": "otp_code wajib tepat 6 digit angka; bentuk lain dijawab VALIDATION_ERROR (400) dan tidak memotong jatah percobaan.\n\nX-Device-ID opsional: bila dikirim harus cocok dengan device pembuat session, kalau tidak dijawab ONBOARDING_NOT_FOUND (404).\n\n5 kegagalan memblokir session 30 menit -> OTP_BLOCKED (429) dengan details.retry_after_seconds. Setelah 3 kegagalan server menerbitkan OTP baru secara otomatis dan kode lama dijawab OTP_EXPIRED (422).\n\nDi APP_ENV=development, ambil kodenya dari data.otp_debug pada response personal-data atau resend-otp."
           }
         },
         {
@@ -1642,6 +1936,11 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}",
+                "description": "Opsional. Bila dikirim harus cocok dengan device pembuat session."
               }
             ],
             "body": {
@@ -1657,7 +1956,8 @@
                 "onboarding",
                 "resend-otp"
               ]
-            }
+            },
+            "description": "Kuota 3 kirim ulang per jam per session. Habis -> RATE_LIMIT_EXCEEDED (429) dengan details.retry_after_seconds. Regenerasi otomatis setelah 3 kegagalan verifikasi tidak memotong kuota ini, dan kirim ulang tidak mereset penghitung kegagalan.\n\nSession yang sedang terblokir dijawab OTP_BLOCKED (429) - kirim ulang bukan jalan memutar blokir. OTP baru membatalkan yang lama seketika.\n\nX-Device-ID opsional, aturan sama seperti verify-otp."
           }
         },
         {
@@ -1931,6 +2231,43 @@
           }
         },
         {
+          "name": "Agent Signaling Token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"queue_id\": \"{{queue_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{base_url}}/onboarding/video-call/agent-token",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "video-call",
+                "agent-token"
+              ]
+            },
+            "description": "Dipanggil CS backend saat agent mengangkat antrean. Mengembalikan signaling_url dengan role agent yang tertanam di token — WebSocket tidak lagi menerima role dari query string."
+          }
+        },
+        {
           "name": "Audit Trail",
           "request": {
             "auth": {
@@ -1980,6 +2317,172 @@
                 "monitoring"
               ]
             }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Onboarding — Admin Katalog Kartu",
+      "description": "Endpoint admin katalog kartu Paspor (docs/08-PILIH-KARTU-API-SPEC.md §3).\n\nDi luar `/v1` karena bukan jalur nasabah — pakai `{{internal_base_url}}`. Dijaga `X-Internal-API-Key`; tanpa `INTERNAL_API_KEY` di environment, semuanya menjawab 403.\n\n`X-Admin-Actor` hanya DICATAT ke jejak audit, tidak diverifikasi: model otorisasi di atas API key belum diputuskan (§17 butir 7).\n\nSetiap penulisan menaikkan `catalog_version` tepat sekali dan menulis nilai lama + baru ke `card_catalog_audit_log`. Karena kunci cache memuat versi, perubahannya langsung terlihat di katalog publik tanpa ada key yang perlu dihapus.",
+      "item": [
+        {
+          "name": "1. List Katalog (admin)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  console.log('kartu:', body.data.cards.map(c => c.card_type + (c.is_active ? '' : ' (nonaktif)')).join(', '));",
+                  "} else {",
+                  "  console.error(body.error && body.error.code);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "X-Admin-Actor",
+                "value": "admin@bca.test"
+              }
+            ],
+            "url": {
+              "raw": "{{internal_base_url}}/cards",
+              "host": [
+                "{{internal_base_url}}"
+              ],
+              "path": [
+                "cards"
+              ]
+            },
+            "description": "Seluruh kartu, TERMASUK yang `is_active: false` — kartu yang ditarik harus tetap terlihat admin, kalau tidak ia tidak bisa dihidupkan kembali.\n\nSetiap kartu membawa `placements`: penempatannya per produk dan wilayah, apa adanya, tanpa aturan \"override wilayah menang\" yang dipakai katalog nasabah."
+          }
+        },
+        {
+          "name": "2. Update Kartu (fee, limit, delivery, is_active)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  pm.environment.set('card_catalog_version', body.data.catalog_version);",
+                  "  console.log('versi baru:', body.data.catalog_version);",
+                  "} else {",
+                  "  console.error(body.error && body.error.code, body.error && body.error.details);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "X-Admin-Actor",
+                "value": "admin@bca.test"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Gold Mastercard\",\n  \"tier_key\": \"DEBIT\",\n  \"style\": \"GOLD\",\n  \"fees\": {\n    \"monthly_admin\": 19000,\n    \"card_issuance\": 0,\n    \"card_replacement\": 22222\n  },\n  \"limits\": {\n    \"cash_withdrawal\": 2222222,\n    \"transfer_bca\": 22222222,\n    \"transfer_interbank\": 2222222,\n    \"debit_purchase\": 22222222\n  },\n  \"delivery\": {\n    \"physical_card_available\": true,\n    \"estimated_days_min\": 3,\n    \"estimated_days_max\": 7,\n    \"branch_pickup_available\": true\n  },\n  \"eligibility\": {\n    \"min_age\": 17,\n    \"min_initial_deposit\": 500000\n  },\n  \"is_active\": true\n}"
+            },
+            "url": {
+              "raw": "{{internal_base_url}}/cards/PASPOR_GOLD",
+              "host": [
+                "{{internal_base_url}}"
+              ],
+              "path": [
+                "cards",
+                "PASPOR_GOLD"
+              ]
+            },
+            "description": "Semantik PUT, bukan PATCH: seluruh field yang boleh diubah WAJIB hadir. Field yang tidak dikenal ditolak 400 — `is_ative` yang terabaikan akan menulis `is_active: false` dan menonaktifkan kartu tanpa ada yang meminta.\n\nRespons memuat `catalog_version` baru beserta `old_value` dan `new_value`.\n\n**Menonaktifkan kartu yang sedang menjadi default ditolak 422** kecuali `new_default_card_type` disertakan di badan yang sama. Coba: set `is_active` ke `false` pada `PASPOR_BLUE` (default TAHAPAN_BCA).\n\nNilai di luar daftar yang dikenal client (`style`, `tier_key`) ditolak 422 dengan `details.allowed_values`."
+          }
+        },
+        {
+          "name": "3. Update Penempatan Kartu pada Produk",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.status === 'success') {",
+                  "  console.log('versi baru:', body.data.catalog_version);",
+                  "} else {",
+                  "  console.error(body.error && body.error.code, body.error && body.error.details);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "X-Admin-Actor",
+                "value": "admin@bca.test"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"display_order\": 3,\n  \"is_default\": false,\n  \"is_popular\": true,\n  \"badge_key\": \"MAX_LIMIT\",\n  \"availability_status\": \"OUT_OF_STOCK\",\n  \"availability_reason_key\": \"STOCK_EMPTY_IN_REGION\",\n  \"region_code\": null\n}"
+            },
+            "url": {
+              "raw": "{{internal_base_url}}/products/TAHAPAN_BCA/cards/PASPOR_PLATINUM",
+              "host": [
+                "{{internal_base_url}}"
+              ],
+              "path": [
+                "products",
+                "TAHAPAN_BCA",
+                "cards",
+                "PASPOR_PLATINUM"
+              ]
+            },
+            "description": "Urutan tampil, default, badge, dan stok per wilayah.\n\n`region_code: null` berarti nasional; mengisinya membuat baris override untuk wilayah itu, yang menang atas baris nasional di katalog nasabah.\n\nStatus selain `AVAILABLE` WAJIB menyebut `availability_reason_key` — kartu yang mati tanpa alasan hanya membuat nasabah menelepon call center. Kartu yang tidak `AVAILABLE` juga tidak bisa dijadikan default.\n\nKartu habis stok TETAP tampil di katalog nasabah, hanya tidak bisa dipilih."
           }
         }
       ]

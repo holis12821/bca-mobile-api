@@ -3,6 +3,7 @@ package websocket
 import (
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -26,6 +27,7 @@ type Client struct {
 	QueueID   string
 	Role      Role
 	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewClient creates a new WebSocket client.
@@ -53,14 +55,14 @@ func (c *Client) Send(data []byte) {
 	}
 }
 
-// Close signals the client to shut down.
+// Close signals the client to shut down. Safe to call more than once and from
+// more than one goroutine: the hub closes a replaced connection while the old
+// read pump may be tearing the same client down, and the check-then-close it
+// used to do could race into a double close of the channel.
 func (c *Client) Close() {
-	select {
-	case <-c.done:
-		// already closed
-	default:
+	c.closeOnce.Do(func() {
 		close(c.done)
-	}
+	})
 }
 
 // Run starts the read and write pumps. Blocks until the connection closes.
@@ -77,10 +79,18 @@ func (c *Client) readPump() {
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
-	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+
+	// Deadline yang gagal dipasang berarti koneksi ini tidak punya batas baca:
+	// peer yang diam akan menahan goroutine ini selamanya. Ditutup, bukan
+	// diteruskan tanpa batas.
+	if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		slog.Warn("pasang read deadline gagal; koneksi signaling ditutup", "error", err)
+		return
+	}
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
+		// Dikembalikan ke gorilla/websocket: error di sini menghentikan
+		// readPump lewat ReadMessage, yang memang perilaku yang diinginkan.
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
 	for {
@@ -120,9 +130,16 @@ func (c *Client) writePump() {
 	for {
 		select {
 		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			// Gagal memasang deadline tulis berarti tulisan berikutnya bisa
+			// menggantung tanpa batas. Koneksinya dilepas.
+			if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				slog.Warn("pasang write deadline gagal", "error", err)
+				return
+			}
 			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				// Kegagalan close frame diabaikan dengan sengaja: kita memang
+				// sedang menutup koneksi, dan tidak ada langkah lanjutan.
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
@@ -130,13 +147,16 @@ func (c *Client) writePump() {
 			}
 
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				slog.Warn("pasang write deadline ping gagal", "error", err)
+				return
+			}
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 
 		case <-c.done:
-			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+			_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 			return
 		}
 	}
