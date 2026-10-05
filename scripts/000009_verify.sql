@@ -1,7 +1,82 @@
 -- scripts/000009_verify.sql — behavioural checks for migration 000009.
 -- Every SELECT below must print PASS. Run with -v ON_ERROR_STOP=1.
+--
+-- The script is rerunnable. It used not to be: the fixtures below carry fixed
+-- UUIDs and nothing removed them, so a second run died on
+--
+--     ERROR: duplicate key value violates unique constraint "users_pkey"
+--
+-- and `make verify-009` was dead on every database it had ever succeeded on
+-- once. The leftovers also moved two INTERNAL account balances (see L1), which
+-- is the kind of residue `make ledger-check` is supposed to catch.
+--
+-- verify_009_cleanup() below owns the whole fixture footprint and runs twice:
+-- once up front, so a database an older version of this script polluted heals
+-- itself, and once at the end. The one row it cannot remove is the audit_logs
+-- row from X1 — audit_logs rejects DELETE by trigger, which is the property X1
+-- exists to prove. One append-only row per run is the intended cost.
+--
+-- The fixture accounts also moved off 1234567890 / 0987654321. Those are numbers
+-- scripts/seed/main.go creates, and while the fixtures were being left behind the
+-- seeder's ON CONFLICT (account_number) adopted one of them — the row kept the
+-- fixture UUID and became a real customer account. Fixture numbers now live in a
+-- 915* range nothing else writes.
+--
+-- Wrapping everything in a single transaction and rolling back would be
+-- shorter, and it does not work: set_updated_at uses NOW(), which is frozen for
+-- the whole transaction, so F1 would compare a timestamp against itself and
+-- report a failure that is an artifact of the harness.
 \set QUIET on
 \pset footer off
+
+CREATE OR REPLACE FUNCTION verify_009_cleanup() RETURNS void AS $fn$
+DECLARE
+    v_users UUID[] := ARRAY['11111111-1111-1111-1111-111111111111',
+                            '22222222-2222-2222-2222-222222222222']::UUID[];
+    -- Both the current fixture accounts and the pair older versions of this
+    -- script used, so a database polluted by one of those runs heals too.
+    v_accts UUID[] := ARRAY['ffff0000-0000-4000-8000-000000000001',
+                            'ffff0000-0000-4000-8000-000000000002',
+                            'aaaaaaaa-0000-0000-0000-000000000001',
+                            'bbbbbbbb-0000-0000-0000-000000000002']::UUID[];
+    v_kept  INT;
+BEGIN
+    -- Rows only — this function never touches a balance. Reversing a posting is
+    -- the job of the block that made it (L8), because only that block knows the
+    -- posting is still in the balance it is about to undo. Up here the residue
+    -- belongs to an EARLIER run, and that balance may since have been changed by
+    -- anything at all: a re-seed, a tester, a real transfer. Corrective
+    -- arithmetic against a number like that does not restore money, it invents
+    -- it.
+    DELETE FROM account_mutations
+     WHERE transaction_id IN (SELECT id FROM transactions WHERE user_id = ANY(v_users));
+
+    DELETE FROM transactions       WHERE user_id = ANY(v_users);
+    DELETE FROM transaction_limits WHERE user_id = ANY(v_users);
+    DELETE FROM devices            WHERE user_id = ANY(v_users);
+
+    -- An account is removed only while a fixture user still owns it.
+    --
+    -- This guard is not hypothetical. An older version of this script left its
+    -- fixtures behind, and because the fixture account reused a seeded account
+    -- NUMBER, the seeder's ON CONFLICT (account_number) adopted the row: it kept
+    -- the fixture UUID but became a real customer's account, thirty mutations
+    -- and all. Deleting by id alone would have taken that with it. The fixtures
+    -- now use numbers no seeder claims, so adoption cannot recur — but the
+    -- databases it already happened to still exist.
+    SELECT COUNT(*) INTO v_kept
+      FROM accounts
+     WHERE id = ANY(v_accts)
+       AND (user_id IS NULL OR NOT (user_id = ANY(v_users)));
+    IF v_kept > 0 THEN
+        RAISE NOTICE 'NOTE  % account(s) sit on a verify-009 fixture UUID but belong to someone else; left untouched', v_kept;
+    END IF;
+
+    DELETE FROM accounts WHERE id = ANY(v_accts) AND user_id = ANY(v_users);
+    DELETE FROM users    WHERE id = ANY(v_users);
+END $fn$ LANGUAGE plpgsql;
+
+SELECT verify_009_cleanup();
 
 -- ---------- fixtures ----------
 INSERT INTO users (id, full_name, display_name, phone_encrypted, phone_hash, pin_hash, pin_salt)
@@ -9,8 +84,8 @@ VALUES ('11111111-1111-1111-1111-111111111111','NURHOLIS MAJID','NURHOLIS','\x00
        ('22222222-2222-2222-2222-222222222222','JOHN DOE','JOHN','\x00','hashB','h','s');
 
 INSERT INTO accounts (id, user_id, account_number, account_type, account_label, balance, is_primary)
-VALUES ('aaaaaaaa-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','1234567890','TAHAPAN','Tahapan BCA',15750000,TRUE),
-       ('bbbbbbbb-0000-0000-0000-000000000002','22222222-2222-2222-2222-222222222222','0987654321','TAHAPAN','Tahapan BCA', 5000000,TRUE);
+VALUES ('ffff0000-0000-4000-8000-000000000001','11111111-1111-1111-1111-111111111111','9150000001','TAHAPAN','Tahapan BCA',15750000,TRUE),
+       ('ffff0000-0000-4000-8000-000000000002','22222222-2222-2222-2222-222222222222','9150000002','TAHAPAN','Tahapan BCA', 5000000,TRUE);
 
 -- ---------- G. default limits seeded by trigger ----------
 SELECT CASE WHEN COUNT(*) = 5 THEN 'PASS' ELSE 'FAIL' END AS "G1 trigger seeds 5 limit rows"
@@ -82,10 +157,10 @@ WHERE sid IS NOT NULL;
 
 -- ---------- C. idempotency is per user, not global ----------
 INSERT INTO transactions (idempotency_key,user_id,source_account_id,type,status,amount,total_amount,reference_number)
-VALUES ('idk-same','11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000001','EWALLET_TOPUP','SUCCESS',100000,101000, next_reference_number(DATE '2026-09-02'));
+VALUES ('idk-same','11111111-1111-1111-1111-111111111111','ffff0000-0000-4000-8000-000000000001','EWALLET_TOPUP','SUCCESS',100000,101000, next_reference_number(DATE '2026-09-02'));
 
 INSERT INTO transactions (idempotency_key,user_id,source_account_id,type,status,amount,total_amount,reference_number)
-VALUES ('idk-same','22222222-2222-2222-2222-222222222222','bbbbbbbb-0000-0000-0000-000000000002','EWALLET_TOPUP','SUCCESS',100000,101000, next_reference_number(DATE '2026-09-02'));
+VALUES ('idk-same','22222222-2222-2222-2222-222222222222','ffff0000-0000-4000-8000-000000000002','EWALLET_TOPUP','SUCCESS',100000,101000, next_reference_number(DATE '2026-09-02'));
 
 SELECT CASE WHEN COUNT(*) = 2 THEN 'PASS' ELSE 'FAIL' END AS "C1 same key accepted for two different users"
 FROM transactions WHERE idempotency_key = 'idk-same';
@@ -93,7 +168,7 @@ FROM transactions WHERE idempotency_key = 'idk-same';
 DO $$
 BEGIN
     INSERT INTO transactions (idempotency_key,user_id,source_account_id,type,status,amount,total_amount,reference_number)
-    VALUES ('idk-same','11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000001','EWALLET_TOPUP','SUCCESS',100000,101000, next_reference_number(DATE '2026-09-02'));
+    VALUES ('idk-same','11111111-1111-1111-1111-111111111111','ffff0000-0000-4000-8000-000000000001','EWALLET_TOPUP','SUCCESS',100000,101000, next_reference_number(DATE '2026-09-02'));
     RAISE EXCEPTION 'FAIL: replay for the SAME user created a second transaction';
 EXCEPTION WHEN unique_violation THEN
     RAISE NOTICE 'PASS  C2 replay by the same user is rejected';
@@ -115,7 +190,7 @@ FROM (SELECT right(next_reference_number(DATE '2026-09-02'),8)::BIGINT AS a,
 DO $$
 BEGIN
     INSERT INTO account_mutations (account_id,mutation_type,amount,balance_before,balance_after,description)
-    VALUES ('aaaaaaaa-0000-0000-0000-000000000001','DEBIT',1,0,0,'no date');
+    VALUES ('ffff0000-0000-4000-8000-000000000001','DEBIT',1,0,0,'no date');
     RAISE EXCEPTION 'FAIL: mutation inserted without an explicit transaction_date';
 EXCEPTION WHEN not_null_violation THEN
     RAISE NOTICE 'PASS  H1 transaction_date has no server-clock default';
@@ -134,27 +209,27 @@ BEGIN
 
     -- lock every affected account in id order (deadlock-free ordering)
     PERFORM id FROM accounts
-     WHERE id IN ('aaaaaaaa-0000-0000-0000-000000000001', v_set, v_fee)
+     WHERE id IN ('ffff0000-0000-4000-8000-000000000001', v_set, v_fee)
      ORDER BY id FOR UPDATE;
 
-    SELECT balance INTO v_cust_before FROM accounts WHERE id = 'aaaaaaaa-0000-0000-0000-000000000001';
+    SELECT balance INTO v_cust_before FROM accounts WHERE id = 'ffff0000-0000-4000-8000-000000000001';
     SELECT balance INTO v_set_before  FROM accounts WHERE id = v_set;
     SELECT balance INTO v_fee_before  FROM accounts WHERE id = v_fee;
 
     INSERT INTO transactions (id,idempotency_key,user_id,source_account_id,type,status,
                               amount,admin_fee,total_amount,reference_number,provider_id)
     VALUES (v_txn,'idk-ledger','11111111-1111-1111-1111-111111111111',
-            'aaaaaaaa-0000-0000-0000-000000000001','EWALLET_TOPUP','SUCCESS',
+            'ffff0000-0000-4000-8000-000000000001','EWALLET_TOPUP','SUCCESS',
             v_amount,v_admin,v_amount+v_admin,next_reference_number(DATE '2026-09-02'),'gopay');
 
-    UPDATE accounts SET balance = balance - (v_amount + v_admin) WHERE id = 'aaaaaaaa-0000-0000-0000-000000000001';
+    UPDATE accounts SET balance = balance - (v_amount + v_admin) WHERE id = 'ffff0000-0000-4000-8000-000000000001';
     UPDATE accounts SET balance = balance + v_amount             WHERE id = v_set;
     UPDATE accounts SET balance = balance + v_admin              WHERE id = v_fee;
 
     INSERT INTO account_mutations (account_id,transaction_id,mutation_type,amount,
                                    balance_before,balance_after,description,transaction_date,transaction_time)
     VALUES
-      ('aaaaaaaa-0000-0000-0000-000000000001',v_txn,'DEBIT', v_amount+v_admin,
+      ('ffff0000-0000-4000-8000-000000000001',v_txn,'DEBIT', v_amount+v_admin,
         v_cust_before, v_cust_before-(v_amount+v_admin),'TOP UP GOPAY', DATE '2026-09-02', TIME '10:30:00'),
       (v_set,v_txn,'CREDIT', v_amount, v_set_before, v_set_before+v_amount,
         'SETTLEMENT EWALLET', DATE '2026-09-02', TIME '10:30:00'),
@@ -175,7 +250,7 @@ SELECT CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END AS "L5 no unbalanced t
 FROM v_unbalanced_transactions;
 
 SELECT CASE WHEN balance = 15649000.00 THEN 'PASS' ELSE 'FAIL' END AS "L4 customer debited amount + fee"
-FROM accounts WHERE id = 'aaaaaaaa-0000-0000-0000-000000000001';
+FROM accounts WHERE id = 'ffff0000-0000-4000-8000-000000000001';
 
 -- L6: a deliberately single-sided posting MUST be caught by v_unbalanced_transactions
 --
@@ -188,7 +263,7 @@ FROM accounts WHERE id = 'aaaaaaaa-0000-0000-0000-000000000001';
 DO $$
 DECLARE
     v_txn     UUID := gen_random_uuid();
-    v_account UUID := 'aaaaaaaa-0000-0000-0000-000000000001';
+    v_account UUID := 'ffff0000-0000-4000-8000-000000000001';
     v_before  NUMERIC;
     v_caught  INT;
 BEGIN
@@ -224,6 +299,41 @@ END $$;
 SELECT CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END AS "L7 verify fixture leaves no ledger drift"
 FROM v_unbalanced_transactions;
 
+-- L8: undo L1's posting, now that L2-L7 have all read it.
+--
+-- L1 debits the fixture account and credits two INTERNAL accounts that belong to
+-- migration 000009, not to this script. The fixture account is deleted in the
+-- teardown, but the internal ones have to survive — and a credit left sitting on
+-- a surviving account is exactly what v_ledger_reconciliation reports as drift.
+-- So the posting is reversed here, in the same run that made it: this is the
+-- last moment anything in this file is allowed to assume the posting is still in
+-- the balance.
+DO $$
+DECLARE
+    v_txn UUID;
+BEGIN
+    SELECT id INTO v_txn FROM transactions
+     WHERE idempotency_key = 'idk-ledger'
+       AND user_id = '11111111-1111-1111-1111-111111111111';
+    IF v_txn IS NULL THEN
+        RAISE EXCEPTION 'FAIL: L8 could not find the L1 transaction to reverse';
+    END IF;
+
+    UPDATE accounts a
+       SET balance = a.balance - x.net
+      FROM (SELECT account_id,
+                   SUM(CASE WHEN mutation_type = 'CREDIT' THEN amount ELSE -amount END) AS net
+              FROM account_mutations
+             WHERE transaction_id = v_txn
+             GROUP BY account_id) x
+     WHERE a.id = x.account_id;
+
+    DELETE FROM account_mutations WHERE transaction_id = v_txn;
+    DELETE FROM transactions      WHERE id = v_txn;
+
+    RAISE NOTICE 'PASS  L8 L1 posting reversed, internal accounts restored';
+END $$;
+
 -- ---------- audit immutability still intact ----------
 INSERT INTO audit_logs (action, resource_type) VALUES ('TXN_EWALLET_TOPUP','transaction');
 DO $$
@@ -234,3 +344,24 @@ EXCEPTION WHEN raise_exception THEN
     IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
     RAISE NOTICE 'PASS  X1 audit_logs remain immutable';
 END $$;
+
+-- ---------- teardown ----------
+SELECT verify_009_cleanup();
+
+SELECT CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END AS "Z1 teardown removed every fixture user"
+FROM users WHERE id IN ('11111111-1111-1111-1111-111111111111',
+                        '22222222-2222-2222-2222-222222222222');
+
+SELECT CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END AS "Z2 teardown removed every fixture account"
+FROM accounts WHERE id IN ('ffff0000-0000-4000-8000-000000000001',
+                           'ffff0000-0000-4000-8000-000000000002');
+
+-- The reason the teardown exists at all: both money views must read exactly as
+-- they did before this script ran.
+SELECT CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END AS "Z3 reconciliation view empty after teardown"
+FROM v_ledger_reconciliation;
+
+SELECT CASE WHEN COUNT(*) = 0 THEN 'PASS' ELSE 'FAIL' END AS "Z4 no unbalanced transactions after teardown"
+FROM v_unbalanced_transactions;
+
+DROP FUNCTION verify_009_cleanup();

@@ -112,7 +112,7 @@ func (h *DevHandler) PINPublicKey(w http.ResponseWriter, r *http.Request) {
 
 	response.Success(w, r, http.StatusOK, map[string]any{
 		"algorithm":      "RSA-OAEP-SHA256",
-		"key_id":         "pin-key-v1",
+		"key_id":         h.pinKeys.ActiveKeyID(),
 		"public_key_pem": string(pemBytes),
 		"payload_shape":  `{"pin":"123456","nonce":"<uuid-v4>","ts":<unix-seconds>}`,
 		"encoding":       "base64(RSA-OAEP-SHA256(json))",

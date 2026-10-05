@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"testing"
@@ -40,6 +41,18 @@ func (m *mockBiometricKeyRepo) FindActiveByKeyID(_ context.Context, keyID string
 func (m *mockBiometricKeyRepo) Create(_ context.Context, key *auth.BiometricKey) error {
 	m.keys[key.KeyID] = key
 	return nil
+}
+
+func (m *mockBiometricKeyRepo) RevokeByUserDevice(_ context.Context, userID, deviceID uuid.UUID) (int, error) {
+	revoked := 0
+	for keyID, k := range m.keys {
+		if k.UserID == userID && k.DeviceID == deviceID && k.IsActive {
+			k.IsActive = false
+			m.keys[keyID] = k
+			revoked++
+		}
+	}
+	return revoked, nil
 }
 
 type mockBiometricChallengeCache struct {
@@ -409,13 +422,16 @@ func TestRegisterBiometricKey(t *testing.T) {
 	_, pubPEM := generateTestKeyPair(t)
 	keyID := "register-key-001"
 
-	err := f.svc.RegisterBiometricKey(ctx, f.userID, f.deviceIDStr, auth.BiometricRegisterRequest{
+	resp, err := f.svc.RegisterBiometricKey(ctx, f.userID, f.deviceIDStr, auth.BiometricRegisterRequest{
 		KeyID:         keyID,
 		PublicKey:     pubPEM,
 		BiometricType: "FINGERPRINT",
 	})
 	if err != nil {
 		t.Fatalf("register failed: %v", err)
+	}
+	if resp == nil || resp.BiometricID == "" || resp.RegisteredAt.IsZero() {
+		t.Fatalf("register response must carry biometric_id and registered_at, got %+v", resp)
 	}
 
 	// Key should be stored
@@ -440,7 +456,7 @@ func TestRegisterBiometricKey_InvalidType(t *testing.T) {
 
 	_, pubPEM := generateTestKeyPair(t)
 
-	err := f.svc.RegisterBiometricKey(ctx, f.userID, f.deviceIDStr, auth.BiometricRegisterRequest{
+	_, err := f.svc.RegisterBiometricKey(ctx, f.userID, f.deviceIDStr, auth.BiometricRegisterRequest{
 		KeyID:         "bad-type-key",
 		PublicKey:     pubPEM,
 		BiometricType: "RETINA_SCAN",
@@ -451,6 +467,147 @@ func TestRegisterBiometricKey_InvalidType(t *testing.T) {
 	var appErr apperr.Error
 	if !errors.As(err, &appErr) || appErr.Code != "VALIDATION_ERROR" {
 		t.Fatalf("expected VALIDATION_ERROR, got: %v", err)
+	}
+}
+
+// TestBiometricLogin_PublishedTestVector pins the interop vector published in
+// docs/01-API-SPECIFICATION.md §2. The Android side verifies its own
+// implementation against the same numbers without waiting for a server, which is
+// what butir 2 of docs/10-HANDOVER-BLOCKER-BACKEND.md asks for.
+//
+// If this test fails, the published vector and the server no longer agree —
+// update both, together, or the client has been given a wrong answer.
+func TestBiometricLogin_PublishedTestVector(t *testing.T) {
+	const (
+		vectorPublicKeyB64 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEo6b/4hWQuDCQW3mrgm1MT3+R4IN/" +
+			"KBMlOIfCncd+r0AELAmBaWsMxOp0AyRkxsK+8LWUeLjiCHmiO0IQiWJa3Q=="
+		vectorChallengeB64 = "dF8Omhv+NpbgVq+JhUxtMqU408OSzYke75J1RTwH5d0="
+		vectorSignatureB64 = "MEUCIQDDEuePW+/ce5/R/9MySwoCKr4MhcNv3B+MqbscMMkYaQIgGZUUEYi2qyw/" +
+			"UJKTGFepdsLBlijYeSxpEwOINsK5bTc="
+	)
+
+	f := setupBiometricService(t)
+	ctx := context.Background()
+
+	// The vector fixes the challenge, so it is planted directly rather than
+	// drawn at random by CreateChallenge.
+	challenge, err := base64.StdEncoding.DecodeString(vectorChallengeB64)
+	if err != nil {
+		t.Fatalf("decode vector challenge: %v", err)
+	}
+	challengeID := "vector-challenge"
+	f.challengeCache.store[challengeID] = &auth.ChallengeData{
+		Challenge: challenge,
+		DeviceID:  f.deviceIDStr,
+	}
+
+	keyID := "vector-key"
+	f.bioKeyRepo.keys[keyID] = &auth.BiometricKey{
+		ID:            uuid.New(),
+		UserID:        f.userID,
+		DeviceID:      f.deviceID,
+		KeyID:         keyID,
+		PublicKey:     vectorPublicKeyB64, // base64 SPKI, no PEM header
+		BiometricType: "FINGERPRINT",
+		IsActive:      true,
+	}
+
+	// signed_challenge, the field name the spec documents — not `signature`.
+	resp, err := f.svc.LoginByBiometric(ctx, auth.BiometricLoginRequest{
+		DeviceID:    f.deviceIDStr,
+		KeyID:       keyID,
+		ChallengeID: challengeID,
+		SignedChall: vectorSignatureB64,
+	}, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("published vector must verify: %v", err)
+	}
+	if resp.AccessToken == "" {
+		t.Fatal("expected a session for the published vector")
+	}
+}
+
+// A re-enrolled fingerprint invalidates the Keystore key, so the app registers a
+// new one. The old key must stop working in the same step, or a key that can
+// never sign again stays a valid credential on that device.
+func TestRegisterBiometricKey_ReplacesPreviousKeyOnSameDevice(t *testing.T) {
+	f := setupBiometricService(t)
+	ctx := context.Background()
+
+	_, firstPub := generateTestKeyPair(t)
+	if _, err := f.svc.RegisterBiometricKey(ctx, f.userID, f.deviceIDStr, auth.BiometricRegisterRequest{
+		KeyID:         "old-key",
+		PublicKey:     firstPub,
+		BiometricType: "FINGERPRINT",
+	}); err != nil {
+		t.Fatalf("first register failed: %v", err)
+	}
+
+	_, secondPub := generateTestKeyPair(t)
+	resp, err := f.svc.RegisterBiometricKey(ctx, f.userID, f.deviceIDStr, auth.BiometricRegisterRequest{
+		KeyID:         "new-key",
+		PublicKey:     secondPub,
+		BiometricType: "FINGERPRINT",
+	})
+	if err != nil {
+		t.Fatalf("re-register failed: %v", err)
+	}
+	if resp.ReplacedKeys != 1 {
+		t.Fatalf("expected 1 replaced key, got %d", resp.ReplacedKeys)
+	}
+	if old := f.bioKeyRepo.keys["old-key"]; old == nil || old.IsActive {
+		t.Fatal("the previous key must be revoked by re-registration")
+	}
+	if fresh := f.bioKeyRepo.keys["new-key"]; fresh == nil || !fresh.IsActive {
+		t.Fatal("the new key must be active")
+	}
+}
+
+// An RSA key parses fine and then fails every login, where it reads as a broken
+// fingerprint. It is rejected at registration instead.
+func TestRegisterBiometricKey_RejectsNonP256Key(t *testing.T) {
+	f := setupBiometricService(t)
+	ctx := context.Background()
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal rsa public key: %v", err)
+	}
+
+	_, err = f.svc.RegisterBiometricKey(ctx, f.userID, f.deviceIDStr, auth.BiometricRegisterRequest{
+		KeyID:         "rsa-key",
+		PublicKey:     base64.StdEncoding.EncodeToString(der),
+		BiometricType: "FINGERPRINT",
+	})
+	var appErr apperr.Error
+	if !errors.As(err, &appErr) || appErr.Code != apperr.BiometricKeyUnsupported.Code {
+		t.Fatalf("expected AUTH_BIOMETRIC_KEY_UNSUPPORTED, got: %v", err)
+	}
+}
+
+// The challenge response carries the contract the client has to implement, so a
+// change there is a change to a published contract.
+func TestCreateChallenge_PublishesAlgorithm(t *testing.T) {
+	f := setupBiometricService(t)
+
+	resp, err := f.svc.CreateChallenge(context.Background(), auth.BiometricChallengeRequest{
+		DeviceID: f.deviceIDStr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Algorithm != auth.BiometricSignatureAlgorithm {
+		t.Fatalf("expected algorithm %s, got %s", auth.BiometricSignatureAlgorithm, resp.Algorithm)
+	}
+	if resp.ExpiresAt.IsZero() || resp.ExpiresIn != 60 {
+		t.Fatalf("expected expires_in 60 and a non-zero expires_at, got %d / %v", resp.ExpiresIn, resp.ExpiresAt)
+	}
+	if raw, err := base64.StdEncoding.DecodeString(resp.Challenge); err != nil || len(raw) != 32 {
+		t.Fatalf("challenge must be base64 of 32 bytes, got %d bytes (err=%v)", len(raw), err)
 	}
 }
 

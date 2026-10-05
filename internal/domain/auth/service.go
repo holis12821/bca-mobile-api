@@ -97,6 +97,13 @@ func NewService(cfg ServiceConfig) *Service {
 
 // LoginByPIN implements the 7-step login flow from §3 skill.
 func (s *Service) LoginByPIN(ctx context.Context, req LoginRequest, clientIP string) (*LoginResponse, error) {
+	// Step 0: the key the client encrypted with has to be the key this server
+	// decrypts with. Checked before the rate limit so a stale key does not burn
+	// a nasabah's login budget.
+	if err := s.ValidatePINKeyID(req.EncryptionKeyID); err != nil {
+		return nil, err
+	}
+
 	// Step 1: Rate limit by device + by IP
 	if err := s.checkRateLimits(ctx, req.DeviceID, clientIP); err != nil {
 		return nil, err
@@ -461,6 +468,9 @@ func (s *Service) VerifyPIN(ctx context.Context, userID uuid.UUID, deviceID, pin
 // PIN, and a captured pin_encrypted blob could be replayed within the 60s
 // timestamp window.
 func (s *Service) ChangePIN(ctx context.Context, userID uuid.UUID, sessionID *uuid.UUID, req ChangePINRequest, clientIP string) error {
+	if err := s.ValidatePINKeyID(req.EncryptionKeyID); err != nil {
+		return err
+	}
 	if s.rateLimiter != nil {
 		result, err := s.rateLimiter.CheckPINVerify(ctx, userID.String())
 		if err != nil {
@@ -606,6 +616,9 @@ func hashToken(token string) string {
 // m-BCA, and before access_code_hash was persisted there was no way to change
 // the second one at all.
 func (s *Service) ChangeAccessCode(ctx context.Context, userID uuid.UUID, sessionID *uuid.UUID, req ChangePINRequest, clientIP string) error {
+	if err := s.ValidatePINKeyID(req.EncryptionKeyID); err != nil {
+		return err
+	}
 	if s.rateLimiter != nil {
 		result, err := s.rateLimiter.CheckPINVerify(ctx, userID.String())
 		if err != nil {
@@ -723,5 +736,54 @@ func (s *Service) ChangeAccessCode(ctx context.Context, userID uuid.UUID, sessio
 		)
 	}
 
+	return nil
+}
+
+// PINEncryptionKey publishes the public half of the PIN transport key.
+//
+// The key also ships inside the APK as assets/pin_public.pem, but a file in
+// assets can only be rotated by shipping a new APK. Serving it here — the same
+// shape onboarding already serves at GET /onboarding/credentials/public-key —
+// is what makes rotation possible without a release, and it is the endpoint
+// butir 1 of docs/10-HANDOVER-BLOCKER-BACKEND.md asks for.
+func (s *Service) PINEncryptionKey() (*PINEncryptionKey, error) {
+	if s.pinKeys == nil || s.pinKeys.PublicKey == nil {
+		// No key means no PIN endpoint works at all. Saying so plainly beats
+		// answering AUTH_INVALID_PIN to every caller.
+		return nil, apperr.ProviderNotConfigured
+	}
+
+	pemBytes, err := s.pinKeys.PublicKeyPEM()
+	if err != nil {
+		return nil, fmt.Errorf("export pin public key: %w", err)
+	}
+
+	return &PINEncryptionKey{
+		Algorithm:    PINEncryptionAlgorithm,
+		KeyID:        s.pinKeys.ActiveKeyID(),
+		PublicKeyPEM: string(pemBytes),
+		PayloadShape: `{"pin":"123456","nonce":"<uuid-v4>","ts":<unix-seconds>}`,
+		Encoding:     "base64(RSA-OAEP-SHA256(json))",
+		MaxSkewSec:   int(crypto.MaxPINTimestampSkew.Seconds()),
+	}, nil
+}
+
+// ValidatePINKeyID rejects a request encrypted under a key this server does not
+// hold. An empty id passes: not every build sends the field yet.
+func (s *Service) ValidatePINKeyID(keyID string) error {
+	if s.pinKeys == nil {
+		return apperr.ProviderNotConfigured
+	}
+	if !s.pinKeys.AcceptsKeyID(keyID) {
+		return apperr.Error{
+			Status:  apperr.PINKeyUnknown.Status,
+			Code:    apperr.PINKeyUnknown.Code,
+			Message: apperr.PINKeyUnknown.Message,
+			Details: map[string]any{
+				"expected_key_id": s.pinKeys.ActiveKeyID(),
+				"received_key_id": keyID,
+			},
+		}
+	}
 	return nil
 }

@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	gorillaWS "github.com/gorilla/websocket"
 
@@ -12,11 +14,27 @@ import (
 	ws "github.com/holis12821/bca-mobile-api/internal/websocket"
 )
 
+// SignalingTokenGuard makes a signaling token usable exactly once.
+// Implemented by redis.SignalingTokenStore.
+type SignalingTokenGuard interface {
+	ConsumeSignalingToken(ctx context.Context, jti string, ttl time.Duration) (bool, error)
+}
+
+// SignalingLifecycle dipanggil saat sisi nasabah sebuah panggilan baru tersambung.
+//
+// Dipenuhi *onboarding.VideoCallService. Antarmuka, bukan tipe konkret, supaya handler ini
+// tidak ikut menarik seluruh lapisan domain hanya untuk satu pemberitahuan posisi antrean.
+type SignalingLifecycle interface {
+	OnNasabahConnected(ctx context.Context, sessionID, queueID string)
+}
+
 // SignalingHandler handles WebSocket connections for video call signaling.
 type SignalingHandler struct {
-	hub      *ws.Hub
-	jwt      *crypto.JWTManager
-	upgrader gorillaWS.Upgrader
+	hub       *ws.Hub
+	jwt       *crypto.JWTManager
+	tokens    SignalingTokenGuard
+	lifecycle SignalingLifecycle
+	upgrader  gorillaWS.Upgrader
 }
 
 // NewSignalingHandler builds the handler. allowedOrigins is the same list the
@@ -24,15 +42,17 @@ type SignalingHandler struct {
 // an Origin check any web page could open a socket against this endpoint with
 // a token it phished (cross-site WebSocket hijacking). Native apps send no
 // Origin header at all and are unaffected.
-func NewSignalingHandler(hub *ws.Hub, jwt *crypto.JWTManager, allowedOrigins []string) *SignalingHandler {
+func NewSignalingHandler(hub *ws.Hub, jwt *crypto.JWTManager, tokens SignalingTokenGuard, lifecycle SignalingLifecycle, allowedOrigins []string) *SignalingHandler {
 	allowed := make(map[string]bool, len(allowedOrigins))
 	for _, o := range allowedOrigins {
 		allowed[strings.ToLower(strings.TrimSpace(o))] = true
 	}
 
 	return &SignalingHandler{
-		hub: hub,
-		jwt: jwt,
+		hub:       hub,
+		jwt:       jwt,
+		tokens:    tokens,
+		lifecycle: lifecycle,
 		upgrader: gorillaWS.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -95,6 +115,34 @@ func (h *SignalingHandler) HandleSignaling(w http.ResponseWriter, r *http.Reques
 
 	role := ws.Role(claims.Role)
 
+	// The token is single-use. It travels in a query string, so a copied URL is
+	// a copied credential until the jti is spent — and the second party to a
+	// video call must not be a bystander holding a screenshot.
+	//
+	// No guard configured means no way to tell a first use from a replay, so the
+	// connection is refused rather than accepted on trust.
+	if h.tokens == nil {
+		slog.Error("ws: signaling requested but no token guard is configured")
+		http.Error(w, "signaling unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	ttl := time.Until(claims.ExpiresAt.Time)
+	fresh, err := h.tokens.ConsumeSignalingToken(r.Context(), claims.ID, ttl)
+	if err != nil {
+		// Failing open here would admit replays whenever Redis hiccups.
+		slog.Error("ws: consume signaling token failed", "error", err)
+		http.Error(w, "signaling unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !fresh {
+		slog.Warn("ws: signaling token replayed",
+			"session_id", sessionID,
+			"queue_id", queueID,
+		)
+		http.Error(w, "token already used", http.StatusUnauthorized)
+		return
+	}
+
 	// Upgrade to WebSocket
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -104,5 +152,15 @@ func (h *SignalingHandler) HandleSignaling(w http.ResponseWriter, r *http.Reques
 
 	client := ws.NewClient(h.hub, conn, sessionID, queueID, role)
 	h.hub.Register(client)
+
+	// Setelah Register, bukan sebelum: pesannya dikirim lewat room yang baru saja dibuat,
+	// dan sebelum itu tidak ada socket yang menerimanya.
+	//
+	// Konteks request tidak dipakai — ia selesai begitu Run() kembali pada beberapa
+	// implementasi server, sementara pemberitahuan ini menyentuh Redis dan Postgres.
+	if h.lifecycle != nil && role == ws.RoleNasabah {
+		h.lifecycle.OnNasabahConnected(context.WithoutCancel(r.Context()), sessionID, queueID)
+	}
+
 	client.Run() // blocks until disconnect
 }

@@ -120,8 +120,18 @@ type BiometricKeyRepository interface {
 	// FindActiveByKeyID finds an active biometric key by its key_id.
 	FindActiveByKeyID(ctx context.Context, keyID string) (*BiometricKey, error)
 
-	// Create inserts a new biometric key row.
+	// Create inserts a new biometric key row, or re-arms an existing row with
+	// the same key_id when it belongs to the same user and device — a phone
+	// that re-enrolls under its old Keystore alias must not be locked out by
+	// the UNIQUE constraint on key_id.
 	Create(ctx context.Context, key *BiometricKey) error
+
+	// RevokeByUserDevice deactivates every active key a user holds on one
+	// device and reports how many rows it touched. Re-enrolling a fingerprint
+	// invalidates the Keystore key (setInvalidatedByBiometricEnrollment), so
+	// the app registers a fresh one; leaving the old row active would keep a
+	// key that can never sign again as a valid login credential.
+	RevokeByUserDevice(ctx context.Context, userID, deviceID uuid.UUID) (int, error)
 }
 
 // BiometricChallengeCache stores and consumes biometric challenges in Redis.

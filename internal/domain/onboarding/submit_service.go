@@ -41,6 +41,12 @@ type SubmitService struct {
 	cards     *CardService
 	issuance  CardIssuanceRepository
 	cardCodes CardCoreBankingCodes
+
+	// accountCards mencatat kartu terbitan ke account_cards, tabel yang dibaca
+	// layar Profil Saya. Opsional seperti dependensi kartu lainnya: tanpa itu
+	// submit tetap berhasil dan kartunya tetap masuk antrean cetak, hanya belum
+	// muncul di GET /account/cards.
+	accountCards AccountCardRegistrar
 }
 
 // CardCoreBankingCodes memetakan card_type ke kode kartu milik core banking.
@@ -63,6 +69,7 @@ type SubmitServiceConfig struct {
 	Cards        *CardService
 	CardIssuance CardIssuanceRepository
 	CardCodes    CardCoreBankingCodes
+	AccountCards AccountCardRegistrar
 }
 
 func NewSubmitService(cfg SubmitServiceConfig) *SubmitService {
@@ -80,6 +87,7 @@ func NewSubmitService(cfg SubmitServiceConfig) *SubmitService {
 		cards:        cfg.Cards,
 		issuance:     cfg.CardIssuance,
 		cardCodes:    cfg.CardCodes,
+		accountCards: cfg.AccountCards,
 	}
 }
 
@@ -177,10 +185,35 @@ func (s *SubmitService) Submit(ctx context.Context, req SubmitRequest, idempoten
 		return nil, apperr.OnboardingIncomplete
 	}
 
-	holderName := s.decryptOrKeep(pd.NamaLengkap)
-	nik := s.decryptOrKeep(pd.NIK)
-	phone := s.decryptOrKeep(pd.NomorHP)
-	email := s.decryptOrKeep(pd.Email)
+	// A failed decrypt must stop the submit, not travel onwards.
+	//
+	// decryptOrKeep used to return the stored value when decryption failed, and
+	// this is the worst place in the codebase for that: these four go straight to
+	// core banking as the account holder's name, NIK, phone and email. A key
+	// rotation or one corrupted row would have opened a real account whose holder
+	// name is a hex string — a permanently wrong record in a banking system, from
+	// an error nobody was told about. Refusing costs the nasabah one retry; the
+	// alternative costs an account that has to be closed by hand.
+	holderName, err := s.decryptPII(pd.NamaLengkap, "nama_lengkap")
+	if err != nil {
+		release()
+		return nil, err
+	}
+	nik, err := s.decryptPII(pd.NIK, "nik")
+	if err != nil {
+		release()
+		return nil, err
+	}
+	phone, err := s.decryptPII(pd.NomorHP, "nomor_hp")
+	if err != nil {
+		release()
+		return nil, err
+	}
+	email, err := s.decryptPII(pd.Email, "email")
+	if err != nil {
+		release()
+		return nil, err
+	}
 
 	// 6. Verify credentials exist
 	cred, err := s.credentials.FindBySessionID(ctx, req.SessionID)
@@ -260,7 +293,8 @@ func (s *SubmitService) Submit(ctx context.Context, req SubmitRequest, idempoten
 	// pernah dikembalikan ke pemanggil: rekening yang sudah ACTIVE tidak boleh
 	// dibatalkan karena pencetakan kartu gagal (§10 butir 4). Yang gagal masuk
 	// antrean retry.
-	card := s.issueCard(ctx, session, cbResult.AccountNumber, holderName)
+	card := s.issueCard(ctx, session, cbResult.AccountNumber, holderName,
+		cardOwner{UserID: mbcaUserID, AccountID: provisioned.AccountID})
 
 	// 10. Build response
 	product := ProductCatalog[session.ProductType]
@@ -308,16 +342,25 @@ func (s *SubmitService) Submit(ctx context.Context, req SubmitRequest, idempoten
 	return resp, nil
 }
 
-// decryptOrKeep decrypts a stored PII field, falling back to the stored value
-// when no key is configured or the value is not ciphertext.
-func (s *SubmitService) decryptOrKeep(value string) string {
+// decryptPII decrypts a stored PII field, or fails.
+//
+// No key configured means the field was never encrypted, so the stored value IS
+// the plaintext — that path stays. What is gone is the silent fallback when a key
+// IS configured and decryption fails: the only thing that can be returned then is
+// ciphertext, and there is no caller in this file for which that is a sensible
+// account-holder detail. The field name travels into the log; the value never
+// does.
+func (s *SubmitService) decryptPII(value, field string) (string, error) {
 	if s.aes == nil {
-		return value
+		return value, nil
 	}
-	if decrypted, err := s.decryptField(value); err == nil {
-		return decrypted
+	decrypted, err := s.decryptField(value)
+	if err != nil {
+		slog.Error("decrypt personal data for submit failed",
+			"field", field, "error", err)
+		return "", apperr.InternalError
 	}
-	return value
+	return decrypted, nil
 }
 
 // validateAllStepsCompleted checks that every required step is done.
@@ -414,7 +457,15 @@ const cardIssuanceRetryDelay = 15 * time.Minute
 // antrean retry dan, bila memungkinkan, kartu berstatus REQUESTED di respons.
 // Rekening nasabah sudah jadi; menggagalkan submit di titik ini akan menukar
 // satu kartu yang terlambat dengan satu rekening yang hilang.
-func (s *SubmitService) issueCard(ctx context.Context, session *Session, accountNumber, holderName string) *SubmitCard {
+// cardOwner adalah pemilik rekening yang baru dibuat, untuk dilekatkan pada
+// kartunya di account_cards. Dipisah sebagai tipe supaya dua UUID yang bentuknya
+// sama tidak bisa tertukar posisinya di daftar argumen.
+type cardOwner struct {
+	UserID    string
+	AccountID string
+}
+
+func (s *SubmitService) issueCard(ctx context.Context, session *Session, accountNumber, holderName string, owner cardOwner) *SubmitCard {
 	if session.CardType == "" || s.issuance == nil {
 		return nil
 	}
@@ -500,11 +551,59 @@ func (s *SubmitService) issueCard(ctx context.Context, session *Session, account
 		slog.Error("simpan hasil cetak kartu gagal", "session_id", session.SessionID, "error", err)
 	}
 
+	s.registerOwnedCard(ctx, session, option.CardType, holderName, owner, *result)
+
 	s.countIssuance(option.CardType, "ok")
 
 	issuance.Status = result.Status
 	issuance.TrackingNumber = result.TrackingNumber
 	return s.submitCard(option, issuance, &result.MaskedNumber)
+}
+
+// registerOwnedCard mencatat kartu terbitan ke account_cards.
+//
+// Kegagalannya TIDAK pernah dikembalikan ke pemanggil, sama seperti kegagalan
+// permintaan cetak: rekening sudah ACTIVE dan tidak boleh dibatalkan karena
+// pencatatan kartu gagal (§10 butir 4). Yang hilang hanya barisnya di layar
+// Profil Saya, dan itu dicatat sebagai error supaya bisa dibereskan menyusul.
+func (s *SubmitService) registerOwnedCard(ctx context.Context, session *Session,
+	cardType, holderName string, owner cardOwner, result CardIssuanceResult) {
+
+	if s.accountCards == nil {
+		return
+	}
+	if owner.UserID == "" || owner.AccountID == "" {
+		slog.Error("kartu terbitan tidak bisa dicatat: pemilik rekening tidak diketahui",
+			"session_id", session.SessionID)
+		return
+	}
+	// Tanpa nomor tersamar tidak ada yang bisa ditampilkan di layar, dan
+	// account_cards mewajibkan kolomnya. Kartunya tetap di antrean cetak.
+	if result.MaskedNumber == "" {
+		slog.Error("kartu terbitan tidak bisa dicatat: core banking tidak mengembalikan masked_number",
+			"session_id", session.SessionID)
+		return
+	}
+	// Masa berlaku juga NOT NULL, dan mengarangnya berarti menuliskan tanggal
+	// yang tidak tercetak di kartu fisiknya.
+	if result.ValidThruMonth == 0 || result.ValidThruYear == 0 {
+		slog.Error("kartu terbitan tidak bisa dicatat: core banking tidak mengembalikan masa berlaku",
+			"session_id", session.SessionID)
+		return
+	}
+
+	if err := s.accountCards.RegisterIssuedCard(ctx, IssuedCard{
+		UserID:         owner.UserID,
+		AccountID:      owner.AccountID,
+		CardType:       cardType,
+		MaskedNumber:   result.MaskedNumber,
+		CardholderName: holderName,
+		ValidThruMonth: result.ValidThruMonth,
+		ValidThruYear:  result.ValidThruYear,
+	}); err != nil {
+		slog.Error("catat kartu milik nasabah gagal; kartu tetap terbit tapi belum muncul di Profil Saya",
+			"session_id", session.SessionID, "card_type", cardType, "error", err)
+	}
 }
 
 // countIssuance mencatat hasil permintaan cetak kartu.

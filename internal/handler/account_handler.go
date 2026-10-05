@@ -45,6 +45,12 @@ func (h *AccountHandler) Profile(w http.ResponseWriter, r *http.Request) {
 		"email":        account.MaskEmail(profile.Email),
 		"accounts":     toAccountBalanceList(profile.Accounts),
 	}
+	// REGULER is left out entirely rather than sent as a value the client must
+	// then learn to ignore: the badge is hidden when the field is absent, and
+	// most customers are REGULER.
+	if profile.Tier != "" && profile.Tier != account.TierReguler {
+		data["tier"] = profile.Tier
+	}
 	if profile.LastLoginAt != nil {
 		data["last_login_at"] = profile.LastLoginAt.UTC().Format(time.RFC3339)
 	}

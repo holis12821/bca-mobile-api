@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // productionConfig is a config that passes validation; each test then breaks
@@ -16,6 +17,7 @@ func productionConfig() *Config {
 	cfg.DB.SSLMode = "require"
 	cfg.Crypto.AESKey = strings.Repeat("ab", 32)
 	cfg.Crypto.LookupHMACKey = "lookup-secret"
+	cfg.SMS.Provider = "twilio"
 	return cfg
 }
 
@@ -31,6 +33,26 @@ func TestValidate_DevelopmentIsPermissive(t *testing.T) {
 func TestValidate_ProductionAcceptsCompleteConfig(t *testing.T) {
 	if err := productionConfig().Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// Without a provider the service still generates, stores and audits every OTP,
+// so every dashboard looks healthy while no nasabah can get past OTP_VERIFY.
+// That has to stop the boot rather than wait for a support ticket.
+func TestValidate_ProductionRejectsMissingSMSProvider(t *testing.T) {
+	for name, provider := range map[string]string{"empty": "", "whitespace": "   "} {
+		t.Run(name, func(t *testing.T) {
+			cfg := productionConfig()
+			cfg.SMS.Provider = provider
+
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("expected validation to fail")
+			}
+			if !strings.Contains(err.Error(), "SMS_PROVIDER") {
+				t.Errorf("error should name the offending variable, got: %v", err)
+			}
+		})
 	}
 }
 
@@ -163,5 +185,49 @@ func TestLoad_ReadsTopLevelSettings(t *testing.T) {
 	}
 	if cfg.SignalingBaseURL != "wss://example.test" || cfg.UploadDir != "/tmp/uploads" {
 		t.Errorf("top-level settings lost: %+v", cfg)
+	}
+}
+
+// The Verify settings have to survive Load, including the comma-separated channel
+// list — a []string behind an env tag is the kind of thing that silently arrives
+// as one element containing a comma.
+func TestLoad_ReadsVerifySettings(t *testing.T) {
+	t.Setenv("SMS_PROVIDER", "twilio_verify")
+	t.Setenv("SMS_VERIFY_SERVICE_SID", "VA00000000000000000000000000000000")
+	t.Setenv("SMS_VERIFY_CHANNELS", "sms,call")
+	t.Setenv("SMS_VERIFY_LOCALE", "id")
+	t.Setenv("SMS_VERIFY_CODE_TTL", "5m")
+	t.Setenv("SMS_VERIFY_BASE_URL", "http://verify.test")
+	t.Setenv("SMS_BASE_URL", "http://messages.test")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if got := cfg.SMS.VerifyChannels; len(got) != 2 || got[0] != "sms" || got[1] != "call" {
+		t.Errorf("SMS_VERIFY_CHANNELS: got %v, want [sms call]", got)
+	}
+	if cfg.SMS.VerifyLocale != "id" {
+		t.Errorf("SMS_VERIFY_LOCALE: got %q", cfg.SMS.VerifyLocale)
+	}
+	if cfg.SMS.VerifyCodeTTL != 5*time.Minute {
+		t.Errorf("SMS_VERIFY_CODE_TTL: got %v, want 5m", cfg.SMS.VerifyCodeTTL)
+	}
+	// The two hosts must not cross over. Verify reading the Messages host is how
+	// a correctly configured account answered OTP_EXPIRED to every nasabah.
+	if cfg.SMS.VerifyBaseURL != "http://verify.test" || cfg.SMS.BaseURL != "http://messages.test" {
+		t.Errorf("hosts crossed over: verify=%q messages=%q", cfg.SMS.VerifyBaseURL, cfg.SMS.BaseURL)
+	}
+}
+
+// Unset means Twilio's own default, so otp_expires_at is never zero.
+func TestLoad_VerifyCodeTTLDefaults(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SMS.VerifyCodeTTL != 10*time.Minute {
+		t.Errorf("default SMS_VERIFY_CODE_TTL: got %v, want 10m", cfg.SMS.VerifyCodeTTL)
 	}
 }

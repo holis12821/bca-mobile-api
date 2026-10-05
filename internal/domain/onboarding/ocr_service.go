@@ -295,17 +295,35 @@ func (s *OCRService) GetOCRResult(ctx context.Context, sessionID string) (*OCRRe
 		return nil, apperr.OnboardingNotFound
 	}
 
-	// Decrypt PII fields
+	// Decrypt PII fields.
+	//
+	// A failed decrypt used to leave the field holding its ciphertext, and this
+	// response is what prefills the data-pribadi form: the nasabah would be shown
+	// a hex string as their own NIK and asked to confirm it. Worse, confirming it
+	// cannot work — personal-data compares the submitted NIK against this same
+	// decrypted value — so it is a dead end dressed up as data. The only honest
+	// answer is that we cannot read what we stored.
 	if s.aes != nil {
-		if nik, err := s.decryptField(result.Extracted.NIK); err == nil {
-			result.Extracted.NIK = nik
+		nik, err := s.decryptField(result.Extracted.NIK)
+		if err != nil {
+			slog.Error("decrypt ocr nik failed", "session_id", sessionID, "error", err)
+			return nil, apperr.InternalError
 		}
-		if nama, err := s.decryptField(result.Extracted.NamaLengkap); err == nil {
-			result.Extracted.NamaLengkap = nama
+		result.Extracted.NIK = nik
+
+		nama, err := s.decryptField(result.Extracted.NamaLengkap)
+		if err != nil {
+			slog.Error("decrypt ocr nama failed", "session_id", sessionID, "error", err)
+			return nil, apperr.InternalError
 		}
-		if alamat, err := s.decryptField(result.Extracted.Alamat); err == nil {
-			result.Extracted.Alamat = alamat
+		result.Extracted.NamaLengkap = nama
+
+		alamat, err := s.decryptField(result.Extracted.Alamat)
+		if err != nil {
+			slog.Error("decrypt ocr alamat failed", "session_id", sessionID, "error", err)
+			return nil, apperr.InternalError
 		}
+		result.Extracted.Alamat = alamat
 	}
 
 	return result, nil

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -54,20 +55,18 @@ func (h *TransactionHandler) ListMutations(w http.ResponseWriter, r *http.Reques
 
 	cursor := r.URL.Query().Get("cursor")
 
-	// Parse period (WIB dates)
-	var period *transaction.DateRange
-	if p := r.URL.Query().Get("period"); p != "" {
-		period = parsePeriod(p)
-	} else {
-		from := r.URL.Query().Get("from")
-		to := r.URL.Query().Get("to")
-		if from != "" && to != "" {
-			fromDate, err1 := time.Parse("2006-01-02", from)
-			toDate, err2 := time.Parse("2006-01-02", to)
-			if err1 == nil && err2 == nil {
-				period = &transaction.DateRange{From: fromDate, To: toDate}
-			}
-		}
+	// Parse period (WIB dates).
+	//
+	// The custom range is accepted under both spellings: the spec documents
+	// start_date/end_date, the handler was written against from/to. A client
+	// that picked the documented pair used to get its dates silently dropped
+	// and the account's whole history back.
+	period, perr := resolvePeriod(r.URL.Query().Get("period"),
+		firstNonEmpty(r.URL.Query().Get("from"), r.URL.Query().Get("start_date")),
+		firstNonEmpty(r.URL.Query().Get("to"), r.URL.Query().Get("end_date")))
+	if perr != nil {
+		response.Err(w, r, apperr.From(perr))
+		return
 	}
 
 	items, hasMore, nextCursor, err := h.svc.ListMutations(r.Context(), userID, acctID, cursor, limit, period)
@@ -107,7 +106,18 @@ func (h *TransactionHandler) ListHistory(w http.ResponseWriter, r *http.Request)
 		txnType = &t
 	}
 
-	items, hasMore, nextCursor, err := h.svc.ListHistory(r.Context(), userID, txnType, cursor, limit)
+	// Riwayat takes the same period vocabulary as Mutasi. Two screens that both
+	// show "7 hari terakhir" but disagree on how to ask for it is how a client
+	// ends up sending from/to here and getting the whole history back.
+	period, perr := resolvePeriod(r.URL.Query().Get("period"),
+		firstNonEmpty(r.URL.Query().Get("from"), r.URL.Query().Get("start_date")),
+		firstNonEmpty(r.URL.Query().Get("to"), r.URL.Query().Get("end_date")))
+	if perr != nil {
+		response.Err(w, r, apperr.From(perr))
+		return
+	}
+
+	items, hasMore, nextCursor, err := h.svc.ListHistory(r.Context(), userID, txnType, period, cursor, limit)
 	if err != nil {
 		h.handleError(w, r, err, "list history")
 		return
@@ -253,23 +263,122 @@ func (h *TransactionHandler) handleError(w http.ResponseWriter, r *http.Request,
 	response.Err(w, r, appErr)
 }
 
-// parsePeriod converts named periods (LAST_7_DAYS, etc.) to DateRange using WIB.
-func parsePeriod(name string) *transaction.DateRange {
+// firstNonEmpty returns the first value that is not blank after trimming.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// PeriodValues is the closed list of `period` values GET /transactions/mutations
+// accepts. The Mutasi screen offers four ranges; the spec used to name only two,
+// which is what butir 6 of docs/10-HANDOVER-BLOCKER-BACKEND.md was blocked on.
+// Anything outside this list is a VALIDATION_ERROR — see resolvePeriod.
+var PeriodValues = []string{
+	"LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS",
+	"THIS_MONTH", "LAST_MONTH", "CUSTOM",
+}
+
+// resolvePeriod turns `period` (plus from/to for CUSTOM) into a WIB date range.
+//
+// An unknown value is REJECTED rather than ignored. It used to fall through to a
+// nil range, which quietly means "no date filter": a typo in `period` answered
+// 200 with the account's entire history, and the screen showed it as though it
+// were the last seven days.
+func resolvePeriod(name, from, to string) (*transaction.DateRange, error) {
 	loc, _ := time.LoadLocation("Asia/Jakarta")
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 
-	switch name {
+	// WIB dates are computed here, never with CURRENT_DATE: the day boundary
+	// that matters is midnight in Jakarta, not in the database's timezone.
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "":
+		// No period named. from+to alone still filter — the app sends them that
+		// way for a custom range it built before the enum existed.
+		return customRange(from, to, true)
 	case "LAST_7_DAYS":
-		return &transaction.DateRange{From: today.AddDate(0, 0, -6), To: today}
+		return &transaction.DateRange{From: today.AddDate(0, 0, -6), To: today}, nil
 	case "LAST_30_DAYS":
-		return &transaction.DateRange{From: today.AddDate(0, 0, -29), To: today}
+		return &transaction.DateRange{From: today.AddDate(0, 0, -29), To: today}, nil
 	case "LAST_90_DAYS":
-		return &transaction.DateRange{From: today.AddDate(0, 0, -89), To: today}
+		return &transaction.DateRange{From: today.AddDate(0, 0, -89), To: today}, nil
 	case "THIS_MONTH":
 		firstDay := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
-		return &transaction.DateRange{From: firstDay, To: today}
+		return &transaction.DateRange{From: firstDay, To: today}, nil
+	case "LAST_MONTH":
+		firstThis := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
+		firstLast := firstThis.AddDate(0, -1, 0)
+		// Inclusive end: the last day of the previous month, not the 1st of this
+		// one — the range is compared as dates, so the boundary day would
+		// otherwise leak into "bulan lalu".
+		lastLast := firstThis.AddDate(0, 0, -1)
+		return &transaction.DateRange{From: firstLast, To: lastLast}, nil
+	case "CUSTOM":
+		return customRange(from, to, false)
 	default:
-		return nil
+		return nil, apperr.Error{
+			Status:  apperr.ValidationError.Status,
+			Code:    apperr.ValidationError.Code,
+			Message: apperr.ValidationError.Message,
+			Details: map[string]any{
+				"invalid_field":  "period",
+				"allowed_values": PeriodValues,
+			},
+		}
 	}
+}
+
+// customRange parses from/to as YYYY-MM-DD in WIB. optional reports whether an
+// absent pair is acceptable — it is when no period was named at all, and it is
+// not when the caller explicitly asked for CUSTOM.
+func customRange(from, to string, optional bool) (*transaction.DateRange, error) {
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	from = strings.TrimSpace(from)
+	to = strings.TrimSpace(to)
+
+	if from == "" || to == "" {
+		if optional {
+			return nil, nil
+		}
+		return nil, apperr.Error{
+			Status:  apperr.ValidationError.Status,
+			Code:    apperr.ValidationError.Code,
+			Message: apperr.ValidationError.Message,
+			Details: map[string]any{
+				"invalid_field": "from,to",
+				"reason":        "period=CUSTOM membutuhkan from dan to (YYYY-MM-DD).",
+			},
+		}
+	}
+
+	fromDate, err1 := time.ParseInLocation("2006-01-02", from, loc)
+	toDate, err2 := time.ParseInLocation("2006-01-02", to, loc)
+	if err1 != nil || err2 != nil {
+		return nil, apperr.Error{
+			Status:  apperr.ValidationError.Status,
+			Code:    apperr.ValidationError.Code,
+			Message: apperr.ValidationError.Message,
+			Details: map[string]any{
+				"invalid_field": "from,to",
+				"reason":        "Format tanggal harus YYYY-MM-DD.",
+			},
+		}
+	}
+	if toDate.Before(fromDate) {
+		return nil, apperr.Error{
+			Status:  apperr.ValidationError.Status,
+			Code:    apperr.ValidationError.Code,
+			Message: apperr.ValidationError.Message,
+			Details: map[string]any{
+				"invalid_field": "from,to",
+				"reason":        "Tanggal akhir tidak boleh lebih awal dari tanggal awal.",
+			},
+		}
+	}
+
+	return &transaction.DateRange{From: fromDate, To: toDate}, nil
 }

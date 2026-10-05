@@ -1,4 +1,4 @@
-.PHONY: help setup keys dev run stop check-port build pin tunnel tunnel-env infra-up infra-down infra-reset \
+.PHONY: help setup keys pin-public-key spki-hash dev run stop check-port build pin tunnel tunnel-env infra-up infra-down infra-reset \
         migrate-create migrate-up migrate-down migrate-status verify-009 ledger-check \
         seed test test-verbose test-coverage test-concurrent lint vet check \
         docker-build prod-migrate prod-up prod-down prod-logs backup clean
@@ -80,6 +80,26 @@ build: ## Build production binary
 pin: ## Encrypt a PIN for manual API calls — usage: make pin PIN=123456
 	@go run ./scripts/pinenc -pin $(or $(PIN),123456)
 
+pin-public-key: ## Print the PIN public key to hand to the Android build (assets/pin_public.pem)
+	@test -f keys/pin_public.pem || { echo "keys/pin_public.pem is missing — run: make keys"; exit 1; }
+	@echo "# key_id: $(or $(PIN_KEY_ID),pin-key-v1)   algorithm: RSA-OAEP-SHA256"
+	@echo "# Public half only. The private key never leaves the backend."
+	@echo "# The same bytes are served at GET /v1/auth/pin/public-key."
+	@cat keys/pin_public.pem
+
+spki-hash: ## SPKI pin for certificate pinning — usage: make spki-hash HOST=api.bcamobile.id
+	@test -n "$(HOST)" || { echo "usage: make spki-hash HOST=api.bcamobile.id"; exit 1; }
+	@echo "# $(HOST) — expires:"
+	@echo | openssl s_client -servername $(HOST) -connect $(HOST):443 2>/dev/null \
+		| openssl x509 -noout -enddate
+	@printf 'sha256/'
+	@echo | openssl s_client -servername $(HOST) -connect $(HOST):443 2>/dev/null \
+		| openssl x509 -pubkey -noout \
+		| openssl pkey -pubin -outform der \
+		| openssl dgst -sha256 -binary \
+		| openssl enc -base64
+	@echo "# A pin list needs a BACKUP too, or certificate renewal bricks the app in the field."
+
 tunnel: ## Public HTTPS URL for the local server — make tunnel [DOMAIN=your.ngrok-free.app]
 	@command -v ngrok >/dev/null || { echo "ngrok is not installed: brew install ngrok"; exit 1; }
 	@echo "Leave this running, then in another terminal: make tunnel-env"
@@ -96,7 +116,7 @@ tunnel-env: ## Point SIGNALING_BASE_URL at the running ngrok tunnel
 
 # === Infrastructure ===
 
-infra-up: ## Start Postgres + both Redis instances
+infra-up: ## Start Postgres + both Redis instances + coturn (STUN/TURN)
 	$(COMPOSE_DEV) up -d
 
 infra-down: ## Stop local infra

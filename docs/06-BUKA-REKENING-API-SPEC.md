@@ -5,9 +5,57 @@
 
 ---
 
+## 0. Pengikatan Perangkat & Header Wajib
+
+Client mengirim `X-Device-ID` dan `X-Request-ID` pada **setiap** request.
+
+### `X-Device-ID`
+
+`session_id` adalah rahasia pembawa tanpa token di belakangnya. Tanpa
+pengikatan, salinannya — tangkapan layar, baris log, papan klip yang dibagikan —
+bisa dilanjutkan dari ponsel mana pun.
+
+- Server membandingkan `X-Device-ID` dengan `device_id` yang tersimpan saat sesi
+  dibuat. Berbeda → **`403 ONBOARDING_DEVICE_MISMATCH`**.
+- Berlaku untuk **semua** endpoint yang menerima `session_id`:
+  `GET`/`DELETE /sessions/{id}`, `PUT /sessions/{id}/card`, `POST /ocr`,
+  `GET /ocr/{session_id}`, `POST /personal-data`, `POST /verify-otp`,
+  `POST /resend-otp`, `POST /biometric`, `POST /video-call/queue`,
+  `POST /credentials`, `POST /submit`.
+- **Header yang tidak dikirim tetap lolos.** Menjawab 403 ke semua build yang
+  sudah ada di tangan tester akan mengubah langkah pengamanan menjadi gangguan
+  layanan. Client yang mengirimkannya langsung mendapat pengikatannya.
+- `403`, bukan `404`: `session_id` adalah UUID v4, jadi tidak ada ruang id yang
+  bisa ditelusuri, dan "tidak ditemukan" membuat client mencari-cari sesi yang
+  sebenarnya sudah dipegangnya dengan benar.
+- Endpoint internal (`X-Internal-API-Key`) tidak terkena: CS backend bukan
+  perangkat nasabah.
+- `GET /products/{product_type}/cards` **mewajibkan** `X-Device-ID` —
+  header itu satu-satunya identitas yang ada sebelum sesi dibuat, dan batas laju
+  katalog bergantung padanya. Tanpa header: `400 VALIDATION_ERROR` dengan
+  `details.missing_header`.
+
+**Pasang ulang aplikasi memutus draf, dan itu memang yang diinginkan.**
+`ANDROID_ID` berganti saat aplikasi dipasang ulang, jadi sesi lama tidak bisa
+dilanjutkan; sesinya kedaluwarsa sendiri setelah 24 jam dan nasabah mulai dari
+awal. Pengikatan yang selamat dari pemasangan ulang harus mempercayai nilai yang
+dipilih client, dan nilai seperti itu tidak mengikat apa pun.
+
+### `X-Request-ID`
+
+Server **membuat sendiri** id-nya dan **tidak** memantulkan nilai client.
+`meta.request_id` pada setiap respons adalah id buatan server, dan nilai itu juga
+dikembalikan di header `X-Request-ID`. Alasannya: id yang dipilih client bisa
+bertabrakan atau disamakan sengaja, dan korelasi log lintas nasabah menjadi tidak
+bisa dipercaya. Client tetap boleh mengirimnya — untuk korelasi sisi client —
+tapi yang dipakai di jejak audit adalah id server.
+
+---
+
 ## Session Lifecycle
 
 ```
+GET  /onboarding/tnc               ← teks Syarat & Ketentuan (publik, cacheable)
 GET  /onboarding/products/{product_type}/cards ← katalog kartu Paspor (publik, cacheable)
 POST /onboarding/sessions          ← init session
 PUT  /onboarding/sessions/{id}/card ← pilih/ganti kartu pada sesi berjalan
@@ -19,8 +67,9 @@ POST /onboarding/resend-otp        ← kirim ulang OTP
 POST /onboarding/biometric         ← upload face + liveness
 POST /onboarding/video-call/queue  ← join antrean video call
 WS   /onboarding/video-call/signal ← WebRTC signaling
-POST /onboarding/video-call/result ← CS submit hasil verifikasi (internal)
-POST /onboarding/video-call/agent-token ← token signaling sisi agent (internal)
+GET  /onboarding/video-call/queued ← daftar antrean yang menunggu (internal)
+POST /onboarding/video-call/result ← CS submit hasil verifikasi (internal, + kredensial petugas)
+POST /onboarding/video-call/agent-token ← token signaling sisi agent (internal, + kredensial petugas)
 GET  /onboarding/credentials/public-key ← RSA public key untuk enkripsi kredensial
 POST /onboarding/credentials       ← simpan kode akses + PIN
 POST /onboarding/submit            ← final submit, buat rekening
@@ -56,6 +105,123 @@ memperpanjangnya; setelah lewat, semua endpoint menjawab
 
 ---
 
+## 0b. Syarat & Ketentuan
+
+```
+GET /v1/onboarding/tnc[?version=2026-09-01]
+```
+
+Layar PERTAMA flow buka rekening. Publik — tanpa `Authorization` dan tanpa `session_id`,
+karena sesi baru lahir setelah nasabah menekan setuju. `X-Device-ID` tidak wajib di sini
+(teksnya sama untuk semua perangkat), tapi bila dikirim, jatah rate limit dihitung per
+perangkat alih-alih per IP.
+
+Isinya dilayani database (migrasi `000025`), bukan dibaca dari `strings.xml` di dalam APK.
+Sebelum itu `tnc_version` yang tersimpan pada baris sesi hanyalah string yang dikirim
+client: bank mencatat "nasabah menyetujui 2026-09-01" tanpa punya satu baris pun yang
+menjelaskan isi versi itu, dan buktinya hilang begitu teksnya diperbarui di rilis
+berikutnya.
+
+`?version=` opsional, untuk menampilkan kembali teks versi lama yang pernah disetujui
+(mis. dari layar riwayat atau permintaan nasabah). Tanpa parameter: versi yang **sedang**
+berlaku.
+
+### Response `200 OK`
+```json
+{
+  "status": "success",
+  "data": {
+    "version": "2026-09-01",
+    "heading": "Syarat & Ketentuan Pembukaan Rekening",
+    "subtitle": "Mohon baca dan pahami syarat dan ketentuan pembukaan rekening digital BCA sebelum melanjutkan.",
+    "trust_banner": {
+      "title": "Persetujuan Resmi Nasabah",
+      "subtitle": "Terdaftar dan diawasi oleh Otoritas Jasa Keuangan (OJK)"
+    },
+    "sections": [
+      {
+        "icon_key": "ACCOUNT_BOX",
+        "title": "1. Ketentuan Umum Pembukaan Rekening Digital",
+        "body": "Calon nasabah merupakan Warga Negara Indonesia (WNI) …"
+      }
+    ],
+    "notice": {
+      "label": "PENTING",
+      "body": "Pastikan Anda berada di tempat tenang dan pencahayaan cukup untuk verifikasi video call pada tahap berikutnya."
+    },
+    "consent": {
+      "prefix": "Saya telah membaca, memahami, dan menyetujui seluruh ",
+      "link": "Syarat & Ketentuan Pembukaan Rekening BCA",
+      "suffix": "."
+    },
+    "agree_cta": "Setuju & Lanjutkan",
+    "effective_from": "2026-08-31T17:00:00Z",
+    "is_active": true
+  },
+  "meta": { "request_id": "...", "timestamp": "..." }
+}
+```
+
+`version` **wajib** dikirim kembali apa adanya sebagai `accepted_tnc_version` pada
+`POST /v1/onboarding/sessions` (§1). Nilai lain ditolak — lihat tabel error di sana.
+
+`consent` dipecah tiga karena bagian `link` dicetak tebal dan berwarna oleh aplikasi.
+Menyatukannya berarti client harus mencari substring untuk tahu bagian mana yang
+ditebalkan, dan substring itu pecah pada setiap perbaikan kata.
+
+`icon_key` dipetakan client ke drawable-nya sendiri — bukan URL, karena ikonnya ada di
+dalam APK. Kunci yang dikenal saat ini: `ACCOUNT_BOX`, `VERIFIED_USER`, `VIDEO_CALL`,
+`SAVINGS`, `LOCK`. Client yang menemukan kunci baru **harus** menampilkan ikon bawaan dan
+tetap mencetak teksnya, bukan melewati pasalnya.
+
+`is_active: false` hanya mungkin muncul pada respons `?version=`. Client yang menampilkan
+dokumen itu **tidak boleh** menawarkan tombol setuju: persetujuannya pasti ditolak `409`.
+
+### Caching
+
+`ETag` memuat versi yang BENAR-BENAR dilayani (`"tnc-2026-09-01"`), bukan nilai query —
+jadi ketika versi aktif berganti, ETag-nya berganti sendiri dan `If-None-Match` tidak lagi
+menjawab `304`. `Cache-Control: public, max-age=300`: lima menit, lebih pendek dari TTL
+cache server (24 jam), karena client yang menahan teks lama lebih lama hanya akan
+mengumpulkan penolakan `409` saat nasabah menekan setuju.
+
+### Rate limit
+
+30 permintaan / 5 menit, per `X-Device-ID` bila ada, per IP bila tidak. Jatahnya sendiri,
+tidak menumpang bucket katalog kartu: kedua layar dibuka berurutan, dan bucket bersama
+berarti keduanya saling menghabiskan jatah di tengah pendaftaran.
+
+### Error Codes
+| Code | HTTP | Keterangan |
+|------|------|-----------|
+| `TNC_VERSION_UNKNOWN` | 422 | `?version=` tidak ada di database |
+| `TNC_UNAVAILABLE` | 503 | Tidak ada versi aktif — salah konfigurasi server (migrasi `000025` belum jalan), bukan salah client |
+
+### Mengaktifkan versi baru
+
+Dua langkah, dan yang kedua sering terlupa:
+
+```sql
+BEGIN;
+UPDATE onboarding_tnc_documents SET is_active = FALSE WHERE is_active;
+INSERT INTO onboarding_tnc_documents (version, heading, …, is_active) VALUES ('2027-01-01', …, TRUE);
+INSERT INTO onboarding_tnc_sections (document_id, section_order, icon_key, title, body)
+SELECT id, 1, 'ACCOUNT_BOX', '1. …', '…' FROM onboarding_tnc_documents WHERE version = '2027-01-01';
+COMMIT;
+```
+
+```bash
+redis-cli -n 0 DEL onboarding:tnc:v1:active   # WAJIB
+```
+
+Tanpa `DEL`, entri cache versi aktif bisa bertahan sampai 24 jam. Yang terjadi bukan
+ketidakkonsistenan acak — `ValidateVersion` membaca cache yang sama, jadi penolakannya
+konsisten: nasabah melihat teks lama dan persetujuannya diterima, sampai TTL habis. Satu
+versi aktif ditegakkan indeks unik parsial, jadi `UPDATE … SET is_active = FALSE` di atas
+bukan kerapian — tanpa itu `INSERT`-nya ditolak.
+
+---
+
 ## 1. Init Session
 
 Dipanggil saat nasabah memilih jenis rekening dan setuju S&K.
@@ -75,10 +241,25 @@ POST /v1/onboarding/sessions
 }
 ```
 
+`accepted_tnc_version` **wajib** dan harus sama dengan `version` yang dilayani
+`GET /v1/onboarding/tnc` (§0b) saat itu. Diperiksa ke database, bukan sekadar dicek tidak
+kosong — dan diperiksa **sebelum** batas 3 sesi per perangkat, supaya persetujuan yang
+salah versi tidak menghabiskan satu jatah.
+
+Versi lama **ditolak** `409 TNC_VERSION_OUTDATED`, tidak diterima dengan penanda seperti
+`meta.catalog_outdated` pada katalog kartu. Bedanya mendasar: katalog yang basi hanya
+membuat nasabah melihat biaya yang keliru, sementara S&K yang basi berarti bank menyimpan
+persetujuan atas pasal yang tidak pernah dibaca. `details.current_version` selalu disertakan
+supaya aplikasi bisa memuat ulang §0b dan menampilkan teks baru tanpa menebak.
+
 `card_type` dan `card_catalog_version` **opsional**; keduanya hanya berarti ketika sisipan
 pilih kartu menyala (`FEATURE_CARD_SELECTION`). Query `?region_code=` dan header
 `X-App-Version` ikut dibaca — wilayah menentukan ketersediaan kartu, versi aplikasi memicu
 fallback client lama (kontrak lengkap: `docs/08-PILIH-KARTU-API-SPEC.md` §7).
+
+`region_code` harus berbentuk `^[A-Z0-9]{1,10}$` (huruf kecil dibakukan, kosong berarti
+nasional). Bentuk lain dijawab `VALIDATION_ERROR` (400) dengan
+`details.invalid_field: "region_code"`, karena nilainya ikut membentuk kunci cache katalog.
 
 | Kondisi | `current_step` hasil | `card` pada respons |
 |---|---|---|
@@ -107,8 +288,8 @@ fallback client lama (kontrak lengkap: `docs/08-PILIH-KARTU-API-SPEC.md` §7).
       "card_type": "PASPOR_BLUE",
       "name": "Blue Mastercard",
       "style": "BLUE",
-      "fees": { "monthly_admin": 14000, "card_issuance": 0, "card_replacement": 15000 },
-      "limits": { "cash_withdrawal": 10000000, "transfer_bca": 50000000,
+      "fees": { "monthly_admin": 15000, "card_issuance": 0, "card_replacement": 25000 },
+      "limits": { "cash_withdrawal": 7000000, "transfer_bca": 50000000,
                   "transfer_interbank": 15000000, "debit_purchase": 50000000 },
       "selected_at": "2026-09-18T10:30:00Z"
     }
@@ -130,6 +311,9 @@ menyegarkan tampilan biaya sebelum layar Ringkasan.
 | `CARD_TYPE_INVALID` | `card_type` tidak ada di katalog produk ini |
 | `CARD_TYPE_UNAVAILABLE` | Kartu sedang habis atau dinonaktifkan |
 | `CARD_NOT_ELIGIBLE` | Syarat kartu belum terpenuhi; lihat `details.reason_key` |
+| `TNC_VERSION_OUTDATED` | 409 — `accepted_tnc_version` bukan versi yang berlaku. `details` memuat `sent_version` dan `current_version`; muat ulang §0b lalu minta nasabah menyetujui teks baru |
+| `TNC_VERSION_UNKNOWN` | 422 — versi tidak pernah ada di database. Berarti bug client, bukan client lama |
+| `TNC_UNAVAILABLE` | 503 — tidak ada versi S&K aktif di server |
 
 ---
 
@@ -155,9 +339,9 @@ S&K lalu ganti kartu, atau mengubah kartu dari layar Ringkasan. Batas laju 10 pe
   "status": "success",
   "data": {
     "card": { "card_type": "PASPOR_GOLD", "name": "Gold Mastercard", "style": "GOLD",
-              "fees": { "monthly_admin": 16000, "card_issuance": 0, "card_replacement": 15000 },
+              "fees": { "monthly_admin": 17000, "card_issuance": 0, "card_replacement": 25000 },
               "limits": { "cash_withdrawal": 10000000, "transfer_bca": 75000000,
-                          "transfer_interbank": 25000000, "debit_purchase": 75000000 },
+                          "transfer_interbank": 20000000, "debit_purchase": 75000000 },
               "selected_at": "2026-09-18T11:00:00Z" },
     "current_step": "OCR",
     "steps_completed": { "tnc_accepted": true, "card_selected": true, "ocr_verified": false }
@@ -179,6 +363,7 @@ di `REVIEW` tetap di `REVIEW`. Client menavigasi mengikuti nilai ini. Boleh dipa
 | `CARD_TYPE_UNAVAILABLE` | 409 | Stok habis atau kartu dinonaktifkan |
 | `CARD_NOT_ELIGIBLE` | 422 | Syarat belum terpenuhi; lihat `details.reason_key` |
 | `CARD_LOCKED` | 409 | Pengajuan sudah disubmit, kartu terkunci |
+| `ONBOARDING_DEVICE_MISMATCH` | 403 | `X-Device-ID` bukan perangkat pembuat sesi (§0). Berlaku di semua endpoint ber-`session_id` |
 
 ---
 
@@ -263,9 +448,38 @@ Nasabah konfirmasi/edit data OCR + isi data tambahan (pekerjaan, penghasilan).
 
 ```
 > **Dev only:** saat `APP_ENV=development`, response `personal-data` dan
-> `resend-otp` memuat `otp_debug` berisi kode OTP-nya, karena SMS gateway di
-> lingkungan itu hanya menulis log. Field ini tidak pernah muncul di
-> environment lain.
+> `resend-otp` memuat `otp_debug` berisi kode OTP-nya. Field ini tidak pernah
+> muncul di environment lain.
+>
+> **Pengiriman SMS:** gerbangnya dipilih dari `SMS_PROVIDER`. Kosong +
+> development → kode hanya ditulis ke log (dan muncul sebagai `otp_debug`);
+> kosong + environment lain → server menolak boot; terisi → dikirim sungguhan
+> lewat provider, di environment apa pun termasuk development. Nomor
+> dinormalkan ke E.164 di dalam gateway, jadi `0812…`, `62812…` dan `+62 812…`
+> sama-sama sampai ke operator pemilik nomornya.
+>
+> **Dua model provider, dan bedanya terlihat di response:**
+>
+> - `SMS_PROVIDER=twilio` — **kita** yang membuat kodenya, menyimpan hash-nya di
+>   Redis dengan TTL 5 menit, dan memeriksanya sendiri. `otp_debug` tersedia di
+>   development.
+> - `SMS_PROVIDER=twilio_verify` — **provider** yang membuat, menyimpan, dan
+>   memeriksa kodenya (Twilio Verify). `otp_expires_at` memakai TTL provider
+>   (10 menit), dan **`otp_debug` selalu kosong, juga di development**, karena
+>   kodenya tidak pernah melewati server ini. Dipakai saat akun Twilio masih
+>   trial: Messages API menolak body kustom di sana (`572006`).
+>
+> Yang **tidak** berubah di antara keduanya: seluruh kebijakan di §3b — blokir 5
+> kegagalan, kuota kirim ulang per sesi, batas per nomor, dan audit trail. Client
+> tidak perlu tahu provider mana yang dipakai, kecuali bahwa `otp_debug` bisa
+> kosong.
+>
+> **Batas per nomor:** 10 SMS per jam per nomor tujuan, dihitung lintas session.
+> `POST /personal-data` menjawab `429 RATE_LIMIT_EXCEEDED` dengan
+> `details.retry_after_seconds` saat batas itu habis, dan tidak ada OTP yang
+> diterbitkan — step tetap di `PERSONAL_DATA` dan flow bisa dilanjutkan nanti.
+> Normalisasi E.164 di atas juga yang membuat batas ini tidak bisa diakali
+> dengan menulis nomor yang sama dalam format berbeda. Lihat §3b butir 4.
 >
 > **Integrasi eksternal:** OCR, Dukcapil, biometrik, object storage dan core
 > banking hanya punya implementasi mock. Di luar `APP_ENV=development`
@@ -303,9 +517,46 @@ POST /v1/onboarding/personal-data
     "sumber_dana_utama": "GAJI",
     "nomor_hp": "081234568889",
     "email": "m.ardan@example.com"
-  }
+  },
+  "channel": "sms"
 }
 ```
+
+`channel` **opsional**: `"sms"` (default) atau `"call"`. Lihat
+*Channel pengiriman OTP* di bawah. Build Android yang tidak mengirimnya tetap
+mendapat SMS, jadi penambahan field ini tidak memecah versi lama.
+
+### Aturan validasi
+
+Diperiksa sebelum apa pun disimpan, jadi penolakan tidak meninggalkan baris
+separuh jadi dan tidak memotong batas kirim OTP.
+
+| Field | Aturan | Ditolak dengan |
+|---|---|---|
+| `nomor_hp` | Harus bisa dinormalkan ke E.164 Indonesia oleh gateway: `08xx`, `628xx`, `+628xx`, atau `8xx`, pemisah bebas (`0812-3456-7890` boleh). Nasional 10–13 digit, blok `080` ditolak | `422 PERSONAL_DATA_INVALID_PHONE` |
+| `email` | Bentuk email standar | `422 PERSONAL_DATA_INVALID_EMAIL` |
+| `channel` | Kosong, `sms`, atau `call` (huruf besar/kecil bebas). `call` hanya saat provider memiliki kodenya dan deployment mengaktifkannya | `400 OTP_CHANNEL_NOT_ALLOWED` |
+| `nik`, `nama_lengkap` | Harus sama dengan hasil OCR | `422 PERSONAL_DATA_NIK_MISMATCH` / `PERSONAL_DATA_NAMA_MISMATCH` |
+| `jenis_kelamin` | Tepat `LAKI_LAKI` atau `PEREMPUAN` | `400 VALIDATION_ERROR` |
+| `tanggal_lahir` | Wajib, format ISO `YYYY-MM-DD` | `400 VALIDATION_ERROR` |
+| `tempat_lahir`, `kelurahan`, `kecamatan`, `kota`, `provinsi` | Maks 128 karakter | `400 VALIDATION_ERROR` |
+| `rt_rw` | Maks 16 karakter | `400 VALIDATION_ERROR` |
+| `kode_pos` | Maks 10 karakter | `400 VALIDATION_ERROR` |
+| `pekerjaan`, `penghasilan_per_bulan`, `sumber_dana_utama` | Harus salah satu enum di §16 | `400 VALIDATION_ERROR` |
+
+> **Kenapa batas panjang ikut didokumentasikan.** Angka-angka itu adalah lebar
+> kolom di migrasi `000012`. Sebelum diperiksa di sini, kiriman yang lebih
+> panjang gagal di `INSERT` dan sampai ke nasabah sebagai `500 INTERNAL_ERROR`
+> untuk input yang sekadar terlalu panjang. `tanggal_lahir` lebih buruk lagi:
+> nilai yang tidak terbaca disimpan sebagai `NULL` sementara response tetap
+> `200`, jadi satu field KYC hilang diam-diam dan rekeningnya tetap dikirim ke
+> core banking tanpa tanggal lahir.
+>
+> **Aturan `nomor_hp` sekarang milik gateway**, bukan regex terpisah. Keduanya
+> pernah berbeda: regex lama meloloskan nomor 14 digit dan blok `080` yang
+> ditolak gateway, jadi data tersimpan, step maju ke `OTP_VERIFY`, lalu setiap
+> pengiriman dijawab `503 OTP_DELIVERY_FAILED` selamanya — jalan buntu untuk
+> nasabah yang tidak melakukan kesalahan apa pun.
 
 ### Response `200 OK`
 ```json
@@ -345,12 +596,12 @@ Response: `200 OK` → `current_step: "BIOMETRIC"`
 |------|------|-----------|
 | `VALIDATION_ERROR` | 400 | `otp_code` bukan 6 digit angka, atau `session_id` kosong |
 | `ONBOARDING_NOT_FOUND` | 404 | Session tidak dikenal, **atau** `X-Device-ID` bukan device pemilik session |
-| `OTP_INVALID` | 422 | Kode salah, percobaan masih tersisa |
-| `OTP_EXPIRED` | 422 | Lewat `otp_expires_at`, atau OTP sudah diganti karena 3 kegagalan beruntun |
+| `OTP_INVALID` | 422 | Kode salah, percobaan masih tersisa. Juga dijawab pada kegagalan ke-3 bila batas kirim per nomor sudah habis: regenerasi dilewati, kode lama tetap sah |
+| `OTP_EXPIRED` | 422 | Lewat `otp_expires_at`, atau OTP sudah diganti karena 3 kegagalan beruntun **dan SMS penggantinya berhasil dikirim** |
 | `ONBOARDING_INVALID_STEP` | 422 | `current_step` bukan `OTP_VERIFY` |
 | `ONBOARDING_SESSION_EXPIRED` | 422 | Session kedaluwarsa (24 jam) |
 | `OTP_BLOCKED` | 429 | 5 kegagalan; membawa `details.retry_after_seconds` |
-| `OTP_DELIVERY_FAILED` | 503 | Kode terbit dan tersimpan, tapi SMS gateway menolak. Kode tetap sah — nasabah bisa kirim ulang |
+| `OTP_DELIVERY_FAILED` | 503 | SMS gateway menolak kiriman. Juga dijawab bila regenerasi otomatis setelah 3 kegagalan gagal dikirim: kode lama sudah ditimpa, jadi client harus menawarkan kirim ulang alih-alih menunggu SMS yang tidak pernah berangkat |
 
 #### Kebijakan penghitung
 
@@ -362,12 +613,35 @@ Tiga hal ini pernah saling bertabrakan di dokumen. Nilainya sekarang tetap:
    sedang terblokir **tidak** menambah penghitung, jadi membanjiri endpoint
    tidak memperpanjang blokir.
 2. **Regenerasi otomatis setelah 3 kegagalan tidak memotong kuota kirim
-   ulang.** Nasabah tidak meminta SMS itu.
+   ulang.** Nasabah tidak meminta SMS itu. Regenerasinya terjadi **tepat sekali**,
+   pada kegagalan ke-3 — bukan pada setiap kegagalan sejak yang ke-3. Dulu
+   kegagalan ke-4 menerbitkan satu lagi, jadi tiga tebakan salah memakan dua SMS
+   dan kode dari kegagalan ke-3 sudah mati sebelum nasabah selesai mengetiknya.
+   Kalau SMS pengganti itu gagal
+   dikirim, jawabannya `503 OTP_DELIVERY_FAILED`, bukan `422 OTP_EXPIRED`:
+   kode lama sudah ditimpa, jadi "kode kedaluwarsa, tunggu yang baru" akan
+   menyuruh nasabah menunggu SMS yang tidak pernah berangkat.
 3. **Kirim ulang tidak mereset penghitung kegagalan.** Kalau mereset, 3 kirim
    ulang berarti 12 tebakan tanpa pernah kena blokir.
+4. **Ada batas kedua yang mengikuti NOMOR, bukan session: 10 SMS per jam per
+   nomor tujuan.** Kuota kirim ulang di atas dikunci per `session_id`, dan
+   session itu gratis dibuat — satu alamat bisa menerbitkan OTP baru lewat
+   session baru sebanyak yang diizinkan rate limit per IP. Tagihan providernya
+   dan HP yang kebanjiran SMS tetap milik kita, jadi batas yang menutupnya harus
+   mengikuti nomornya. Satu sesi penuh = 1 penerbitan + 3 kirim ulang = 4 SMS,
+   jadi nasabah sungguhan masih bisa mengulang flow dua kali dalam satu jam
+   tanpa menyentuh batas ini.
+
+   Habis → `429 RATE_LIMIT_EXCEEDED` dengan `details.retry_after_seconds`,
+   bentuk yang sama dengan kuota kirim ulang, jadi client tidak butuh cabang
+   baru. Berlaku di `POST /personal-data` dan `POST /resend-otp`. Pada
+   regenerasi otomatis, batas ini **tidak** menimpa kode yang sedang dipegang
+   nasabah: regenerasinya dilewati dan jawabannya tetap `422 OTP_INVALID`.
 
 Penghitung kegagalan dan kuota kirim ulang sama-sama dinolkan saat
-`POST /personal-data` menerbitkan OTP pembuka sebuah step.
+`POST /personal-data` menerbitkan OTP pembuka sebuah step. Batas per nomor
+**tidak** ikut dinolkan — itu justru satu-satunya penghitung yang harus
+bertahan melewati session baru.
 
 ---
 
@@ -443,10 +717,37 @@ Response:
       "end": "22:00",
       "timezone": "Asia/Jakarta"
     },
-    "signaling_url": "wss://signal.bcamobile.id/v1/onboarding/video-call/signal?token=eyJ..."
+    "signaling_url": "wss://signal.bcamobile.id/v1/onboarding/video-call/signal?token=eyJ...",
+    "signaling_expires_in": 300,
+    "ice_servers": [
+      { "urls": ["stun:stun.bcamobile.id:3478"] },
+      {
+        "urls": ["turn:turn.bcamobile.id:3478?transport=udp"],
+        "username": "<dari TURN_USERNAME>",
+        "credential": "<dari TURN_CREDENTIAL>"
+      }
+    ]
   }
 }
 ```
+
+`ice_servers` mengikuti bentuk `RTCIceServer`, jadi bisa diteruskan apa adanya ke
+`PeerConnection`. Isinya datang dari environment (`STUN_URLS`, `TURN_URLS`,
+`TURN_USERNAME`, `TURN_CREDENTIAL`) — bukan dari kode, karena kredensial TURN
+milik penyedia dan berganti berkala.
+
+**`ice_servers` kosong berarti belum ada TURN yang dikonfigurasi di environment
+itu.** Panggilan masih jadi di jaringan yang ramah dan gagal di seluler ber-NAT
+ketat. Ini bukan mock dan tidak dijaga `APP_ENV`: daftar kosong membuat client
+bisa membedakan "belum dikonfigurasi" dari "dikonfigurasi tapi rusak".
+`TURN_URLS` tanpa username/credential diabaikan dan dicatat sebagai error saat
+startup — server TURN tanpa kredensial menolak semua alokasi.
+
+**Untuk pengembangan lokal sudah ada TURN sungguhan**: service `coturn` di
+`deployments/docker-compose.yml` ikut naik dengan `make infra-up`, dan
+`.env.example` sudah menunjuk ke sana (`turn:localhost:3478`, user `bcadev`).
+Kredensial itu khusus lokal. Dari HP atau emulator, `localhost` harus diganti
+alamat LAN mesin pengembang — kalau tidak, HP mencari TURN di dirinya sendiri.
 
 ### 5b. WebSocket Signaling Protocol
 
@@ -460,17 +761,81 @@ internal). **Role ada di dalam token, bukan di query string** — server menolak
 koneksi yang tokennya tidak memuat role `nasabah`/`agent`, sehingga nasabah
 tidak bisa menyambung sebagai agent.
 
+**Masa berlaku token: 5 menit, dan SEKALI PAKAI.** Token dibawa di query string,
+tempat ia berakhir di log proxy, laporan crash, dan apa pun yang mencatat URL —
+jadi URL yang tersalin adalah kredensial yang tersalin sampai token itu dipakai.
+`jti` ditandai terpakai pada sambungan pertama; percobaan kedua dengan URL yang
+sama dijawab `401`. Sambungan yang terputus **join antrean lagi** untuk mendapat
+token baru pada `queue_id` yang sama, bukan memakai URL lama. `signaling_expires_in`
+pada response join antrean menyebut umurnya dalam detik.
+
+Kalau Redis tidak terjangkau, koneksi ditolak `503` — bukan diterima. Di titik ini
+gagal-terbuka berarti memasukkan pemegang URL salinan ke dalam video call e-KYC
+yang sedang berjalan.
+
 Untuk klien browser, `Origin` harus terdaftar di `CORS_ALLOWED_ORIGINS`;
 aplikasi native tidak mengirim `Origin` dan tidak terpengaruh.
+
+#### 5b-0. Daftar Antrean (internal)
+
+Pintu masuk sisi CS. Tanpa ini petugas tidak punya cara menemukan `queue_id` yang
+dibutuhkan `agent-token`: `GET /onboarding/monitoring` hanya mengembalikan
+`queue_length` — sebuah angka, tanpa satu pun pengenal panggilan.
+
+```
+GET /v1/onboarding/video-call/queued
+X-Internal-API-Key: <key>
+```
+
+Response `200 OK`:
+```json
+{
+  "status": "success",
+  "data": {
+    "calls": [
+      { "queue_id": "q_abc123", "queue_number": "A-014",
+        "session_id": "onb_9f8e7d6c5b4a", "position": 1,
+        "waited_seconds": 95, "status": "QUEUED" }
+    ],
+    "operating_hours": { "start": "06:00", "end": "22:00", "timezone": "Asia/Jakarta" },
+    "within_operating_hours": true
+  }
+}
+```
+
+- Urutannya dari sorted set Redis, jadi `position` identik dengan yang dilihat nasabah.
+- Panggilan yang sudah diambil petugas **hilang dari daftar** (`agent-token` menjalankan
+  `ZREM`). Itu yang mencegah dua petugas memilih panggilan yang sama.
+- **Tidak memuat PII.** Petugas memilih berdasarkan urutan, bukan berdasarkan siapa
+  nasabahnya.
+- Daftar ini sekaligus membersihkan anggota antrean yang tidak bisa dilayani — yang
+  rekamannya tidak ada, dan yang sesinya sudah kedaluwarsa atau dibatalkan. Keduanya
+  dibatalkan (`CANCELLED`) dan dikeluarkan dari antrean, supaya `position` yang dilihat
+  petugas dan nasabah tidak lebih besar daripada jumlah panggilan yang benar-benar ada.
+- `within_operating_hours: false` berarti antrean tidak menerima yang baru; yang sudah
+  mengantre tetap boleh dilayani.
 
 #### 5b-1. Agent Token (internal)
 
 ```
 POST /v1/onboarding/video-call/agent-token
 X-Internal-API-Key: <key>
+X-Agent-Employee-ID: CS-1042
+X-Agent-API-Key: <kunci petugas>
 
 { "queue_id": "q_abc123" }
 ```
+
+**Identitas petugas ada di header, bukan di body.** `agent_employee_id` dan `agent_name`
+dulu field payload yang dipercaya apa adanya: siapa pun yang memegang `INTERNAL_API_KEY` —
+satu secret yang sama untuk seluruh integrasi CS — bisa mengaku sebagai pegawai mana pun,
+dan string itulah yang masuk audit trail sebagai `actor` serta tampil ke layar nasabah
+lewat `agent_assigned`. Sekarang `X-Agent-Employee-ID` menyebut petugasnya dan
+`X-Agent-API-Key` membuktikannya terhadap tabel `cs_agents`; nama petugas diambil dari
+baris itu, tidak lagi dari permintaan.
+
+Dua penjaga, dua pertanyaan: sistem mana yang memanggil (`X-Internal-API-Key`) dan petugas
+mana yang bertindak (`X-Agent-*`).
 
 Response `200 OK`:
 ```json
@@ -486,8 +851,25 @@ Response `200 OK`:
 }
 ```
 
-Antrean yang sudah `COMPLETED`/`CANCELLED` tidak lagi menerbitkan token
-(`VIDEO_CALL_NOT_ACTIVE`).
+Response-nya juga memuat `ice_servers` dalam bentuk `RTCIceServer`, sama seperti respons
+join antrean, jadi sisi agent memakai TURN yang sama dengan nasabah.
+
+| Keadaan | Jawaban |
+|---|---|
+| Antrean sudah `COMPLETED`/`CANCELLED` | `422 VIDEO_CALL_NOT_ACTIVE` |
+| Panggilan sedang ditangani petugas LAIN | `409 VIDEO_CALL_ALREADY_TAKEN` |
+| Petugas tidak dikenal / kunci salah / tidak aktif | `403 FORBIDDEN` |
+| Registry petugas tidak bisa dihubungi | `503 AGENT_AUTH_UNAVAILABLE` |
+
+Pengambilan ulang oleh **petugas yang sama** tetap diizinkan: token signaling sekali pakai,
+jadi itu jalur menyambung ulang yang sah. Yang ditolak adalah petugas kedua — dulu keduanya
+mendapat token, `Hub.Register` menutup socket petugas pertama, tapi identitas yang tercatat
+tetap milik yang pertama. Jadi yang berbicara dengan nasabah dan yang tercatat di audit
+adalah dua orang berbeda.
+
+Pencatatan status ke `ACTIVE` terjadi **sebelum** token diterbitkan, dan kegagalannya
+menolak permintaan. Dulu kegagalan itu hanya dicatat lalu token tetap keluar — panggilan
+berjalan tanpa catatan siapa yang menanganinya.
 
 #### Client → Server Messages
 ```jsonc
@@ -533,14 +915,19 @@ Antrean yang sudah `COMPLETED`/`CANCELLED` tidak lagi menerbitkan token
 
 ```
 POST /v1/onboarding/video-call/result
-X-Internal-Service-Key: <cs-backend-key>
+X-Internal-API-Key: <key>
+X-Agent-Employee-ID: CS-1042
+X-Agent-API-Key: <kunci petugas>
 ```
+
+`agent_employee_id` **tidak lagi ada di body** — identitasnya datang dari header yang
+diautentikasi, alasannya sama dengan §5b-1. Header-nya juga `X-Internal-API-Key`; dokumen
+ini sebelumnya menulis `X-Internal-Service-Key`, yang tidak pernah ada di kode.
 
 ```json
 {
   "session_id": "onb_9f8e7d6c5b4a",
   "queue_id": "q_abc123",
-  "agent_employee_id": "CS-1042",
   "result": "APPROVED",
   "ktp_shown_live": true,
   "identity_confirmed": true,
@@ -549,6 +936,21 @@ X-Internal-Service-Key: <cs-backend-key>
   "recording_id": "rec_xyz789"
 }
 ```
+
+| Keadaan | Jawaban |
+|---|---|
+| Panggilan belum diambil petugas (`QUEUED`) atau sudah `CANCELLED` | `422 VIDEO_CALL_NOT_ACTIVE` |
+| Pelapor bukan petugas yang mengambil panggilan | `409 VIDEO_CALL_AGENT_MISMATCH` |
+| Hasil sudah pernah tercatat | `200 OK`, hasil tersimpan dikembalikan apa adanya |
+
+Dua aturan pertama dulu tidak ada. Akibatnya satu permintaan bisa menyelesaikan panggilan
+yang belum pernah terjadi — memindahkan sesi ke `CREDENTIALS` tanpa verifikasi tatap muka
+sama sekali — dan petugas mana pun bisa menandatangani verifikasi milik orang lain,
+sekaligus **menimpa** `agent_employee_id` yang sudah tercatat sehingga jejak auditnya ikut
+berubah.
+
+`REJECTED` tidak memindahkan step: sesi tetap di `VIDEO_CALL` supaya nasabah bisa mengantre
+lagi.
 
 ---
 
@@ -718,9 +1120,9 @@ GET /v1/onboarding/sessions/{session_id}
       "card_type": "PASPOR_GOLD",
       "name": "Gold Mastercard",
       "style": "GOLD",
-      "fees": { "monthly_admin": 16000, "card_issuance": 0, "card_replacement": 15000 },
+      "fees": { "monthly_admin": 17000, "card_issuance": 0, "card_replacement": 25000 },
       "limits": { "cash_withdrawal": 10000000, "transfer_bca": 75000000,
-                  "transfer_interbank": 25000000, "debit_purchase": 75000000 },
+                  "transfer_interbank": 20000000, "debit_purchase": 75000000 },
       "selected_at": "2026-09-18T09:05:00Z"
     }
   }
@@ -752,8 +1154,12 @@ Response: `200 OK` → `{"status": "success", "data": {"deleted": true}}`
 ```
 POST /v1/onboarding/resend-otp
 
-{ "session_id": "onb_9f8e7d6c5b4a" }
+{ "session_id": "onb_9f8e7d6c5b4a", "channel": "call" }
 ```
+
+`channel` opsional, default `"sms"`. Ini endpoint yang membuat "SMS-nya tidak
+sampai" bisa dipulihkan: nasabah di operator yang menyaring pesan bisa meminta
+kodenya dibacakan lewat telepon.
 
 Response `200 OK`:
 ```json
@@ -772,10 +1178,43 @@ kirim ulang bukan jalan memutar blokir.
 
 Menerima `X-Device-ID` opsional dengan aturan yang sama seperti `verify-otp`.
 
+### Channel pengiriman OTP
+
+Berlaku di `POST /personal-data` dan `POST /resend-otp`.
+
+| `channel` | Arti |
+|---|---|
+| tidak dikirim / `"sms"` | OTP lewat SMS. Perilaku default, dan satu-satunya yang tersedia di semua konfigurasi |
+| `"call"` | Provider menelepon nomor nasabah dan membacakan kodenya |
+
+`"call"` dijawab `400 OTP_CHANNEL_NOT_ALLOWED` kecuali dua syarat terpenuhi:
+provider yang memiliki kodenya sedang aktif (`SMS_PROVIDER=twilio_verify`), dan
+`call` ada di `SMS_VERIFY_CHANNELS`. Penolakannya terjadi **sebelum** apa pun
+dikirim — tidak ada kode yang terbit, tidak ada kuota yang terpotong — jadi
+mencoba ulang dengan `sms` langsung berhasil.
+
+Yang **tidak** dilakukan: menurunkan `call` menjadi SMS secara diam-diam. Nasabah
+yang meminta telepon lalu menerima SMS akan menunggu panggilan yang tidak pernah
+datang, sementara kodenya sudah ada di inbox.
+
+Kode dari SMS maupun telepon diverifikasi di endpoint yang sama
+(`POST /verify-otp`) — tidak ada field tambahan di sana, karena cara pengirimannya
+tidak mengubah cara pemeriksaannya.
+
+> **Bahasa pada `call`:** template suara Twilio Verify tidak mencakup bahasa
+> Indonesia, jadi kode dibacakan dalam bahasa **Inggris** meskipun
+> `SMS_VERIFY_LOCALE=id`. SMS tetap bahasa Indonesia. Ini batasan provider, bukan
+> pilihan di sisi kita.
+
 **Kuota: 3 kirim ulang per jam per session.** Jatah habis dijawab
 `RATE_LIMIT_EXCEEDED` (429) dengan `details.retry_after_seconds` berisi sisa
 jendela. Regenerasi otomatis setelah 3 kegagalan verifikasi tidak memotong
 kuota ini. Kuota dinolkan saat `POST /personal-data` menerbitkan OTP pembuka.
+
+**Batas kedua: 10 SMS per jam per nomor tujuan**, dihitung lintas session dan
+tidak pernah dinolkan oleh session baru. Jawabannya juga
+`RATE_LIMIT_EXCEEDED` (429) dengan `details.retry_after_seconds`. Lihat §3b
+butir 4 — ini yang menutup pembuatan session berulang sebagai cara memanen SMS.
 
 OTP baru membatalkan yang lama seketika — kode sebelumnya langsung ditolak.
 
@@ -784,7 +1223,7 @@ OTP baru membatalkan yang lama seketika — kode sebelumnya langsung ditolak.
 | `ONBOARDING_NOT_FOUND` | 404 | Session tidak dikenal, atau `X-Device-ID` bukan pemiliknya |
 | `ONBOARDING_INVALID_STEP` | 422 | `current_step` bukan `OTP_VERIFY` |
 | `OTP_BLOCKED` | 429 | Session sedang terblokir; `details.retry_after_seconds` |
-| `RATE_LIMIT_EXCEEDED` | 429 | Kuota 3/jam habis; `details.retry_after_seconds` |
+| `RATE_LIMIT_EXCEEDED` | 429 | Kuota 3/jam per session **atau** 10 SMS/jam per nomor habis; `details.retry_after_seconds` |
 | `OTP_DELIVERY_FAILED` | 503 | SMS gateway menolak. Kuota tetap terpotong |
 
 ### 10b. Hasil OCR Tersimpan
@@ -816,7 +1255,15 @@ Response `200 OK`:
 ```
 
 `key_id` inilah yang dikirim balik sebagai `encryption_key_id` saat menyimpan
-kredensial.
+kredensial. Nilai yang bukan kunci aktif ditolak
+`422 CRED_DECRYPTION_FAILED` dengan `details.expected_key_id` — sebelumnya field
+ini disimpan tapi tidak pernah dibandingkan, jadi client yang memakai kunci lama
+sampai ke tahap dekripsi dan menerima error tanpa sebab yang bisa ditindak.
+
+**Kunci PIN dan kunci kredensial onboarding adalah kunci yang sama** (satu
+pasangan RSA-2048, `PIN_PRIVATE_KEY_PATH`/`PIN_PUBLIC_KEY_PATH`, dinamai
+`PIN_KEY_ID`). `GET /v1/auth/pin/public-key` menyajikan kunci yang sama dengan
+bentuk respons yang sama, jadi satu jalur kode client cukup untuk keduanya.
 
 ### 10d. Audit Trail Session (internal)
 

@@ -164,6 +164,90 @@ REDIS_PASSWORD=localdev_redis_123
 
 Cache boleh hilang. Sesi tidak.
 
+### 0.6 coturn: STUN/TURN untuk video call
+
+`deployments/docker-compose.yml` juga menjalankan `coturn` (naik bersama
+`make infra-up`), dan `.env.example` sudah menunjuk ke sana:
+
+```bash
+STUN_URLS=stun:localhost:3478
+TURN_URLS=turn:localhost:3478?transport=udp
+TURN_USERNAME=bcadev
+TURN_CREDENTIAL=localdev_turn_123
+```
+
+Nilai itu dikirim ke aplikasi sebagai `ice_servers` pada respons
+`POST /v1/onboarding/video-call/queue`. Tanpa TURN, WebRTC hanya jadi di jaringan
+yang ramah: di seluler ber-NAT ketat panggilan gagal setelah nasabah menunggu di
+antrean.
+
+Dua hal yang sering salah:
+
+- **`localhost` hanya benar untuk klien di mesin yang sama.** Dari HP atau
+  emulator, ganti ke alamat LAN mesin ini — kalau tidak, HP mencari TURN di
+  dirinya sendiri.
+- **Kredensial di atas khusus lokal.** Deployment sungguhan memakai TURN milik
+  infrastruktur dengan kredensial berumur pendek, bukan satu username statis yang
+  ikut di repo.
+
+Periksa TURN-nya hidup:
+
+```bash
+docker exec bca-coturn turnutils_stunclient 127.0.0.1   # harus mencetak "reflexive addr"
+docker inspect --format '{{.State.Health.Status}}' bca-coturn
+```
+
+### 0.7 FCM: push notification (opsional untuk pengembangan)
+
+**Boleh dilewati.** Tanpa kredensial, `APP_ENV=development` memakai
+`LoggingPusher`: isi push dicatat ke log, baris notifikasi tetap ditulis, dan
+seluruh flow bisa diuji ujung ke ujung dari aplikasi. Bagian ini hanya perlu
+kalau Anda ingin notifikasi benar-benar muncul di notification tray perangkat.
+
+```bash
+FCM_CREDENTIALS_FILE=keys/fcm-service-account.json
+FCM_TIMEOUT=10s
+```
+
+Cara mendapatkan berkasnya: Firebase Console → Project settings → Service
+accounts → *Generate new private key*. Simpan hasilnya di `keys/` — direktori itu
+sudah ada di `.gitignore`.
+
+```bash
+# periksa berkasnya bentuknya benar sebelum menjalankan server
+python3 -c "import json,sys; d=json.load(open('keys/fcm-service-account.json')); print(d['type'], d['project_id'], d['client_email'])"
+```
+
+`project_id` dibaca dari dalam berkas itu, jadi **tidak ada** `FCM_PROJECT_ID`:
+variabel kedua bisa tidak cocok dengan kredensialnya, dan gejalanya "pesan
+diterima FCM, tidak ada yang sampai".
+
+Tiga keadaan yang mungkin, semuanya disengaja:
+
+| Kredensial | `APP_ENV` | Perilaku |
+|---|---|---|
+| kosong | `development` | `LoggingPusher` — isi push ke log |
+| kosong | selain itu | `NoopPusher` + **WARNING saat boot** |
+| terisi | apa pun | kirim sungguhan ke FCM HTTP v1 |
+
+**Terisi tapi tidak sah → server gagal boot**, sengaja. Turun diam-diam ke
+`NoopPusher` berarti proses yang kelihatan sehat sementara tidak ada satu pun
+notifikasi sampai ke perangkat.
+
+Memeriksanya jalan:
+
+```bash
+# 1. daftarkan token dari aplikasi, lalu pastikan tersimpan
+psql "$DATABASE_URL" -c "SELECT device_id, left(push_token,12) FROM devices WHERE push_token IS NOT NULL"
+
+# 2. picu satu notifikasi (transfer, ganti PIN, apa pun), lalu lihat log
+#    tanpa kredensial : "push (logging pusher)" dengan devices > 0
+#    dengan kredensial: tidak ada log push, notifikasi muncul di perangkat
+```
+
+Token yang ditolak FCM (`UNREGISTERED`, `INVALID_ARGUMENT`) dibersihkan sendiri
+dari `devices.push_token`. Gangguan sementara tidak menghapus apa pun.
+
 ### DoD Fase 0
 
 ```bash
@@ -451,7 +535,7 @@ Top-up Rp 100.000 (fee 1.000) menghasilkan **tiga** mutasi berjumlah nol, saldo 
 
 ## Fase 6 — Registrasi & KYC Stub
 
-- `POST /registration/initiate` → OTP (di dev: log OTP-nya, jangan kirim SMS).
+- `POST /registration/initiate` → OTP (tanpa `SMS_PROVIDER` di dev: OTP hanya masuk log, tidak ada SMS).
 - `POST /registration/verify-otp`.
 - `POST /registration/upload-document` — multipart. Validasi content-type **dari isi file**, bukan dari header. Batasi ukuran. Simpan ke disk lokal atau MinIO, jangan ke database.
 - `POST /registration/complete` — set PIN awal, buat user + rekening. Trigger `000009` otomatis mengisi limit default.

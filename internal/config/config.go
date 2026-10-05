@@ -38,7 +38,111 @@ type Config struct {
 	// for the web frontends that must reach this API from a browser.
 	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS" envSeparator:","`
 
+	WebRTC WebRTC
+
+	Push Push
+
+	SMS SMS
+
 	Client Client
+}
+
+// Push holds the Firebase Cloud Messaging credentials.
+//
+// Empty CredentialsFile is a supported state, not a misconfiguration: without it
+// the service still writes every in-app notification row, and the process says
+// plainly at boot that nothing is being delivered to handsets. What is NOT
+// supported is a credentials file that exists but cannot be used — that fails
+// the boot, because a server which looks healthy while silently delivering
+// nothing is the failure this transport was added to remove.
+type Push struct {
+	// CredentialsFile is the path to the Google service account JSON, the same
+	// file GOOGLE_APPLICATION_CREDENTIALS would point at. The project id is read
+	// from inside it; there is deliberately no FCM_PROJECT_ID, because a second
+	// variable could disagree with the credential and the symptom would be
+	// "messages accepted, nothing delivered".
+	//
+	// The file itself must never be committed — see .env.example.
+	CredentialsFile string `env:"FCM_CREDENTIALS_FILE"`
+
+	// Timeout bounds a single FCM call. The push happens after money has already
+	// been committed, so a slow Google is cut off rather than allowed to hold the
+	// handler open.
+	Timeout time.Duration `env:"FCM_TIMEOUT" envDefault:"10s"`
+}
+
+// SMS holds the OTP delivery provider credentials.
+//
+// Empty Provider is supported only in development, where the gateway logs the
+// code instead of sending it. Outside development Validate() rejects it: a
+// process without a provider still generates and stores every OTP, so the
+// metrics, the audit trail and the step transitions all look healthy while no
+// nasabah can finish buka rekening. That has to be a failed boot, not a
+// discovery made from a support ticket.
+type SMS struct {
+	// Provider names the transport. "twilio" is the one implemented; see
+	// internal/pkg/sms.NewProvider. An unknown value fails the boot rather
+	// than falling back, because a typo here costs every nasabah their OTP.
+	Provider string `env:"SMS_PROVIDER"`
+
+	// AccountSID is Twilio's "AC…" account identifier (the basic-auth user).
+	AccountSID string `env:"SMS_ACCOUNT_SID"`
+
+	// AuthToken is the account auth token. It is a password: never logged,
+	// never echoed into an error, and never committed — keep it in .env.
+	AuthToken string `env:"SMS_AUTH_TOKEN"`
+
+	// Sender is a Twilio number in E.164 ("+1555…") or, preferred for
+	// Indonesian traffic, a Messaging Service SID ("MG…") that picks the route
+	// and sender id per destination operator.
+	Sender string `env:"SMS_SENDER"`
+
+	// BaseURL overrides the API host. It exists for tests and for an
+	// on-premise aggregator later; leave it unset in every real deployment.
+	BaseURL string `env:"SMS_BASE_URL"`
+
+	// Timeout bounds one send. The nasabah is watching a spinner, so a slow
+	// aggregator is cut off rather than allowed to hold the handler open.
+	Timeout time.Duration `env:"SMS_TIMEOUT" envDefault:"10s"`
+
+	// VerifyServiceSID names a Twilio Verify service ("VA…"), required when
+	// Provider is "twilio_verify".
+	//
+	// Verify owns the code: it generates, stores and checks it, so Sender above
+	// is unused on that path. It exists because a Twilio trial account cannot
+	// send a custom message body at all — the Messages API answers 572006 — and
+	// Verify is the one channel that works there.
+	VerifyServiceSID string `env:"SMS_VERIFY_SERVICE_SID"`
+
+	// VerifyBaseURL overrides the Verify host. Deliberately NOT BaseURL above:
+	// Verify lives on verify.twilio.com, Messages on api.twilio.com. Verify used
+	// to read BaseURL, so setting SMS_BASE_URL pointed verifications at the
+	// Messages host, which answers 404 — and a 404 from Verify means "nothing
+	// pending for this number", so every nasabah saw OTP_EXPIRED while the
+	// credentials were perfectly fine. Tests only; leave unset everywhere else.
+	VerifyBaseURL string `env:"SMS_VERIFY_BASE_URL"`
+
+	// VerifyChannels is the allowlist of Verify channels this deployment may
+	// use: "sms", "call", or both. Empty means SMS only.
+	//
+	// It is a deployment setting rather than a request parameter because each
+	// channel has its own Geo Permissions checkbox in the Twilio console —
+	// Messaging for sms, Voice for call — and a channel the console has not
+	// opened fails at the provider no matter who asked for it.
+	VerifyChannels []string `env:"SMS_VERIFY_CHANNELS" envSeparator:","`
+
+	// VerifyLocale is the language Verify renders the code in. Empty means "id".
+	//
+	// Honoured for sms. Verify's voice template does not cover Indonesian, so a
+	// call falls back to English and the transport omits the parameter rather
+	// than pretending otherwise.
+	VerifyLocale string `env:"SMS_VERIFY_LOCALE"`
+
+	// VerifyCodeTTL must match the code expiry set on the Verify service in the
+	// console. Nothing here enforces it — it is what the app is told, so a
+	// mismatch shows up as a countdown that disagrees with the code the nasabah
+	// is holding.
+	VerifyCodeTTL time.Duration `env:"SMS_VERIFY_CODE_TTL" envDefault:"10m"`
 }
 
 // Client holds the values GET /health/config serves to the mobile app. They
@@ -162,6 +266,27 @@ type JWT struct {
 type PIN struct {
 	PrivateKeyPath string `env:"PIN_PRIVATE_KEY_PATH" envDefault:"keys/pin_private.pem"`
 	PublicKeyPath  string `env:"PIN_PUBLIC_KEY_PATH" envDefault:"keys/pin_public.pem"`
+
+	// KeyID menamai pasangan kunci yang sedang aktif. Client mengirimkannya
+	// balik sebagai `encryption_key_id`, jadi rotasi kunci bisa dilacak:
+	// ciphertext yang dibuat dengan kunci lama ditolak dengan sebab yang jelas
+	// alih-alih muncul sebagai "PIN selalu salah".
+	KeyID string `env:"PIN_KEY_ID" envDefault:"pin-key-v1"`
+}
+
+// WebRTC memuat daftar ICE server yang dikirim ke aplikasi bersama
+// signaling_url. Kosong berarti tidak ada TURN: panggilan masih jadi di
+// jaringan yang ramah, dan gagal di seluler ber-NAT ketat. Kredensialnya milik
+// penyedia TURN, jadi tempatnya di environment — bukan di kode.
+type WebRTC struct {
+	STUNURLs       []string `env:"STUN_URLS" envSeparator:","`
+	TURNURLs       []string `env:"TURN_URLS" envSeparator:","`
+	TURNUsername   string   `env:"TURN_USERNAME"`
+	TURNCredential string   `env:"TURN_CREDENTIAL"`
+
+	// TURNTTL adalah masa berlaku kredensial TURN yang dilaporkan ke client,
+	// supaya aplikasi tahu kapan harus meminta yang baru.
+	TURNTTL time.Duration `env:"TURN_CREDENTIAL_TTL" envDefault:"12h"`
 }
 
 type Crypto struct {
@@ -250,6 +375,10 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Crypto.LookupHMACKey) == "" {
 		problems = append(problems, "LOOKUP_HMAC_SECRET is required outside development (phone/email lookups depend on it)")
+	}
+
+	if strings.TrimSpace(c.SMS.Provider) == "" {
+		problems = append(problems, "SMS_PROVIDER is required outside development (without it every OTP is generated, stored and never delivered, so buka rekening stops at OTP_VERIFY)")
 	}
 
 	if !strings.HasPrefix(strings.ToLower(c.SignalingBaseURL), "wss://") {

@@ -46,12 +46,18 @@ dikerjakan sebelum menutup pekerjaan.
 
 ## Informasi yang wajib dikumpulkan lebih dulu
 
-**Jangan mulai menulis kode** sebelum sembilan hal ini punya jawaban tertulis.
-Kalau salah satu belum ada, tanyakan; jangan diisi tebakan yang kelihatan masuk akal.
+**Sembilan hal ini sudah punya jawaban tertulis** di
+**`docs/08-PILIH-KARTU-API-SPEC.md` §17** (per 2026-09-25). Baca §17 dulu —
+jangan menanyakan ulang yang sudah terjawab, dan jangan mengisi tebakan baru di
+atasnya.
 
-Status terkininya dipelihara di **`docs/08-PILIH-KARTU-API-SPEC.md` §17**. Butir
-1, 4, 5, dan 6 sudah terjawab di spec; butir **2, 3, 7, 8, 9 masih kosong**.
-Cek §17 dulu sebelum bertanya — jangan menanyakan ulang yang sudah terjawab.
+Karena repo ini portofolio, butir 2, 3, 7, 8, dan 9 **diputuskan di dalam proyek**,
+bukan diterima dari product owner. Angkanya hidup di
+`migrations/000022_card_catalog_rates.up.sql` beserta alasan tiap pilihan, dan
+**bukan tarif resmi BCA**. Perubahan tarif berikutnya lewat admin API katalog —
+bukan migrasi baru, bukan seeder.
+
+Kalau muncul pertanyaan kesepuluh yang §17 tidak jawab: tanyakan, jangan ditebak.
 
 | # | Yang harus diketahui | Kenapa penting | Sumber |
 | --- | --- | --- | --- |
@@ -65,15 +71,17 @@ Cek §17 dulu sebelum bertanya — jangan menanyakan ulang yang sudah terjawab.
 | 8 | Format `card_type` yang dipakai core banking saat permintaan cetak kartu | Kalau berbeda dengan enum kita, butuh tabel pemetaan | Tim core banking |
 | 9 | Berapa lama jejak audit pemilihan kartu harus disimpan | Menentukan retensi `onboarding_card_selection_log` | Compliance |
 
-Jawaban 2 dan 3 yang paling sering dilewati, dan paling berbahaya. **Jangan**
-menyalin angka dari `strings.xml` client ke database produksi tanpa konfirmasi —
-angka itu dibuat untuk desain layar.
+Jawaban 2 dan 3 tetap yang paling berbahaya kalau salah. **Jangan** menyalin angka
+dari `strings.xml` client (`14000`/`16000`/`19000`) ke database — angka itu dibuat
+untuk desain layar, dan karena `monthly_admin_fee_shown` ikut tercatat di audit
+log, angka yang salah menjadi bukti tertulis bahwa nasabah diberi tahu tarif yang
+keliru.
 
-Perangkapnya nyata: contoh payload di `docs/08` §4 memuat `14000`, `16000`, dan
-`19000` — persis angka `strings.xml` itu. Spec sudah menandainya sebagai
-placeholder (banner di kepala dokumen dan peringatan di §4), tapi angka itu tetap
-terlihat seperti data sungguhan bagi yang membaca cepat. **Yang mengikat dari §4
-adalah nama field dan bentuk objek, bukan nominalnya.**
+Perangkap lamanya sudah ditutup: contoh payload di `docs/08` §4 sekarang memuat
+angka yang **sama dengan yang benar-benar disajikan API** (`15000`/`17000`/`20000`,
+dari migrasi 000022), bukan lagi angka `strings.xml`. Jadi contoh dan kenyataan
+tidak lagi bisa dibedakan secara keliru — tapi yang mengikat dari §4 tetap **nama
+field dan bentuk objek**.
 
 Konteks teknis yang sudah pasti dan tidak perlu ditanyakan:
 

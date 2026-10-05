@@ -126,6 +126,45 @@ type seedUser struct {
 	DeviceID    string
 	DeviceModel string
 	Accounts    []seedAccount
+
+	// Tier layanan. Kosong diperlakukan REGULER oleh tierOf — client
+	// menyembunyikan badge untuk tier itu.
+	Tier string
+
+	// Cards kartu Paspor milik nasabah ini. Kosong berarti nasabah tanpa kartu,
+	// dan itu keadaan yang memang perlu ada di data dev: GET /account/cards
+	// wajib membalas array kosong untuk mereka, bukan 404.
+	//
+	// Daftar, bukan satu kartu: layar Profil Saya menampilkan semua kartu, dan
+	// satu kartu per nasabah membuat jalur "kartu kedua", is_primary, dan kartu
+	// terblokir tidak pernah tersentuh sampai ada nasabah sungguhan.
+	Cards []seedCard
+}
+
+// seedCard adalah kartu milik nasabah, bukan katalog. Katalognya card_products.
+type seedCard struct {
+	ID           uuid.UUID
+	CardType     string
+	MaskedNumber string
+	// ValidThruMonth saja yang ditetapkan; tahunnya dihitung dari waktu seed
+	// supaya data dev tidak pelan-pelan menjadi kartu kedaluwarsa.
+	ValidThruMonth int
+
+	// AccountIndex menunjuk rekening mana di Accounts yang kartu ini menempel.
+	// Kartu menempel pada rekening, bukan pada nasabah: satu orang bisa punya
+	// beberapa rekening dengan kartu berbeda.
+	AccountIndex int
+
+	// Status dan BlockedReason ada supaya jalur kartu terblokir punya data
+	// tanpa harus memblokir kartu lebih dulu lewat API — dan pemblokiran itu
+	// tidak bisa dibatalkan dari aplikasi, jadi tester yang mencobanya akan
+	// kehilangan satu-satunya kartu ACTIVE-nya.
+	Status        string
+	BlockedReason string
+
+	IsPrimary            bool
+	DebitOnlineEnabled   bool
+	InternationalEnabled bool
 }
 
 type seedAccount struct {
@@ -156,6 +195,35 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 			Email:       "nurholis@example.com",
 			DeviceID:    "device-nurholis-001",
 			DeviceModel: "iPhone 15 Pro Max",
+			Tier:        "PRIORITAS",
+			Cards: []seedCard{
+				{
+					ID:                   uuid.MustParse("00000000-0000-0000-0000-400000000001"),
+					CardType:             "PASPOR_GOLD",
+					MaskedNumber:         "•••• •••• •••• 7890",
+					ValidThruMonth:       12,
+					AccountIndex:         0,
+					Status:               "ACTIVE",
+					IsPrimary:            true,
+					DebitOnlineEnabled:   true,
+					InternationalEnabled: true,
+				},
+				{
+					// Kartu kedua di rekening kedua: tanpa ini, urutan
+					// is_primary dan tampilan daftar lebih dari satu kartu
+					// tidak pernah terlihat di dev.
+					ID:                 uuid.MustParse("00000000-0000-0000-0000-400000000003"),
+					CardType:           "PASPOR_PLATINUM",
+					MaskedNumber:       "•••• •••• •••• 1188",
+					ValidThruMonth:     9,
+					AccountIndex:       1,
+					Status:             "ACTIVE",
+					DebitOnlineEnabled: true,
+					// Transaksi luar negeri mati sampai nasabah menyalakannya
+					// sendiri — default yang sama dengan migrasi 000021.
+					InternationalEnabled: false,
+				},
+			},
 			Accounts: []seedAccount{
 				{
 					ID:            uuid.MustParse("00000000-0000-0000-0000-100000000001"),
@@ -179,6 +247,31 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 			Email:       "budi@example.com",
 			DeviceID:    "device-budi-001",
 			DeviceModel: "Samsung Galaxy S24 Ultra",
+			// Tier kosong = REGULER. Badge tier harus hilang untuk nasabah ini.
+			Cards: []seedCard{
+				{
+					ID:                 uuid.MustParse("00000000-0000-0000-0000-400000000002"),
+					CardType:           "PASPOR_BLUE",
+					MaskedNumber:       "•••• •••• •••• 3210",
+					ValidThruMonth:     8,
+					AccountIndex:       0,
+					Status:             "ACTIVE",
+					IsPrimary:          true,
+					DebitOnlineEnabled: true,
+				},
+				{
+					// Satu kartu TERBLOKIR di data dev. Client punya tampilan
+					// sendiri untuk status ini, dan memblokir kartu lewat API
+					// untuk mengujinya tidak bisa dibatalkan dari aplikasi.
+					ID:             uuid.MustParse("00000000-0000-0000-0000-400000000004"),
+					CardType:       "PASPOR_BLUE",
+					MaskedNumber:   "•••• •••• •••• 4471",
+					ValidThruMonth: 3,
+					AccountIndex:   0,
+					Status:         "BLOCKED",
+					BlockedReason:  "LOST",
+				},
+			},
 			Accounts: []seedAccount{
 				{
 					ID:            uuid.MustParse("00000000-0000-0000-0000-200000000001"),
@@ -196,6 +289,9 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 			Email:       "siti@example.com",
 			DeviceID:    "device-siti-001",
 			DeviceModel: "iPhone 14",
+			Tier:        "SOLITAIRE",
+			// Cards sengaja kosong: satu nasabah tanpa kartu supaya empty state
+			// GET /account/cards bisa dicoba tanpa mengubah data.
 			Accounts: []seedAccount{
 				{
 					ID:            uuid.MustParse("00000000-0000-0000-0000-300000000001"),
@@ -220,10 +316,10 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 		_, err := pool.Exec(ctx, `
 			INSERT INTO users (id, full_name, display_name, pin_hash, pin_salt,
 				phone_encrypted, phone_hash, email_encrypted, email_hash,
-				status, created_at, updated_at)
+				status, tier, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5,
 				pgp_sym_encrypt($6, $7), $8, pgp_sym_encrypt($9, $7), $10,
-				'ACTIVE', $11, $11)
+				'ACTIVE', $12, $11, $11)
 			ON CONFLICT (id) DO UPDATE SET
 				full_name = EXCLUDED.full_name,
 				display_name = EXCLUDED.display_name,
@@ -233,10 +329,11 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 				phone_hash = EXCLUDED.phone_hash,
 				email_encrypted = EXCLUDED.email_encrypted,
 				email_hash = EXCLUDED.email_hash,
+				tier = EXCLUDED.tier,
 				updated_at = EXCLUDED.updated_at`,
 			u.ID, u.FullName, displayName(u.FullName), pinHash, pinSaltFrom(pinHash),
 			u.Phone, passphrase, hasher.Hash(u.Phone), u.Email, hasher.Hash(u.Email),
-			now)
+			now, tierOf(u))
 		if err != nil {
 			log.Fatalf("insert user %s: %v", u.FullName, err)
 		}
@@ -261,26 +358,49 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 		// fail the unique constraint on every run. RETURNING id then gives
 		// the row that actually exists, so mutations attach to it rather than
 		// to an id the seeder merely hoped for.
+		//
+		// balance is the one column this upsert does NOT force back to the seed
+		// constant. Resetting it used to leave `make ledger-check` reporting a
+		// permanent violation: a re-seed rewound accounts.balance while
+		// account_mutations and the ledger entries written by real transfers
+		// stayed where they were, so v_ledger_reconciliation reported a drift
+		// exactly equal to every transfer made since the previous seed. The
+		// money invariant check then failed for a reason that had nothing to do
+		// with the money code — the worst kind of broken check, because people
+		// learn to ignore it.
+		//
+		// An account that has never moved still gets the seed balance, so a
+		// fresh database looks exactly as before.
 		for i, a := range u.Accounts {
 			var accountID uuid.UUID
+			var balance decimal.Decimal
 			err = pool.QueryRow(ctx, `
 				INSERT INTO accounts (id, user_id, account_number, account_type, account_label,
 					balance, currency, status, is_primary, owner_type, created_at, updated_at)
 				VALUES ($1, $2, $3, 'TAHAPAN', $4, $5, 'IDR', 'ACTIVE', $6, 'CUSTOMER', $7, $7)
 				ON CONFLICT (account_number) DO UPDATE SET
 					user_id = EXCLUDED.user_id,
-					balance = EXCLUDED.balance,
+					balance = CASE
+						WHEN EXISTS (SELECT 1 FROM account_mutations m WHERE m.account_id = accounts.id)
+						THEN accounts.balance
+						ELSE EXCLUDED.balance
+					END,
 					account_label = EXCLUDED.account_label,
 					is_primary = EXCLUDED.is_primary,
 					updated_at = EXCLUDED.updated_at
-				RETURNING id`,
+				RETURNING id, balance`,
 				a.ID, u.ID, a.AccountNumber, a.AccountLabel, a.Balance, i == 0, now,
-			).Scan(&accountID)
+			).Scan(&accountID, &balance)
 			if err != nil {
 				log.Fatalf("insert account %s: %v", a.AccountNumber, err)
 			}
 			u.Accounts[i].ID = accountID
-			log.Printf("    account: %s (%s) balance: %s", a.AccountNumber, a.AccountLabel, a.Balance.String())
+			if balance.Equal(a.Balance) {
+				log.Printf("    account: %s (%s) balance: %s", a.AccountNumber, a.AccountLabel, balance.String())
+			} else {
+				log.Printf("    account: %s (%s) balance: %s (dipertahankan — akun punya riwayat mutasi, saldo seed %s tidak dipakai)",
+					a.AccountNumber, a.AccountLabel, balance.String(), a.Balance.String())
+			}
 		}
 
 		// Insert default transaction limits
@@ -320,139 +440,212 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 	// Seed promotions
 	seedPromotions(ctx, pool, now)
 
-	// Seed katalog kartu Paspor (development saja — lihat fungsinya)
-	seedCardProducts(ctx, pool)
+	// Katalog kartu Paspor datang dari migrasi 000022, bukan dari seeder.
+	// Di sini hanya diperiksa supaya kegagalan di bawah punya sebab yang jelas.
+	verifyCardCatalog(ctx, pool)
+
+	// Kartu milik nasabah butuh katalog sudah ada: account_cards.card_type punya
+	// foreign key ke card_products. Kalau migrasi 000022 belum dijalankan, baris
+	// log di verifyCardCatalog yang menjelaskannya.
+	seedAccountCards(ctx, pool, users, now)
+
+	// Petugas CS untuk menguji video call e-KYC dari ujung ke ujung.
+	seedCSAgents(ctx, pool, hashPIN)
 }
 
-// seedCardProducts menanam katalog kartu untuk pengembangan lokal.
+// seedCSAgents menanam satu petugas CS untuk pengujian lokal video call.
 //
-// ANGKA DI SINI PALSU DAN SENGAJA TERLIHAT PALSU. Biaya dan limit resmi belum
-// diputuskan product owner — lihat docs/08-PILIH-KARTU-API-SPEC.md §17. Nilai
-// berulang seperti 11111 / 2222222 dipilih supaya siapa pun yang melihatnya di
-// layar atau di database langsung tahu itu bukan tarif sungguhan.
+// DIGERBANGI APP_ENV, dan itu bukan formalitas: isinya kredensial, bukan data referensi.
+// Seeder ini tidak punya gerbang environment sendiri — ia menanam nasabah ber-PIN 123456
+// ke database mana pun yang ditunjuk DATABASE_URL — jadi tanpa gerbang di sini satu kali
+// `make seed` yang salah arah akan membuat kunci petugas yang diketahui umum bisa dipakai
+// mengambil panggilan dan menandatangani hasil verifikasi identitas.
 //
-// Godaannya adalah memakai 14000/16000/19000 dari contoh §4, karena kelihatan
-// lebih "nyata". Justru itu bahayanya: angka-angka itu berasal dari strings.xml
-// client — data desain layar — dan kalau bocor ke staging tidak ada yang curiga.
+// Di luar development, baris cs_agents dibuat oleh yang mengoperasikan integrasi CS,
+// dengan kunci acak, lewat jalur yang sama dengan pendistribusian INTERNAL_API_KEY.
+func seedCSAgents(ctx context.Context, pool *pgxpool.Pool, hash func(string) string) {
+	if env := os.Getenv("APP_ENV"); env != "development" {
+		log.Printf("cs_agents dilewati: APP_ENV=%q, bukan development", env)
+		return
+	}
+
+	const (
+		employeeID = "CS-1042"
+		name       = "Sarah Adisti"
+		devAPIKey  = "dev-agent-key"
+	)
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO cs_agents (employee_id, name, api_key_hash, is_active)
+		VALUES ($1, $2, $3, true)
+		ON CONFLICT (employee_id) DO UPDATE
+		SET name = EXCLUDED.name,
+		    api_key_hash = EXCLUDED.api_key_hash,
+		    is_active = true,
+		    updated_at = now()`,
+		employeeID, name, hash(devAPIKey),
+	)
+	if err != nil {
+		log.Fatalf("seed cs_agents: %v", err)
+	}
+	log.Printf("cs agent: %s (%s), X-Agent-API-Key: %s", employeeID, name, devAPIKey)
+}
+
+// tierOf memetakan tier kosong ke REGULER. Kolom users.tier NOT NULL, dan
+// REGULER adalah default skema — bukan tier istimewa.
+func tierOf(u seedUser) string {
+	if u.Tier == "" {
+		return "REGULER"
+	}
+	return u.Tier
+}
+
+// verifyCardCatalog memeriksa katalog kartu, tidak menanamnya.
 //
-// Fungsi ini menolak jalan di luar development. Katalog produksi diisi lewat
-// admin API, bukan seeder.
-func seedCardProducts(ctx context.Context, pool *pgxpool.Pool) {
+// Katalog dulu ditanam di sini dengan angka yang sengaja palsu (11111 / 22222 /
+// 33333), digerbangi APP_ENV supaya tidak bocor ke staging. Akibatnya staging
+// tidak pernah punya katalog sama sekali, dan angka kartu hidup di dua tempat.
+//
+// Sekarang katalog adalah data referensi yang dibawa migrasi
+// 000022_card_catalog_rates: satu sumber angka, ikut ke setiap environment,
+// dan perubahan tarif berikutnya lewat admin API — bukan lewat seeder.
+//
+// Yang tersisa di sini hanya penjaga: kalau katalognya kosong, seedAccountCards
+// di bawah akan gagal dengan pelanggaran foreign key, dan pesan itu jauh lebih
+// sulit dibaca daripada baris log ini.
+func verifyCardCatalog(ctx context.Context, pool *pgxpool.Pool) {
+	var cards, options int
+	var version string
+
+	err := pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM card_products WHERE is_active),
+		       (SELECT count(*) FROM product_card_options),
+		       (SELECT version_date || '.' || counter FROM card_catalog_version)`,
+	).Scan(&cards, &options, &version)
+	if err != nil {
+		log.Printf("  warn: baca katalog kartu: %v", err)
+		return
+	}
+
+	if cards == 0 {
+		log.Printf("  card catalog: KOSONG — jalankan `make migrate-up` (migrasi 000022). " +
+			"Kartu milik nasabah di bawah akan gagal karena foreign key ke card_products.")
+		return
+	}
+
+	log.Printf("  card catalog: %d kartu aktif, %d opsi produk, versi %s "+
+		"(dari migrasi 000022 — angka portofolio, bukan tarif resmi BCA)",
+		cards, options, version)
+}
+
+// seedAccountCards menanam kartu MILIK nasabah — bukan katalog.
+//
+// Terikat gerbang environment yang sama dengan seedCardProducts, dan bukan demi
+// konsistensi belaka: account_cards.card_type merujuk card_products, yang hanya
+// terisi di development. Di luar dev, kartu nasabah datang dari core banking,
+// bukan dari seeder.
+//
+// Nomor kartu di sini tersamar, dan itu bukan pilihan gaya: constraint
+// account_card_number_masked (migrasi 000021) menolak baris yang memuat tujuh
+// angka berurutan. Menulis PAN lengkap di seeder akan GAGAL di database, tidak
+// lolos diam-diam.
+func seedAccountCards(ctx context.Context, pool *pgxpool.Pool, users []seedUser, now time.Time) {
 	env := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
 	if env == "" {
 		env = "development"
 	}
 	if env != "development" && env != "test" {
-		log.Printf("  card products: DILEWATI (APP_ENV=%s) — angka seed adalah placeholder dev", env)
+		log.Printf("  account cards: DILEWATI (APP_ENV=%s) — kartu nasabah berasal dari core banking", env)
 		return
 	}
 
-	cards := []struct {
-		Type          string
-		Name          string
-		Tier          string
-		Style         string
-		AdminFee      int64
-		IssuanceFee   int64
-		ReplaceFee    int64
-		LimitCash     int64
-		LimitBCA      int64
-		LimitInterbnk int64
-		LimitDebit    int64
-		DeliveryMin   int
-		DeliveryMax   int
-		MinAge        int
-		MinDeposit    int64
-	}{
-		{"PASPOR_BLUE", "Blue Mastercard", "DEBIT", "BLUE",
-			11111, 0, 11111, 1111111, 11111111, 1111111, 11111111, 3, 7, 17, 500000},
-		{"PASPOR_GOLD", "Gold Mastercard", "DEBIT", "GOLD",
-			22222, 0, 22222, 2222222, 22222222, 2222222, 22222222, 3, 7, 17, 500000},
-		{"PASPOR_PLATINUM", "Platinum Mastercard", "PLATINUM_DEBIT", "PLATINUM",
-			33333, 0, 33333, 3333333, 33333333, 3333333, 33333333, 5, 10, 17, 500000},
-	}
+	// Kartu dev berlaku tiga tahun dari waktu seed. Tahun yang dipatok akan
+	// pelan-pelan berubah menjadi kartu kedaluwarsa dan menutupi jalur ACTIVE
+	// yang justru paling sering diuji.
+	validYear := now.Year() + 3
 
-	for _, c := range cards {
-		_, err := pool.Exec(ctx, `
-			INSERT INTO card_products (card_type, name, tier_key, style,
-				fee_monthly_admin, fee_card_issuance, fee_card_replacement,
-				limit_cash_withdrawal, limit_transfer_bca,
-				limit_transfer_interbank, limit_debit_purchase,
-				delivery_days_min, delivery_days_max, min_age, min_initial_deposit)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-			ON CONFLICT (card_type) DO UPDATE SET
-				name = EXCLUDED.name,
-				tier_key = EXCLUDED.tier_key,
-				style = EXCLUDED.style,
-				fee_monthly_admin = EXCLUDED.fee_monthly_admin,
-				fee_card_issuance = EXCLUDED.fee_card_issuance,
-				fee_card_replacement = EXCLUDED.fee_card_replacement,
-				limit_cash_withdrawal = EXCLUDED.limit_cash_withdrawal,
-				limit_transfer_bca = EXCLUDED.limit_transfer_bca,
-				limit_transfer_interbank = EXCLUDED.limit_transfer_interbank,
-				limit_debit_purchase = EXCLUDED.limit_debit_purchase,
-				delivery_days_min = EXCLUDED.delivery_days_min,
-				delivery_days_max = EXCLUDED.delivery_days_max,
-				min_age = EXCLUDED.min_age,
-				min_initial_deposit = EXCLUDED.min_initial_deposit,
-				updated_at = NOW()`,
-			c.Type, c.Name, c.Tier, c.Style,
-			c.AdminFee, c.IssuanceFee, c.ReplaceFee,
-			c.LimitCash, c.LimitBCA, c.LimitInterbnk, c.LimitDebit,
-			c.DeliveryMin, c.DeliveryMax, c.MinAge, c.MinDeposit)
-		if err != nil {
-			log.Printf("  warn: insert card product %s: %v", c.Type, err)
+	seeded := 0
+	withoutCards := 0
+	for _, u := range users {
+		if len(u.Cards) == 0 {
+			withoutCards++
+			continue
+		}
+		if len(u.Accounts) == 0 {
+			log.Printf("  warn: %s punya kartu tapi tidak punya rekening — dilewati", u.FullName)
+			continue
+		}
+
+		for _, c := range u.Cards {
+			// Rekening yang ditunjuk kartu. ID-nya sudah ditulis balik dari
+			// RETURNING id, jadi kartu menempel pada baris yang BENAR-BENAR
+			// ada — bukan pada id yang seeder harapkan.
+			idx := c.AccountIndex
+			if idx < 0 || idx >= len(u.Accounts) {
+				log.Printf("  warn: kartu %s menunjuk rekening ke-%d yang tidak ada pada %s — dipasang ke rekening utama",
+					c.MaskedNumber, idx, u.FullName)
+				idx = 0
+			}
+			accountID := u.Accounts[idx].ID
+
+			status := c.Status
+			if status == "" {
+				status = "ACTIVE"
+			}
+
+			// blocked_reason dan blocked_at hanya terisi untuk kartu terblokir.
+			// Menulis alasan pada kartu aktif akan lolos constraint tapi
+			// membuat response memuat alasan blokir untuk kartu yang hidup.
+			var blockedReason *string
+			var blockedAt *time.Time
+			if status == "BLOCKED" {
+				reason := c.BlockedReason
+				if reason == "" {
+					reason = "LOST"
+				}
+				blockedReason = &reason
+				blockedTime := now.AddDate(0, 0, -2)
+				blockedAt = &blockedTime
+			}
+
+			_, err := pool.Exec(ctx, `
+				INSERT INTO account_cards (id, user_id, account_id, card_type,
+					masked_number, cardholder_name, valid_thru_month, valid_thru_year,
+					status, blocked_reason, blocked_at,
+					debit_online_enabled, international_enabled, is_primary,
+					created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+					$9, $10, $11, $12, $13, $14, $15, $15)
+				ON CONFLICT (id) DO UPDATE SET
+					account_id = EXCLUDED.account_id,
+					card_type = EXCLUDED.card_type,
+					masked_number = EXCLUDED.masked_number,
+					cardholder_name = EXCLUDED.cardholder_name,
+					valid_thru_month = EXCLUDED.valid_thru_month,
+					valid_thru_year = EXCLUDED.valid_thru_year,
+					status = EXCLUDED.status,
+					blocked_reason = EXCLUDED.blocked_reason,
+					blocked_at = EXCLUDED.blocked_at,
+					debit_online_enabled = EXCLUDED.debit_online_enabled,
+					international_enabled = EXCLUDED.international_enabled,
+					is_primary = EXCLUDED.is_primary,
+					updated_at = EXCLUDED.updated_at`,
+				c.ID, u.ID, accountID, c.CardType,
+				c.MaskedNumber, u.FullName, c.ValidThruMonth, validYear,
+				status, blockedReason, blockedAt,
+				c.DebitOnlineEnabled, c.InternationalEnabled, c.IsPrimary,
+				now)
+			if err != nil {
+				log.Fatalf("insert account card for %s: %v", u.FullName, err)
+			}
+			seeded++
+			log.Printf("    card: %s %s (%s) %s valid thru %02d/%d",
+				u.FullName, c.MaskedNumber, c.CardType, status, c.ValidThruMonth, validYear)
 		}
 	}
 
-	// Pemetaan ke produk.
-	//
-	// Ketiga produk diisi supaya flow pilih kartu bisa dicoba pada semuanya di
-	// development. Lineup di bawah adalah TEBAKAN untuk dev, bukan penawaran
-	// resmi: Xpresi dan TabunganKu memang produk dengan tarif lebih rendah, jadi
-	// keduanya diberi kartu kelas bawah saja. Jawaban resminya §17 butir 1 —
-	// jangan menyalin daftar ini ke staging atau produksi.
-	options := []struct {
-		Product  string
-		Card     string
-		Order    int
-		Default  bool
-		Popular  bool
-		BadgeKey string
-	}{
-		{"TAHAPAN_BCA", "PASPOR_BLUE", 1, true, true, "RECOMMENDED_BEGINNER"},
-		{"TAHAPAN_BCA", "PASPOR_GOLD", 2, false, false, "FLEXIBLE_TRANSACTION"},
-		{"TAHAPAN_BCA", "PASPOR_PLATINUM", 3, false, false, "MAX_LIMIT"},
-
-		// Xpresi: dua kartu, Blue sebagai default.
-		{"TAHAPAN_XPRESI", "PASPOR_BLUE", 1, true, true, "RECOMMENDED_BEGINNER"},
-		{"TAHAPAN_XPRESI", "PASPOR_GOLD", 2, false, false, "FLEXIBLE_TRANSACTION"},
-
-		// TabunganKu: satu kartu saja. Produk setoran awal Rp20 ribu tidak
-		// masuk akal ditawari kartu dengan limit tertinggi.
-		{"TABUNGANKU", "PASPOR_BLUE", 1, true, false, "RECOMMENDED_BEGINNER"},
-	}
-
-	for _, o := range options {
-		_, err := pool.Exec(ctx, `
-			INSERT INTO product_card_options (product_type, card_type, display_order,
-				is_default, is_popular, badge_key)
-			VALUES ($1,$2,$3,$4,$5,$6)
-			ON CONFLICT (product_type, card_type, COALESCE(region_code, ''))
-			DO UPDATE SET
-				display_order = EXCLUDED.display_order,
-				is_default = EXCLUDED.is_default,
-				is_popular = EXCLUDED.is_popular,
-				badge_key = EXCLUDED.badge_key,
-				updated_at = NOW()`,
-			o.Product, o.Card, o.Order, o.Default, o.Popular, o.BadgeKey)
-		if err != nil {
-			log.Printf("  warn: insert card option %s/%s: %v", o.Product, o.Card, err)
-		}
-	}
-
-	log.Printf("  card products: %d seeded, %d options (ANGKA PLACEHOLDER DEV)",
-		len(cards), len(options))
+	log.Printf("  account cards: %d kartu untuk %d nasabah, %d nasabah sengaja tanpa kartu",
+		seeded, len(users)-withoutCards, withoutCards)
 }
 
 func seedMutations(ctx context.Context, pool *pgxpool.Pool, user seedUser, now time.Time) {

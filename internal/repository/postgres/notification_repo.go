@@ -49,35 +49,43 @@ func (r *NotificationRepo) Insert(ctx context.Context, e notify.Entry) error {
 	return nil
 }
 
-// ListByUserID returns paginated notifications using keyset pagination.
+// ListByUserID returns paginated notifications using keyset pagination,
+// optionally narrowed to a set of types.
 // Returns limit+1 rows so caller can compute has_more.
-func (r *NotificationRepo) ListByUserID(ctx context.Context, userID uuid.UUID, cursor *uuid.UUID, limit int) ([]account.Notification, error) {
-	var query string
-	var args []any
+func (r *NotificationRepo) ListByUserID(ctx context.Context, userID uuid.UUID, types []string, cursor *uuid.UUID, limit int) ([]account.Notification, error) {
+	args := []any{userID}
+	where := "WHERE user_id = $1"
+	argIdx := 2
+
+	// = ANY($n) rather than an IN list built by hand: the values come from the
+	// query string, and a hand-built list is where an injection gets in.
+	if len(types) > 0 {
+		where += fmt.Sprintf(" AND type = ANY($%d)", argIdx)
+		args = append(args, types)
+		argIdx++
+	}
 
 	if cursor != nil {
-		// Keyset pagination: get created_at of cursor row, then fetch older
-		query = `
-			SELECT id, user_id, type, title, body, deep_link,
-			       is_read, read_at, metadata, created_at
-			FROM notifications
-			WHERE user_id = $1
-			  AND (created_at, id) < (
-			      SELECT created_at, id FROM notifications WHERE id = $2
-			  )
-			ORDER BY created_at DESC, id DESC
-			LIMIT $3`
-		args = []any{userID, *cursor, limit}
-	} else {
-		query = `
-			SELECT id, user_id, type, title, body, deep_link,
-			       is_read, read_at, metadata, created_at
-			FROM notifications
-			WHERE user_id = $1
-			ORDER BY created_at DESC, id DESC
-			LIMIT $2`
-		args = []any{userID, limit}
+		// Keyset pagination: compare against the cursor row's (created_at, id).
+		// The subquery is NOT scoped to user_id on purpose — the outer
+		// predicate already is, and a cursor naming someone else's row simply
+		// finds nothing rather than paging through their notifications.
+		where += fmt.Sprintf(` AND (created_at, id) < (
+			      SELECT created_at, id FROM notifications WHERE id = $%d
+			  )`, argIdx)
+		args = append(args, *cursor)
+		argIdx++
 	}
+
+	query := fmt.Sprintf(`
+		SELECT id, user_id, type, title, body, deep_link,
+		       is_read, read_at, metadata, created_at
+		FROM notifications
+		%s
+		ORDER BY created_at DESC, id DESC
+		LIMIT $%d`, where, argIdx)
+
+	args = append(args, limit)
 
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {

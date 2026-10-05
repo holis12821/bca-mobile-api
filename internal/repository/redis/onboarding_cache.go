@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/sms"
 )
 
 const onboardingSessionTTL = 24 * time.Hour
@@ -189,10 +192,17 @@ func (rl *OCRRateLimiter) CheckOCRAttempt(ctx context.Context, sessionID string)
 // OnboardingOTPCache manages OTP storage and attempt tracking.
 type OnboardingOTPCache struct {
 	client *goredis.Client
+
+	// phoneHasher keys the per-number send budget. HMAC and not plain SHA-256
+	// for the same reason users.phone_hash is: there are only ~10^10 Indonesian
+	// mobile numbers, so an unkeyed digest of one is recoverable by anybody who
+	// can list Redis keys. Nil is tolerated (bare wiring in tests) and falls
+	// back to an unkeyed digest, which still never stores the number itself.
+	phoneHasher *crypto.HMACHasher
 }
 
-func NewOnboardingOTPCache(client *goredis.Client) *OnboardingOTPCache {
-	return &OnboardingOTPCache{client: client}
+func NewOnboardingOTPCache(client *goredis.Client, phoneHasher *crypto.HMACHasher) *OnboardingOTPCache {
+	return &OnboardingOTPCache{client: client, phoneHasher: phoneHasher}
 }
 
 func otpKey(sessionID string) string {
@@ -209,6 +219,24 @@ func otpBlockKey(sessionID string) string {
 
 func otpResendKey(sessionID string) string {
 	return fmt.Sprintf("onboarding:otp_resend:%s", sessionID)
+}
+
+// otpPhoneSendKey keys the hourly SMS budget of one destination number.
+//
+// Deliberately NOT scoped by session: the whole point is that it survives the
+// attacker throwing the session away. The number is normalised first, or
+// "08123…" and "+628123…" would be two budgets for one handset.
+func (c *OnboardingOTPCache) otpPhoneSendKey(phone string) string {
+	normalized, err := sms.NormalizePhone(phone)
+	if err != nil {
+		// Unroutable numbers never reach the gateway anyway. Keying on the raw
+		// input keeps them counted rather than silently unlimited.
+		normalized = phone
+	}
+	if c.phoneHasher != nil {
+		return fmt.Sprintf("onboarding:otp_phone_send:%s", c.phoneHasher.Hash(normalized))
+	}
+	return fmt.Sprintf("onboarding:otp_phone_send:%x", sha256.Sum256([]byte(normalized)))
 }
 
 func (c *OnboardingOTPCache) StoreOTP(ctx context.Context, sessionID, otpHash string, ttl time.Duration) (time.Time, error) {
@@ -334,6 +362,50 @@ func (c *OnboardingOTPCache) ResendWindowRemaining(ctx context.Context, sessionI
 // previous one's resends.
 func (c *OnboardingOTPCache) ResetResend(ctx context.Context, sessionID string) error {
 	return c.client.Del(ctx, otpResendKey(sessionID)).Err()
+}
+
+// otpPhoneSendWindow is the hour a destination number's SMS budget lives in.
+// Fixed, not sliding: a sliding window would need the timestamp of every send
+// kept, and the cap only has to make farming unprofitable, not exact.
+const otpPhoneSendWindow = time.Hour
+
+// IncrPhoneSend counts one SMS against the destination number's hourly budget.
+//
+// This counter is what the per-session resend quota cannot do. The session
+// quota is keyed by session_id, and a session is free: an attacker creates a
+// new one per SMS and pays nothing, while the Twilio invoice and the victim's
+// handset both belong to us. Counting per number is the only place that adds up.
+func (c *OnboardingOTPCache) IncrPhoneSend(ctx context.Context, phone string) (int64, error) {
+	key := c.otpPhoneSendKey(phone)
+	count, err := c.client.Incr(ctx, key).Result()
+	if err != nil {
+		return 0, fmt.Errorf("incr otp phone send: %w", err)
+	}
+	if count == 1 {
+		// Same failure handling as the other counters here: a key with no TTL
+		// is a permanent block on that number, so drop it rather than leave it.
+		if err := c.client.Expire(ctx, key, otpPhoneSendWindow).Err(); err != nil {
+			slog.Error("set otp phone send ttl failed", "error", err)
+			if delErr := c.client.Del(ctx, key).Err(); delErr != nil {
+				slog.Error("drop otp phone send key failed", "error", delErr)
+			}
+			return 0, fmt.Errorf("set otp phone send ttl: %w", err)
+		}
+	}
+	return count, nil
+}
+
+// PhoneSendWindowRemaining is how long until the number's budget refills.
+// Feeds details.retry_after_seconds.
+func (c *OnboardingOTPCache) PhoneSendWindowRemaining(ctx context.Context, phone string) (time.Duration, error) {
+	ttl, err := c.client.TTL(ctx, c.otpPhoneSendKey(phone)).Result()
+	if err != nil {
+		return 0, fmt.Errorf("ttl otp phone send: %w", err)
+	}
+	if ttl <= 0 {
+		return 0, nil
+	}
+	return ttl, nil
 }
 
 // BiometricRateLimiter rate limits biometric attempts per session.
@@ -463,6 +535,20 @@ func (c *VideoCallQueueCache) Position(ctx context.Context, queueID string) (int
 
 func (c *VideoCallQueueCache) Length(ctx context.Context) (int64, error) {
 	return c.client.ZCard(ctx, videoCallQueueKey).Result()
+}
+
+// List mengembalikan queue_id yang masih mengantre, urut dari yang paling depan.
+//
+// Dipakai saat satu panggilan selesai: posisi semua yang di belakangnya bergeser, dan
+// tanpa daftar ini tidak ada cara memberi tahu mereka. Antrean video call dibatasi jam
+// operasional 06:00-22:00 dan satu agent per panggilan, jadi panjangnya puluhan — bukan
+// skala yang menuntut paginasi.
+func (c *VideoCallQueueCache) List(ctx context.Context) ([]string, error) {
+	ids, err := c.client.ZRange(ctx, videoCallQueueKey, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("zrange: %w", err)
+	}
+	return ids, nil
 }
 
 func (c *VideoCallQueueCache) IncrDailyCounter(ctx context.Context) (int64, error) {

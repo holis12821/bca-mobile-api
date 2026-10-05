@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"testing"
 	"time"
@@ -80,4 +81,35 @@ func TestValidatePINTimestamp_FutureSkew(t *testing.T) {
 	payload := &crypto.PINPayload{TS: time.Now().Add(2 * time.Minute).Unix()}
 	err := crypto.ValidatePINTimestamp(payload, crypto.MaxPINTimestampSkew)
 	assert.Error(t, err, "future timestamp >60s should be rejected")
+}
+
+// The padding is part of the contract: the client encrypts with
+// RSA/ECB/OAEPWithSHA-256AndMGF1Padding, and PKCS#1 v1.5 must NOT decrypt. The
+// two are indistinguishable from the outside — a v1.5 client sees only "PIN
+// always wrong" — so this pins the one thing that tells them apart.
+func TestRSA_RejectsPKCS1v15Ciphertext(t *testing.T) {
+	kp := generateTestRSAKeyPair(t)
+
+	plaintext := []byte(`{"pin":"123456","nonce":"n","ts":1}`)
+	legacy, err := rsa.EncryptPKCS1v15(rand.Reader, kp.PublicKey, plaintext)
+	require.NoError(t, err)
+
+	_, err = kp.DecryptPIN(base64.StdEncoding.EncodeToString(legacy))
+	assert.Error(t, err, "PKCS#1 v1.5 ciphertext must not decrypt: the server is OAEP-SHA256 only")
+}
+
+func TestRSA_KeyIDMatching(t *testing.T) {
+	kp := generateTestRSAKeyPair(t)
+
+	// No PIN_KEY_ID configured falls back to the id the API published before
+	// the field existed, so a client that hardcoded it keeps working.
+	assert.Equal(t, crypto.DefaultPINKeyID, kp.ActiveKeyID())
+
+	kp.KeyID = "pin-key-v2"
+	assert.Equal(t, "pin-key-v2", kp.ActiveKeyID())
+
+	// Empty is accepted: builds that predate the field send nothing.
+	assert.True(t, kp.AcceptsKeyID(""))
+	assert.True(t, kp.AcceptsKeyID("PIN-KEY-V2"), "comparison is case-insensitive")
+	assert.False(t, kp.AcceptsKeyID("pin-key-v1"), "a rotated-out key must be rejected by name")
 }

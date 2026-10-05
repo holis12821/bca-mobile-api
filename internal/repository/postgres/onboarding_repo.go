@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 )
 
 type OnboardingSessionRepo struct {
@@ -284,14 +286,23 @@ func (r *OnboardingOCRResultRepo) Create(ctx context.Context, result *onboarding
 			 created_at, auto_delete_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`
 
-	var tanggalLahir *time.Time
-	if result.Extracted.TanggalLahir != "" {
-		if t, err := time.Parse("2006-01-02", result.Extracted.TanggalLahir); err == nil {
-			tanggalLahir = &t
-		}
+	// OCR is best-effort, so an unreadable date is NOT an error here.
+	//
+	// ParseKTPFromText hands over whatever it found: normalizeDateString only
+	// recognises ISO and DD-MM-YYYY and returns anything else unchanged, so
+	// "21/04/1995" or a smudged line reaches this point verbatim. Failing the
+	// save would block the nasabah at the OCR step over a field they are about
+	// to confirm by hand anyway — SavePersonalData is where the date is required
+	// and strictly validated. Dropped to NULL with a warning, which is what this
+	// call site did before parseBirthDate existed.
+	tanggalLahir, err := parseBirthDate(result.Extracted.TanggalLahir)
+	if err != nil {
+		slog.Warn("ocr birth date is not an ISO date; stored as NULL",
+			"session_id", result.SessionID, "ocr_id", result.OCRID)
+		tanggalLahir = nil
 	}
 
-	_, err := r.pool.Exec(ctx, query,
+	_, err = r.pool.Exec(ctx, query,
 		result.ID, result.OCRID, result.SessionID, result.PhotoPath, result.AccuracyPct,
 		result.Extracted.NIK, result.Extracted.NamaLengkap,
 		result.Extracted.TempatLahir, tanggalLahir, result.Extracted.JenisKelamin,
@@ -372,14 +383,12 @@ func (r *OnboardingPersonalDataRepo) Create(ctx context.Context, data *onboardin
 			 created_at, updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`
 
-	var tanggalLahir *time.Time
-	if data.TanggalLahir != "" {
-		if t, err := time.Parse("2006-01-02", data.TanggalLahir); err == nil {
-			tanggalLahir = &t
-		}
+	tanggalLahir, err := parseBirthDate(data.TanggalLahir)
+	if err != nil {
+		return err
 	}
 
-	_, err := r.pool.Exec(ctx, query,
+	_, err = r.pool.Exec(ctx, query,
 		data.ID, data.PersonalDataID, data.SessionID,
 		data.NIK, data.NamaLengkap,
 		data.TempatLahir, tanggalLahir, data.JenisKelamin,
@@ -406,11 +415,9 @@ func (r *OnboardingPersonalDataRepo) Update(ctx context.Context, data *onboardin
 		    nomor_hp_enc = $18, email_enc = $19, updated_at = $20
 		WHERE session_id = $1`
 
-	var tanggalLahir *time.Time
-	if data.TanggalLahir != "" {
-		if t, err := time.Parse("2006-01-02", data.TanggalLahir); err == nil {
-			tanggalLahir = &t
-		}
+	tanggalLahir, err := parseBirthDate(data.TanggalLahir)
+	if err != nil {
+		return err
 	}
 
 	tag, err := r.pool.Exec(ctx, query,
@@ -636,7 +643,18 @@ func (r *OnboardingVideoCallRepo) UpdateResult(ctx context.Context, queueID stri
 	query := `
 		UPDATE onboarding_video_calls
 		SET status = 'COMPLETED', result = $2,
-		    agent_employee_id = $3, agent_name = $4,
+		    -- Yang sudah tercatat MENANG, bukan ditimpa pelapor.
+		    --
+		    -- Urutan COALESCE-nya dulu terbalik, jadi satu permintaan hasil bisa menulis
+		    -- ulang kolom ini menjadi siapa pun — termasuk petugas yang tidak pernah
+		    -- menangani panggilannya. Jejak audit lalu bertentangan dengan nama yang sudah
+		    -- dilihat nasabah di agent_assigned. Service juga menolak pelapor yang bukan
+		    -- petugas yang mengambil panggilan; ini pertahanan kedua di lapisan SQL.
+		    agent_employee_id = COALESCE(agent_employee_id, NULLIF($3, '')),
+		    -- NULLIF supaya pemanggil yang mengirim nama kosong tidak menghapus nama yang
+		    -- sudah tercatat saat agent mengambil panggilan. Itu persis bug yang membuat
+		    -- kolom ini selalu berakhir NULL.
+		    agent_name = COALESCE(NULLIF($4, ''), agent_name),
 		    notes = $5, recording_id = $6,
 		    ktp_shown_live = $7, identity_confirmed = $8,
 		    call_duration_seconds = $9, ended_at = $10
@@ -655,6 +673,106 @@ func (r *OnboardingVideoCallRepo) UpdateResult(ctx context.Context, queueID stri
 		return fmt.Errorf("video call not found: %s", queueID)
 	}
 	return nil
+}
+
+// MarkActive records that an agent has picked the call up.
+//
+// COALESCE pada agent_name menjaga nama yang sudah tercatat: CS yang meminta token agent
+// dua kali (mis. menyambung ulang setelah socketnya putus) tidak boleh menghapus nama yang
+// sudah ada hanya karena permintaan kedua mengirimnya kosong.
+//
+// started_at dipasang sekali lewat COALESCE juga, supaya durasi panggilan dihitung dari
+// agent masuk yang pertama, bukan dari upaya menyambung ulang yang terakhir.
+func (r *OnboardingVideoCallRepo) MarkActive(ctx context.Context, queueID, agentEmployeeID, agentName string) error {
+	now := time.Now().UTC()
+	query := `
+		UPDATE onboarding_video_calls
+		SET status = 'ACTIVE',
+		    agent_employee_id = COALESCE(NULLIF($2, ''), agent_employee_id),
+		    agent_name = COALESCE(NULLIF($3, ''), agent_name),
+		    started_at = COALESCE(started_at, $4)
+		WHERE queue_id = $1 AND status <> 'COMPLETED' AND status <> 'CANCELLED'`
+
+	tag, err := r.pool.Exec(ctx, query, queueID, agentEmployeeID, agentName, now)
+	if err != nil {
+		return fmt.Errorf("mark video call active: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("video call not active: %s", queueID)
+	}
+	return nil
+}
+
+// Cancel membebaskan panggilan yang masih QUEUED atau ACTIVE.
+//
+// Alasan pembatalan masuk ke audit trail lewat service, tempat seluruh riwayat sesi memang
+// dibaca. Menambah kolom di sini akan menduplikasi jejak yang sudah ada tanpa ada yang
+// membacanya.
+//
+// Status akhir COMPLETED tidak pernah disentuh: hasil verifikasi yang sudah tercatat tidak
+// boleh bisa dibatalkan oleh jalur pembersihan apa pun.
+func (r *OnboardingVideoCallRepo) Cancel(ctx context.Context, queueID string) (bool, error) {
+	query := `
+		UPDATE onboarding_video_calls
+		SET status = 'CANCELLED', ended_at = COALESCE(ended_at, $2)
+		WHERE queue_id = $1 AND status IN ('QUEUED', 'ACTIVE')`
+
+	tag, err := r.pool.Exec(ctx, query, queueID, time.Now().UTC())
+	if err != nil {
+		return false, fmt.Errorf("cancel video call: %w", err)
+	}
+	// Nol baris bukan error: semua pemanggilnya jalur pembersihan yang harus idempoten,
+	// dan panggilan yang sudah selesai atau sudah dibatalkan memang tidak perlu disentuh.
+	return tag.RowsAffected() > 0, nil
+}
+
+// CSAgentRepo mengautentikasi petugas CS untuk endpoint internal video call.
+type CSAgentRepo struct {
+	pool *pgxpool.Pool
+}
+
+func NewCSAgentRepo(pool *pgxpool.Pool) *CSAgentRepo {
+	return &CSAgentRepo{pool: pool}
+}
+
+// AuthenticateAgent memverifikasi kredensial petugas dan mengembalikan namanya.
+//
+// Hash Argon2 ber-salt tidak bisa dicari balik, jadi pemanggil menyebut dirinya lebih dulu
+// (`employeeID`) dan membuktikannya dengan `apiKey`. Pola yang sama dipakai login nasabah;
+// yang berbeda hanya dari mana identitasnya datang.
+//
+// Tiga keadaan dibedakan dengan sengaja: (name, true, nil) berhasil, ("", false, nil)
+// kredensial salah atau petugas tidak aktif, dan ("", false, err) kegagalan infrastruktur.
+// Pemanggilnya TIDAK boleh memperlakukan yang ketiga sebagai penolakan — Postgres yang
+// tersendat bukan bukti bahwa petugasnya tidak berwenang.
+func (r *CSAgentRepo) AuthenticateAgent(ctx context.Context, employeeID, apiKey string) (string, bool, error) {
+	if employeeID == "" || apiKey == "" {
+		return "", false, nil
+	}
+
+	var name, hash string
+	err := r.pool.QueryRow(ctx,
+		`SELECT name, api_key_hash FROM cs_agents WHERE employee_id = $1 AND is_active`,
+		employeeID,
+	).Scan(&name, &hash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Petugas tidak dikenal. Argon2 sengaja tidak dijalankan di sini: jalur ini
+			// hanya terbuka bagi pemanggil yang sudah lolos X-Internal-API-Key, jadi
+			// tidak ada penyerang anonim yang bisa mengukur selisih waktunya.
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("find cs agent: %w", err)
+	}
+
+	ok, err := crypto.VerifyPassword(ctx, apiKey, hash)
+	if err != nil {
+		return "", false, fmt.Errorf("verify cs agent key: %w", err)
+	}
+	if !ok {
+		return "", false, nil
+	}
+	return name, true, nil
 }
 
 // OnboardingCredentialRepo persists hashed credentials for onboarding.
@@ -704,4 +822,28 @@ func (r *OnboardingCredentialRepo) FindBySessionID(ctx context.Context, sessionI
 		return nil, fmt.Errorf("find credential: %w", err)
 	}
 	return &cred, nil
+}
+
+// parseBirthDate converts the ISO date the domain carries as a string into the
+// DATE column's value. Empty stays NULL, which is legitimate: OCR does not
+// always find the field.
+//
+// An unparseable non-empty value is an ERROR, not NULL. The two personal-data
+// writers used to swallow it, so a typo dropped a KYC field while the response
+// said 200 and the account went on to core banking without a date of birth.
+// SavePersonalData validates the format now; this is the backstop for every
+// other writer of nasabah-confirmed data.
+//
+// The OCR writer deliberately does NOT propagate this error — see the comment at
+// that call site. Machine-read text is allowed to be wrong; what the nasabah
+// confirmed is not.
+func parseBirthDate(v string) (*time.Time, error) {
+	if v == "" {
+		return nil, nil
+	}
+	t, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		return nil, fmt.Errorf("tanggal_lahir %q is not an ISO date: %w", v, err)
+	}
+	return &t, nil
 }

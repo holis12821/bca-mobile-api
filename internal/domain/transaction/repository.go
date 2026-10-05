@@ -22,7 +22,9 @@ type MutationCursorValues struct {
 	ID        uuid.UUID
 }
 
-// DateRange represents a date range for filtering mutations.
+// DateRange represents an inclusive WIB date range, used by both Mutasi and
+// Riwayat. Both ends are midnight in Asia/Jakarta: the caller computes them, so
+// no query ever depends on the database's own idea of "today".
 type DateRange struct {
 	From time.Time
 	To   time.Time
@@ -31,8 +33,8 @@ type DateRange struct {
 // TransactionRepository defines data access for transactions.
 type TransactionRepository interface {
 	// ListByUserID returns keyset-paginated transaction history.
-	// Optionally filtered by type.
-	ListByUserID(ctx context.Context, userID uuid.UUID, txnType *string, cursor *HistoryCursorValues, limit int) ([]Transaction, error)
+	// Optionally filtered by type and by a WIB date range.
+	ListByUserID(ctx context.Context, userID uuid.UUID, txnType *string, period *DateRange, cursor *HistoryCursorValues, limit int) ([]Transaction, error)
 
 	// FindByID finds a transaction by ID, scoped to user_id.
 	FindByID(ctx context.Context, userID, txnID uuid.UUID) (*Transaction, error)

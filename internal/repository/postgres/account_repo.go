@@ -132,7 +132,8 @@ func (r *ProfileRepo) FindProfile(ctx context.Context, userID uuid.UUID) (*accou
 		SELECT id, full_name, display_name,
 		       pgp_sym_decrypt(phone_encrypted, $2) AS phone,
 		       COALESCE(pgp_sym_decrypt(email_encrypted, $2), '') AS email,
-		       last_login_at
+		       last_login_at,
+		       COALESCE(tier, 'REGULER')
 		FROM users
 		WHERE id = $1
 		  AND deleted_at IS NULL`
@@ -143,6 +144,7 @@ func (r *ProfileRepo) FindProfile(ctx context.Context, userID uuid.UUID) (*accou
 		&profile.ID, &profile.FullName, &profile.DisplayName,
 		&phone, &email,
 		&profile.LastLoginAt,
+		&profile.Tier,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil

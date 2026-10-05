@@ -44,6 +44,15 @@ var (
 	// SessionRevoked is returned when a structurally valid access token belongs
 	// to a session that has been logged out or revoked.
 	SessionRevoked = Error{http.StatusUnauthorized, "AUTH_SESSION_REVOKED", "Sesi Anda sudah berakhir. Silakan login kembali.", nil}
+
+	// OnboardingDeviceMismatch is returned when X-Device-ID does not match the
+	// device that created the onboarding session. A session_id is a bearer
+	// secret on its own: without this check, a leaked id could be continued
+	// from any phone. 403 rather than 404 is deliberate and was asked for by
+	// the Android client (docs/10-HANDOVER-BLOCKER-BACKEND.md butir 3): the id
+	// is a v4 UUID, so nothing is enumerable, and a distinct code is the
+	// difference between a one-line fix and a day of guessing.
+	OnboardingDeviceMismatch = Error{http.StatusForbidden, "ONBOARDING_DEVICE_MISMATCH", "Sesi ini dibuat dari perangkat lain.", nil}
 )
 
 // --- 404 ---
@@ -66,7 +75,20 @@ var IdempotencyConflict = Error{http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Tr
 // --- 422 ---
 
 var (
-	OldPINMismatch             = Error{http.StatusUnprocessableEntity, "AUTH_OLD_PIN_MISMATCH", "PIN lama tidak sesuai.", nil}
+	OldPINMismatch = Error{http.StatusUnprocessableEntity, "AUTH_OLD_PIN_MISMATCH", "PIN lama tidak sesuai.", nil}
+
+	// PINKeyUnknown is returned when a request names an encryption_key_id that
+	// is not the key this server decrypts with. Without it a client encrypting
+	// under a rotated-out key sees AUTH_INVALID_PIN — indistinguishable from a
+	// wrong PIN, and the reason the handover document calls this the most
+	// expensive class of bug to trace.
+	PINKeyUnknown = Error{http.StatusUnprocessableEntity, "AUTH_PIN_KEY_UNKNOWN", "Kunci enkripsi PIN tidak dikenal. Perbarui kunci publik.", nil}
+
+	// BiometricKeyUnsupported is returned at registration when the public key
+	// is not EC P-256. Accepting it would push the failure to login time,
+	// where it looks like a bad fingerprint instead of a bad key type.
+	BiometricKeyUnsupported = Error{http.StatusUnprocessableEntity, "AUTH_BIOMETRIC_KEY_UNSUPPORTED", "Jenis kunci biometrik tidak didukung. Gunakan EC P-256.", nil}
+
 	InquiryExpired             = Error{http.StatusUnprocessableEntity, "INQUIRY_EXPIRED", "Sesi transaksi sudah kedaluwarsa. Silakan ulangi.", nil}
 	InquiryMismatch            = Error{http.StatusUnprocessableEntity, "INQUIRY_MISMATCH", "Data transaksi tidak sesuai dengan inquiry.", nil}
 	InsufficientBalance        = Error{http.StatusUnprocessableEntity, "TRANSFER_INSUFFICIENT_BALANCE", "Saldo tidak mencukupi.", nil}
@@ -107,6 +129,55 @@ var (
 	// `allowed_values` bila memang ada daftar tertutupnya, supaya admin bisa
 	// memperbaiki pada percobaan pertama tanpa membuka kode.
 	CardCatalogInvalidValue = Error{http.StatusUnprocessableEntity, "CARD_CATALOG_INVALID_VALUE", "Nilai katalog kartu tidak valid.", nil}
+
+	// --- Kartu MILIK nasabah (/account/cards) ---
+	//
+	// Terpisah dari blok di atas yang melayani katalog onboarding. Kartu milik
+	// nasabah punya siklus hidup sendiri, jadi salah satunya tidak bisa
+	// meminjam kode error yang lain tanpa membuat pesan di layar keliru.
+
+	// CardNotFound 404 juga dipakai saat kartu ADA tapi milik orang lain.
+	// Membedakan keduanya berarti mengonfirmasi bahwa sebuah card_id tebakan
+	// itu nyata.
+	CardNotFound = Error{http.StatusNotFound, "CARD_NOT_FOUND", "Kartu tidak ditemukan.", nil}
+
+	// CardBlocked 409: sakelar kanal tidak bisa diubah pada kartu terblokir.
+	// Membuka blokir bukan tombol di aplikasi — itu keputusan cabang.
+	CardBlocked = Error{http.StatusConflict, "CARD_BLOCKED", "Kartu sedang diblokir. Hubungi Halo BCA untuk membukanya.", nil}
+
+	// CardReplacementInProgress 409: sudah ada permintaan penggantian yang
+	// belum selesai untuk kartu ini. Ditegakkan oleh unique index parsial di
+	// migrasi 000021, bukan oleh pemeriksaan di aplikasi — dua request bersamaan
+	// tidak boleh dua-duanya lolos.
+	CardReplacementInProgress = Error{http.StatusConflict, "CARD_REPLACEMENT_IN_PROGRESS", "Permintaan penggantian kartu sebelumnya masih diproses.", nil}
+
+	// CardDeliveryUnavailable 422: metode pengiriman yang diminta tidak
+	// dilayani untuk jenis kartu ini menurut katalog.
+	CardDeliveryUnavailable = Error{http.StatusUnprocessableEntity, "CARD_DELIVERY_UNAVAILABLE", "Metode pengiriman ini tidak tersedia untuk kartu Anda.", nil}
+)
+
+// --- Syarat & Ketentuan buka rekening (migrasi 000025) ---
+
+var (
+	// TNCVersionOutdated 409, bukan 422: versi yang dikirim client memang
+	// pernah sah — keadaannya yang berubah sejak teks itu dibaca, persis
+	// seperti CardTypeUnavailable.
+	//
+	// Details SELALU memuat `current_version` supaya aplikasi bisa memuat ulang
+	// S&K dan menampilkan teks baru tanpa menebak. Tanpa penolakan ini, bank
+	// mencatat persetujuan atas pasal yang sudah dicabut dan tidak pernah
+	// dilihat nasabah — lihat komentar di migrasi 000025.
+	TNCVersionOutdated = Error{http.StatusConflict, "TNC_VERSION_OUTDATED", "Syarat & Ketentuan telah diperbarui. Mohon baca dan setujui versi terbaru.", nil}
+
+	// TNCVersionUnknown 422: versi yang tidak pernah ada di database. Dipisah
+	// dari TNCVersionOutdated karena artinya berbeda — yang satu client lama,
+	// yang satu client yang mengarang nilai (dan dulu diterima apa adanya).
+	TNCVersionUnknown = Error{http.StatusUnprocessableEntity, "TNC_VERSION_UNKNOWN", "Versi Syarat & Ketentuan tidak dikenal.", nil}
+
+	// TNCUnavailable 503: tidak ada satu pun versi aktif di database. Itu salah
+	// konfigurasi server (migrasi belum jalan), bukan salah client — jadi 5xx,
+	// dan jangan sampai terbaca sebagai "nasabah mengirim sesuatu yang salah".
+	TNCUnavailable = Error{http.StatusServiceUnavailable, "TNC_UNAVAILABLE", "Syarat & Ketentuan belum tersedia. Silakan coba beberapa saat lagi.", nil}
 )
 
 // --- 422 (onboarding) ---
@@ -148,6 +219,14 @@ var (
 // an SMS that would never arrive, with nothing on screen suggesting a resend.
 // The OTP stays valid — only the response says delivery failed.
 var OTPDeliveryFailed = Error{http.StatusServiceUnavailable, "OTP_DELIVERY_FAILED", "Kode OTP gagal dikirim. Silakan coba kirim ulang.", nil}
+
+// OTPChannelNotAllowed is answered when the request asked for a delivery channel
+// this deployment has not enabled, or one the active provider cannot serve.
+//
+// 400 rather than 503: nothing failed. The channel was refused before anything
+// was sent, so the nasabah's code, counters and send budget are all untouched and
+// retrying on the default channel works immediately.
+var OTPChannelNotAllowed = Error{http.StatusBadRequest, "OTP_CHANNEL_NOT_ALLOWED", "Metode pengiriman OTP tersebut tidak tersedia. Silakan gunakan SMS.", nil}
 
 // --- 422 (biometric) ---
 

@@ -51,7 +51,7 @@ type mockTransactionRepo struct {
 	transactions []transaction.Transaction
 }
 
-func (r *mockTransactionRepo) ListByUserID(_ context.Context, userID uuid.UUID, txnType *string, cursor *transaction.HistoryCursorValues, limit int) ([]transaction.Transaction, error) {
+func (r *mockTransactionRepo) ListByUserID(_ context.Context, userID uuid.UUID, txnType *string, period *transaction.DateRange, cursor *transaction.HistoryCursorValues, limit int) ([]transaction.Transaction, error) {
 	var result []transaction.Transaction
 	pastCursor := cursor == nil
 	for _, t := range r.transactions {
@@ -59,6 +59,10 @@ func (r *mockTransactionRepo) ListByUserID(_ context.Context, userID uuid.UUID, 
 			continue
 		}
 		if txnType != nil && t.Type != *txnType {
+			continue
+		}
+		// Mirrors the SQL: inclusive From, exclusive at the next midnight.
+		if period != nil && (t.CreatedAt.Before(period.From) || !t.CreatedAt.Before(period.To.AddDate(0, 0, 1))) {
 			continue
 		}
 		if !pastCursor {
@@ -380,12 +384,52 @@ func TestListHistory_FilterByType(t *testing.T) {
 	})
 
 	filterType := "TRANSFER_INTERNAL"
-	items, _, _, err := svc.ListHistory(context.Background(), userID, &filterType, "", 20)
+	items, _, _, err := svc.ListHistory(context.Background(), userID, &filterType, nil, "", 20)
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
 	if len(items) != 2 {
 		t.Fatalf("expected 2 TRANSFER_INTERNAL, got %d", len(items))
+	}
+}
+
+// TestListHistory_FilterByPeriod covers the range Riwayat asks for. The last day
+// must be included: the SQL stops at the NEXT midnight, and an off-by-one there
+// hides today's transactions from a range that explicitly names today.
+func TestListHistory_FilterByPeriod(t *testing.T) {
+	userID := uuid.New()
+	wib := time.FixedZone("WIB", 7*3600)
+	today := time.Date(2026, 9, 26, 0, 0, 0, 0, wib)
+
+	mk := func(ref string, at time.Time) transaction.Transaction {
+		return transaction.Transaction{
+			ID: uuid.New(), UserID: userID, Type: "TRANSFER_INTERNAL", Status: "SUCCESS",
+			Amount: decimal.NewFromInt(10000), TotalAmount: decimal.NewFromInt(10000),
+			Currency: "IDR", ReferenceNumber: ref, CreatedAt: at,
+		}
+	}
+	txns := []transaction.Transaction{
+		mk("TODAY_LATE", today.Add(23*time.Hour+59*time.Minute)),
+		mk("IN_RANGE", today.AddDate(0, 0, -3)),
+		mk("TOO_OLD", today.AddDate(0, 0, -10)),
+	}
+
+	svc := newTestService(func(cfg *transaction.ServiceConfig) {
+		cfg.Transactions = &mockTransactionRepo{transactions: txns}
+	})
+
+	period := &transaction.DateRange{From: today.AddDate(0, 0, -6), To: today}
+	items, _, _, err := svc.ListHistory(context.Background(), userID, nil, period, "", 20)
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 in range, got %d", len(items))
+	}
+	for _, it := range items {
+		if it.ReferenceNumber == "TOO_OLD" {
+			t.Fatal("transaction outside the range leaked into the result")
+		}
 	}
 }
 

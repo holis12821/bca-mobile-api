@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -48,7 +49,15 @@ func (h *NotificationHandler) ListNotifications(w http.ResponseWriter, r *http.R
 		cursor = &parsed
 	}
 
-	resp, hasMore, nextCursor, err := h.svc.ListNotifications(r.Context(), userID, cursor, limit)
+	// The Notifikasi tabs map to types. Both ?type=PROMO and
+	// ?type=PROMO,INFO are accepted; the tab bar sends one, "Semua" sends none.
+	types, terr := parseNotificationTypes(r.URL.Query().Get("type"))
+	if terr != nil {
+		response.Err(w, r, apperr.From(terr))
+		return
+	}
+
+	resp, hasMore, nextCursor, err := h.svc.ListNotifications(r.Context(), userID, types, cursor, limit)
 	if err != nil {
 		h.handleError(w, r, err, "list notifications")
 		return
@@ -108,4 +117,48 @@ func (h *NotificationHandler) handleError(w http.ResponseWriter, r *http.Request
 		)
 	}
 	response.Err(w, r, appErr)
+}
+
+// parseNotificationTypes turns the `type` query parameter into a validated,
+// de-duplicated list.
+//
+// An unknown value is a VALIDATION_ERROR, not a silently ignored filter: the
+// same mistake on `period` used to answer 200 with the account's whole history,
+// which looked like working software until someone counted the rows
+// (docs/10-HANDOVER-BLOCKER-BACKEND.md butir 6).
+func parseNotificationTypes(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	allowed := make(map[string]bool, len(account.NotificationTypes))
+	for _, t := range account.NotificationTypes {
+		allowed[t] = true
+	}
+
+	seen := make(map[string]bool)
+	var types []string
+	for _, part := range strings.Split(raw, ",") {
+		t := strings.ToUpper(strings.TrimSpace(part))
+		if t == "" {
+			continue
+		}
+		if !allowed[t] {
+			return nil, apperr.Error{
+				Status:  apperr.ValidationError.Status,
+				Code:    apperr.ValidationError.Code,
+				Message: apperr.ValidationError.Message,
+				Details: map[string]any{
+					"invalid_field":  "type",
+					"allowed_values": account.NotificationTypes,
+				},
+			}
+		}
+		if !seen[t] {
+			seen[t] = true
+			types = append(types, t)
+		}
+	}
+	return types, nil
 }

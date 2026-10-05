@@ -115,6 +115,52 @@ X-Idempotency-Key: <uuid_v4>  (untuk mutating operations)
 
 ## 2. Authentication
 
+### `GET /auth/pin/public-key`
+**Auth:** None (public)
+**Purpose:** Kunci publik untuk mengenkripsi `pin_encrypted`
+**Cache:** `Cache-Control: public, max-age=300`
+
+Bentuk respons identik dengan `GET /onboarding/credentials/public-key`, jadi satu
+jalur kode client bisa melayani keduanya. Kunci yang sama juga dibundel di APK
+sebagai `assets/pin_public.pem`; endpoint ini yang membuat rotasi kunci mungkin
+tanpa rilis baru.
+
+```json
+// Response 200
+{
+  "status": "success",
+  "data": {
+    "algorithm": "RSA-OAEP-SHA256",
+    "key_id": "pin-key-v1",
+    "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq...\n-----END PUBLIC KEY-----\n",
+    "payload_shape": "{\"pin\":\"123456\",\"nonce\":\"<uuid-v4>\",\"ts\":<unix-seconds>}",
+    "encoding": "base64(RSA-OAEP-SHA256(json))",
+    "max_skew_sec": 60
+  }
+}
+```
+
+**Aturan enkripsi PIN — berlaku untuk `/auth/login/pin`, `/auth/pin/verify`,
+`/auth/pin/change`, `/auth/access-code/change`, `/registration/complete`, dan
+`/onboarding/credentials`:**
+
+| Hal | Nilai |
+|---|---|
+| Algoritma | `RSA/ECB/OAEPWithSHA-256AndMGF1Padding` (RSA-OAEP, hash SHA-256, MGF1-SHA-256, label kosong) |
+| Padding lain | **Ditolak.** PKCS#1 v1.5 tidak akan pernah terdekripsi |
+| Plaintext | JSON `{"pin":"123456","nonce":"<uuid-v4>","ts":<unix-seconds>}` |
+| Wire | base64 standar dari ciphertext |
+| `nonce` | sekali pakai, diingat server 120 detik |
+| `ts` | skew maksimal 60 detik |
+| `encryption_key_id` | opsional; bila dikirim dan bukan kunci aktif → `422 AUTH_PIN_KEY_UNKNOWN` beserta `details.expected_key_id` |
+
+`encryption_key_id` kosong tetap diterima — build lama belum mengirimkannya.
+Mengirimkannya adalah cara membedakan "PIN salah" dari "kunci sudah dirotasi",
+yang tanpa itu tampak sama dari sisi client.
+
+`make pin-public-key` mencetak PEM yang sama dari sisi server, untuk diserahkan
+sekali ke repo Android.
+
 ### `POST /auth/login/pin`
 **Auth:** None (public)
 **Purpose:** Login dengan kode akses (PIN) — Screen: **Kode Akses**
@@ -125,6 +171,7 @@ X-Idempotency-Key: <uuid_v4>  (untuk mutating operations)
 {
   "device_id": "d4e5f6a7-...",
   "pin_encrypted": "base64_encrypted_pin_with_server_public_key",
+  "encryption_key_id": "pin-key-v1",
   "device_info": {
     "model": "Samsung Galaxy S24",
     "os_version": "Android 15",
@@ -177,6 +224,39 @@ X-Idempotency-Key: <uuid_v4>  (untuk mutating operations)
 **Auth:** None (public)
 **Purpose:** Login dengan biometrik (Face ID / Touch ID)
 **Note:** Device mengirim signed challenge, bukan data biometrik
+
+#### Kontrak tanda tangan
+
+| Hal | Nilai |
+|---|---|
+| Jenis kunci | **EC P-256** (`secp256r1` / `prime256v1`). RSA dan kurva lain ditolak saat register dengan `422 AUTH_BIOMETRIC_KEY_UNSUPPORTED` |
+| Algoritma tanda tangan | **`SHA256withECDSA`** |
+| Yang ditandatangani | **32 byte challenge mentah** — base64-*decode* field `challenge` lebih dulu, lalu tandatangani byte itu. Tidak ada penggabungan: tanpa `device_id`, tanpa prefiks panjang |
+| Format `signed_challenge` | **base64 dari DER ASN.1** — keluaran bawaan `java.security.Signature`. Raw `r‖s` 64 byte juga masih diterima, tapi DER yang didokumentasikan |
+| Format `public_key` | **base64 X.509 `SubjectPublicKeyInfo`** tanpa header PEM. PEM tetap diterima |
+| Nama field | `signed_challenge` **atau** `signature` — keduanya dilayani, isinya sama |
+| `biometric_type` di body login | Diterima dan dicatat, tapi tidak dipercaya: jenis biometrik yang membuka kunci adalah urusan perangkat, dan kunci terdaftarnya sudah menyimpannya |
+
+#### Vektor uji
+
+Nilai tetap ini diverifikasi oleh `TestBiometricLogin_PublishedTestVector` di
+`internal/domain/auth/biometric_service_test.go`. Sisi Android bisa mencocokkan
+implementasinya tanpa menunggu server:
+
+```
+public_key  (base64 SPKI, EC P-256)
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEo6b/4hWQuDCQW3mrgm1MT3+R4IN/KBMlOIfCncd+r0AELAmBaWsMxOp0AyRkxsK+8LWUeLjiCHmiO0IQiWJa3Q==
+
+challenge   (base64, 32 byte)
+dF8Omhv+NpbgVq+JhUxtMqU408OSzYke75J1RTwH5d0=
+
+signed_challenge  (base64 DER, SHA256withECDSA)
+MEUCIQDDEuePW+/ce5/R/9MySwoCKr4MhcNv3B+MqbscMMkYaQIgGZUUEYi2qyw/UJKTGFepdsLBlijYeSxpEwOINsK5bTc=
+```
+
+ECDSA tidak deterministik, jadi tanda tangan Anda sendiri **tidak** akan sama
+dengan baris di atas — yang harus sama adalah hasil verifikasinya. Kunci privat
+pasangan vektor ini hanya untuk uji dan tidak dipakai di lingkungan mana pun.
 
 ```json
 // Request
@@ -234,10 +314,17 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
   "data": {
     "challenge_id": "ch_abc123",
     "challenge": "random_32_byte_base64_string",
-    "expires_at": "2026-09-02T10:31:00Z"
+    "expires_in": 60,
+    "expires_at": "2026-09-02T10:31:00Z",
+    "algorithm": "SHA256withECDSA",
+    "signature_format": "base64(DER ASN.1) of SHA256withECDSA over the raw 32 challenge bytes"
   }
 }
 ```
+
+`challenge` adalah base64 dari 32 byte acak. Challenge **sekali pakai**: server
+mengambilnya dengan `GETDEL`, jadi percobaan kedua dengan `challenge_id` yang
+sama dijawab `401 AUTH_TOKEN_INVALID` — bukan hanya yang sudah kedaluwarsa.
 
 ### `POST /auth/biometric/register`
 **Auth:** Bearer Token (harus sudah login via PIN)
@@ -257,11 +344,33 @@ GET /auth/biometric/challenge?device_id=d4e5f6a7-...
 {
   "status": "success",
   "data": {
-    "biometric_id": "bio_abc123",
-    "registered_at": "2026-09-02T10:30:00Z"
+    "biometric_id": "9f1c6d2e-...",
+    "key_id": "key_abc123",
+    "registered_at": "2026-09-02T10:30:00Z",
+    "replaced_keys": 1
   }
 }
 ```
+
+**Perilaku yang perlu diketahui client:**
+
+- `device_id` di body **tidak** menentukan apa pun; pengikatan diambil dari
+  access token. Body yang menyebut device lain dijawab
+  `403 AUTH_DEVICE_NOT_RECOGNIZED`.
+- **Pendaftaran ulang MENGGANTI.** Semua kunci aktif nasabah ini pada perangkat
+  ini dicabut lebih dulu, dan jumlahnya dilaporkan di `replaced_keys`. Ini yang
+  dibutuhkan saat `setInvalidatedByBiometricEnrollment(true)` menghanguskan kunci
+  karena sidik jari baru didaftarkan: client hapus kunci, daftar lagi, dan kunci
+  lama berhenti berlaku pada saat yang sama.
+- **Beberapa perangkat per nasabah tetap boleh.** Pencabutan dibatasi satu
+  perangkat, jadi mendaftar di tablet tidak mematikan biometrik di ponsel.
+- `key_id` unik lintas tabel. Mendaftar ulang dengan `key_id` yang sama pada
+  perangkat dan nasabah yang sama memperbarui barisnya; `key_id` yang sudah
+  dipakai nasabah atau perangkat lain ditolak.
+- `attestation` (rantai Android Key Attestation, base64, maksimal 16 KB)
+  **disimpan, tidak diverifikasi** ke akar Google, dan tidak ada syarat
+  `security_level` minimal — lihat `docs/04-SECURITY.md`. Perangkat tanpa
+  dukungan attestation tidak ditolak.
 
 ### `POST /auth/token/refresh`
 **Auth:** Refresh Token
@@ -373,7 +482,7 @@ Catatan: untuk nasabah lama yang belum punya kode akses (mis. akun seed),
 {
   "pin_encrypted": "base64_encrypted",
   "transaction_id": "txn_abc123",
-  "purpose": "EWALLET_TOPUP"    // TRANSFER, EWALLET_TOPUP, QRIS_PAYMENT, CHANGE_LIMIT, CHANGE_PIN
+  "purpose": "EWALLET_TOPUP"
 }
 
 // Response 200
@@ -385,6 +494,25 @@ Catatan: untuk nasabah lama yang belum punya kode akses (mis. akun seed),
   }
 }
 ```
+
+**Daftar `purpose` yang diterima** — tertutup, dan token terikat pada satu
+tujuan: token transfer tidak bisa dipakai memblokir kartu.
+
+| `purpose` | Dipakai oleh |
+|---|---|
+| `TRANSFER` | `POST /transfer/execute` |
+| `EWALLET_TOPUP` | `POST /ewallet/topup` |
+| `QRIS_PAYMENT` | `POST /qris/pay` |
+| `CHANGE_LIMIT` | `PUT /account/transaction-limit` |
+| `CHANGE_PIN` | `POST /auth/pin/change` |
+| `CHANGE_PROFILE` | `PUT /account/profile` |
+| `BLOCK_CARD` | `POST /account/cards/{card_id}/block` |
+| `REPLACE_CARD` | `POST /account/cards/{card_id}/replacement` |
+
+Daftar ini ditegakkan **dua kali**: `transaction.ValidPurposes` di Go dan CHECK
+constraint `verification_tokens_purpose_check` di database (migrasi `000024`).
+Menambah purpose baru berarti mengubah keduanya — sampai migrasi itu ada,
+`CHANGE_PROFILE` hanya terdaftar di Go dan endpoint ini menjawab `500` untuknya.
 
 ---
 
@@ -417,10 +545,16 @@ Catatan: untuk nasabah lama yang belum punya kode akses (mis. akun seed),
       }
     ],
     "app_version": "5.9.1",
-    "last_login": "2026-09-02T10:00:00Z"
+    "last_login": "2026-09-02T10:00:00Z",
+    "tier": "PRIORITAS"
   }
 }
 ```
+
+- `tier`: `PRIORITAS` | `SOLITAIRE`. **Tidak dikirim sama sekali** untuk nasabah
+  reguler — badge disembunyikan saat field-nya tidak ada, jadi client tidak perlu
+  belajar mengabaikan satu nilai. Tidak ada `GET /account/tier`; satu field pada
+  endpoint yang sudah dipanggil sudah cukup.
 
 ### `POST /account/profile/otp`
 **Auth:** Bearer Token
@@ -441,9 +575,15 @@ pengecekan. Berlaku 5 menit, maksimal 5 kali salah lalu kode dihanguskan.
 }
 ```
 
-**Dev only:** saat `APP_ENV=development` response juga memuat `otp_debug`
-berisi kodenya, karena SMS gateway di lingkungan itu hanya menulis log.
-Field ini tidak pernah muncul di environment lain.
+**Dev only:** saat `APP_ENV=development` **dan** `SMS_PROVIDER` kosong,
+response juga memuat `otp_debug` berisi kodenya, karena gateway di keadaan itu
+hanya menulis log. Field ini tidak pernah muncul di environment lain.
+
+**`503 OTP_DELIVERY_FAILED`:** provider SMS menolak kiriman. Kodenya tetap
+terbit dan tersimpan, tapi response tidak lagi menjawab `200` dengan
+`expires_in` untuk SMS yang tidak pernah diserahkan — nasabah dulu menunggu
+pesan yang tidak akan datang. Client menampilkan pesan error dan menawarkan
+"coba lagi".
 
 ### `PUT /account/profile`
 **Auth:** Bearer Token + OTP
@@ -634,6 +774,187 @@ Response 200 sama persis dengan `GET /account/transaction-limit` di atas
 Plafon maksimum yang dipaksakan server: TRANSFER_INTERNAL & TRANSFER_EXTERNAL
 100 juta/hari, EWALLET 20 juta/hari, QRIS 20 juta/hari dan 5 juta/transaksi.
 
+### `GET /account/cards`
+**Auth:** Bearer Token
+**Purpose:** Kartu yang DIMILIKI nasabah — Screen: **Profil Saya** (Manajemen Kartu Paspor)
+
+**Dari mana barisnya datang.** Satu kartu tercatat di sini ketika core banking
+menjawab permintaan cetak pada `POST /v1/onboarding/submit` — nomor tersamar dan
+masa berlakunya berasal dari jawaban itu, tidak dihitung oleh layanan ini. Kartu
+pertama seorang nasabah otomatis menjadi kartu utama (`is_primary`).
+
+Dua hal yang perlu diketahui client:
+
+- **Permintaan cetak yang gagal tidak memunculkan kartu di sini.** Kartunya masuk
+  antrean retry dan respons submit tetap melaporkan `REQUESTED`, tapi daftar ini
+  baru berisi setelah penerbitnya benar-benar menjawab. Daftar kosong pada
+  nasabah yang baru buka rekening adalah keadaan yang sah, bukan error.
+- **Status `PRINTING` dan `SHIPPED` pada respons submit tidak berpindah sendiri
+  ke sini.** Perpindahan status fisik dan pemenuhan permintaan penggantian
+  (`POST /account/cards/{card_id}/replacement`) datang dari core banking, dan
+  layanan ini belum punya kanal masuk untuk itu — tidak ada callback, tidak ada
+  pekerja yang menaikkan status. Selama itu belum ada, kartu pengganti tidak
+  muncul sebagai kartu baru di daftar ini dan kartu di sini tetap `ACTIVE`
+  sampai nasabah sendiri memblokirnya.
+
+Tidak ada parameter apa pun. Pemilik diambil dari klaim `sub` pada access token,
+jadi tidak ada jalan meminta kartu nasabah lain.
+
+```json
+// Response 200
+{
+  "status": "success",
+  "data": {
+    "cards": [
+      {
+        "card_id": "3f2a7c10-aaaa-4bbb-8ccc-ddddeeeeffff",
+        "masked_number": "•••• •••• •••• 7890",
+        "cardholder_name": "NURHOLIS MAJID",
+        "card_type": "PASPOR_GOLD",
+        "product_name": "Gold Mastercard",
+        "network": "MASTERCARD",
+        "tier_key": "DEBIT",
+        "style": "GOLD",
+        "valid_thru": "12/29",
+        "status": "ACTIVE",
+        "is_primary": true,
+        "settings": {
+          "debit_online_enabled": true,
+          "international_enabled": false
+        }
+      }
+    ]
+  }
+}
+```
+
+Catatan kontrak yang mengikat client:
+
+- `status`: `ACTIVE` | `BLOCKED` | `EXPIRED` | `REPLACEMENT_PENDING`. Client
+  memetakan `ACTIVE` ke chip hijau "Aktif & Terhubung".
+- `status` **dihitung server saat dibaca**, bukan sekadar isi kolom. Kartu yang
+  masa berlakunya sudah lewat dilaporkan `EXPIRED` walau baris di database masih
+  `ACTIVE` — tidak ada job yang membalik kolom itu. `BLOCKED` menang atas
+  kedaluwarsa: kartu yang dilaporkan hilang harus tetap berkata begitu.
+- `blocked_reason` hanya muncul saat `status` = `BLOCKED`
+  (`LOST` | `STOLEN` | `DAMAGED` | `SUSPECTED_FRAUD`).
+- `valid_thru` sudah terformat `MM/YY`. Tampilkan apa adanya, jangan diolah lagi.
+- `masked_number` **selalu** tersamar. Nomor kartu utuh tidak pernah keluar dari
+  layanan ini (docs/04-SECURITY.md), dan migrasi `000021` menegakkannya dengan
+  CHECK constraint.
+- Tidak ada nilai visual: `style` (`BLUE` | `GOLD` | `PLATINUM`) dipetakan client
+  ke design token. Server tidak mengirim hex warna atau URL gambar.
+- Nasabah tanpa kartu membalas `200` dengan `{"cards": []}` — **bukan** `404`.
+  Layar punya empty state untuk keadaan itu.
+
+### `PUT /account/cards/{card_id}/settings`
+**Auth:** Bearer Token
+**Purpose:** Dua sakelar kanal kartu — Screen: **Profil Saya**
+
+```json
+// Request — keduanya OPSIONAL
+{ "debit_online_enabled": true, "international_enabled": false }
+
+// Response 200 — kartu yang sudah diperbarui
+{
+  "status": "success",
+  "data": { "card": { "card_id": "3f2a…", "…": "bentuknya sama dengan GET /account/cards" } }
+}
+```
+
+- **Field yang tidak dikirim tidak diubah.** Keduanya `*bool`: mengirim hanya
+  `international_enabled` membiarkan `debit_online_enabled` apa adanya. Client
+  tidak perlu mengirim keadaan lengkap.
+- Body yang tidak menyebut satu pun field dijawab `422 VALIDATION_ERROR`.
+  Menjawab `200` akan memberi tahu layar bahwa penulisan terjadi padahal
+  nama field-nya salah ketik.
+- **Tanpa `verification_token`.** Keduanya bisa dikembalikan nasabah sendiri,
+  dan meminta PIN untuk hal sepele melatih orang memasukkan PIN tanpa berpikir.
+- Kartu `BLOCKED` menolak perubahan dengan `409 CARD_BLOCKED`.
+- Menyalakan sakelar yang memang sudah menyala tidak menulis apa pun dan tetap
+  dijawab `200` — jejak audit hanya untuk perubahan.
+- Balasannya kartu utuh, jadi client tidak perlu memanggil `GET /account/cards`
+  lagi setelahnya.
+
+### `POST /account/cards/{card_id}/block`
+**Auth:** Bearer Token + `verification_token` (purpose `BLOCK_CARD`)
+**Purpose:** Blokir kartu hilang/dicuri — Screen: **Profil Saya**
+
+```json
+// Request
+{ "reason": "LOST", "verification_token": "vt_…" }
+
+// Response 200 — kartu dengan status BLOCKED
+{
+  "status": "success",
+  "data": { "card": { "status": "BLOCKED", "blocked_reason": "LOST", "…": "…" } }
+}
+```
+
+- `reason`: `LOST` | `STOLEN` | `DAMAGED` | `SUSPECTED_FRAUD`. Nilai lain
+  dijawab `422 VALIDATION_ERROR`.
+- `verification_token` **wajib**, diterbitkan `POST /auth/pin/verify` dengan
+  `purpose = "BLOCK_CARD"`. Tanpa itu, siapa pun yang memegang ponsel tak
+  terkunci bisa mematikan kartu.
+- **Idempoten:** memblokir kartu yang sudah `BLOCKED` dijawab `200` dengan
+  keadaan yang sama, bukan error. Nasabah yang panik menekan dua kali tidak
+  boleh diberi tahu ada yang gagal.
+- **Tidak ada endpoint buka blokir.** Membuka kartu yang dilaporkan hilang
+  adalah keputusan cabang, bukan tombol di aplikasi.
+
+### `POST /account/cards/{card_id}/replacement`
+**Auth:** Bearer Token + `verification_token` (purpose `REPLACE_CARD`)
+**Header wajib:** `X-Idempotency-Key`
+**Purpose:** Permintaan kartu pengganti — Screen: **Profil Saya**
+
+```json
+// Request
+{ "reason": "DAMAGED", "delivery_method": "COURIER", "verification_token": "vt_…" }
+
+// Response 201
+{
+  "status": "success",
+  "data": {
+    "request_id": "918656e0-b1c7-4412-9a21-feb2f9f9b6fb",
+    "card_id": "3f2a…",
+    "status": "REQUESTED",
+    "reason": "DAMAGED",
+    "delivery_method": "COURIER",
+    "fee": 50000,
+    "estimated_arrival_from": "2026-09-30",
+    "estimated_arrival_to": "2026-10-05",
+    "masked_number": "•••• •••• •••• 1188"
+  }
+}
+```
+
+- `reason`: `DAMAGED` | `LOST` | `UPGRADE`.
+- `delivery_method`: `COURIER` | `BRANCH_PICKUP`, default `COURIER`. Kartu yang
+  katalognya tidak melayani pengambilan di cabang menjawab
+  `422 CARD_DELIVERY_UNAVAILABLE`.
+- **`X-Idempotency-Key` wajib** — penggantian berbiaya, dan retry jaringan tidak
+  boleh mencetak dua kartu. Tanpa header: `422 VALIDATION_ERROR` dengan
+  `details.missing_header`.
+- **Retry dengan kunci yang sama dijawab `200`** beserta header
+  `X-Idempotent-Replayed: true` dan `request_id` yang sama. Retry ini **tidak**
+  memerlukan `verification_token` yang masih hidup: percobaan pertama sudah
+  menghanguskannya, dan meminta yang baru berarti retry tidak akan pernah
+  berhasil.
+- Kunci **berbeda** untuk kartu yang permintaannya masih `REQUESTED` atau
+  `PRINTING` dijawab `409 CARD_REPLACEMENT_IN_PROGRESS`.
+- `fee` dibekukan dari katalog saat permintaan dibuat. Perubahan tarif
+  berikutnya tidak mengubah angka yang sudah diberitahukan ke nasabah.
+- Jendela estimasi berasal dari `card_products.delivery_days_min/max` — Blue dan
+  Gold 3–7 hari, Platinum 5–10 hari. Tanggalnya dihitung di WIB.
+- Kartu berpindah ke `REPLACEMENT_PENDING`, **kecuali** kartu yang sudah
+  `BLOCKED` — kartu yang dilaporkan hilang tetap terblokir.
+- **Permintaan berhenti di `REQUESTED`.** Pemenuhannya — kartu dicetak, dikirim,
+  lalu terbit sebagai kartu baru di `GET /account/cards` — datang dari core
+  banking, dan layanan ini belum punya kanal masuk untuk itu (tidak ada callback
+  maupun pekerja yang menaikkan status). Client sebaiknya menampilkan permintaan
+  yang sedang berjalan dari respons ini, bukan menunggu kartu penggantinya
+  muncul di daftar kartu.
+
 ### `POST /account/device/push-token`
 **Auth:** Bearer Token
 **Purpose:** Daftarkan FCM token perangkat untuk notifikasi push
@@ -652,6 +973,37 @@ klien tidak boleh menempelkan token ke perangkat yang bukan sedang dipakainya.
 }
 ```
 
+- `push_token` wajib, maksimal 512 karakter. Kosong atau lebih panjang dijawab
+  `400 VALIDATION_ERROR`.
+- **Idempoten.** Aplikasi memanggil endpoint ini setiap kali FCM merotasi token,
+  jadi tidak ada `X-Idempotency-Key` dan tidak ada penolakan duplikat.
+- Perangkat yang sudah dicabut (`devices.revoked_at`) dijawab
+  `403 AUTH_DEVICE_NOT_RECOGNIZED`, **bukan** `200` tanpa efek — 200 membuat
+  aplikasi yakin tokennya tersimpan padahal tidak.
+
+**Pengirimannya sekarang nyata.** Notifikasi dikirim ke FCM HTTP v1 begitu
+`FCM_CREDENTIALS_FILE` diisi. Tiga hal yang perlu diketahui client:
+
+- **Tanpa kredensial, tidak ada yang dikirim ke perangkat** — dan itu keadaan
+  yang sah. Baris notifikasi tetap ditulis, jadi aplikasi tetap melihat pesannya
+  lewat `GET /notifications` pada polling berikutnya. Di development isinya
+  dicatat ke log; di lingkungan lain proses memberi peringatan saat boot.
+- **Token yang ditolak FCM dibersihkan sendiri.** Hanya `UNREGISTERED` dan
+  `INVALID_ARGUMENT` yang menghapus `devices.push_token`; gangguan sementara
+  (`UNAVAILABLE`, kuota, jaringan) tidak — menghapus token karena FCM sedang
+  bermasalah berarti nasabah berhenti menerima push sampai aplikasinya dibuka
+  lagi. Aplikasi tidak perlu melakukan apa pun: pendaftaran token berikutnya
+  memulihkannya.
+- **Sakelar `push_notification_enabled` (`PUT /account/settings`) dihormati,
+  kecuali untuk notifikasi `SECURITY`.** Ganti PIN, ganti kode akses, dan
+  deteksi sesi mencurigakan tetap dikirim ke perangkat walau nasabah mematikan
+  notifikasi — itu justru pesan yang paling ia butuhkan. Apa pun sakelarnya,
+  baris in-app tetap ditulis dan tetap terbaca di layar Notifikasi.
+
+Muatan yang dikirim: `notification.title`, `notification.body`, dan `data` berisi
+`type` (lima nilai `NotificationTypes`) plus `deep_link` bila notifikasinya punya
+tujuan (`bcamobile://transaction/{id}`).
+
 ## 4. Transactions / Mutations
 
 ### `GET /transactions/mutations`
@@ -663,12 +1015,38 @@ klien tidak boleh menempelkan token ke perangkat yang bukan sedang dipakainya.
 **Cache:** Redis 1 menit
 **Pagination:** Cursor-based
 
+**Nilai `period` yang diterima** — daftar tertutup. Nilai di luar daftar dijawab
+`400 VALIDATION_ERROR` dengan `details.invalid_field = "period"` dan
+`details.allowed_values`. Nilai tak dikenal **tidak** diabaikan: dulu nilai salah
+tulis lolos sebagai "tanpa filter tanggal", jadi layar Mutasi menampilkan seluruh
+riwayat rekening seolah-olah itu 7 hari terakhir.
+
+| `period` | Rentang (tanggal WIB, kedua ujung inklusif) |
+|---|---|
+| `LAST_7_DAYS` | 6 hari lalu … hari ini |
+| `LAST_30_DAYS` | 29 hari lalu … hari ini |
+| `LAST_90_DAYS` | 89 hari lalu … hari ini |
+| `THIS_MONTH` | tanggal 1 bulan ini … hari ini |
+| `LAST_MONTH` | tanggal 1 bulan lalu … hari terakhir bulan lalu |
+| `CUSTOM` | `from` … `to`, wajib keduanya |
+
+Batas hari dihitung di `Asia/Jakarta`, bukan dengan `CURRENT_DATE`: pergantian
+hari yang dilihat nasabah adalah tengah malam Jakarta.
+
+`CUSTOM` menerima **`from`/`to`** maupun **`start_date`/`end_date`** (format
+`YYYY-MM-DD`); `from`/`to` yang kanonik. Tanpa `period`, pasangan tanggal saja
+tetap memfilter. `to` lebih awal dari `from`, format salah, atau `CUSTOM` tanpa
+tanggal → `400 VALIDATION_ERROR`.
+
 ```json
 // Request Query
 GET /transactions/mutations?account_id=acc_001&period=LAST_7_DAYS&cursor=&limit=20
 
+// Bulan lalu:
+GET /transactions/mutations?account_id=acc_001&period=LAST_MONTH&cursor=&limit=20
+
 // Atau custom date range:
-GET /transactions/mutations?account_id=acc_001&period=CUSTOM&start_date=2026-08-01&end_date=2026-08-31&cursor=&limit=20
+GET /transactions/mutations?account_id=acc_001&period=CUSTOM&from=2026-08-01&to=2026-08-31&cursor=&limit=20
 
 // Response 200
 {
@@ -721,11 +1099,21 @@ GET /transactions/mutations?account_id=acc_001&period=CUSTOM&start_date=2026-08-
 **Purpose:** Riwayat transaksi yang dilakukan user — Screen: **Riwayat**
 **Berbeda dari mutasi:** Ini menampilkan transaksi yang di-initiate user (transfer, top-up, pembayaran), bukan semua mutasi rekening
 
+**Filter periode:** sama persis dengan `GET /transactions/mutations` (§4) —
+`period` menerima `LAST_7_DAYS`, `LAST_30_DAYS`, `LAST_90_DAYS`, `THIS_MONTH`,
+`LAST_MONTH`, `CUSTOM`. `CUSTOM` wajib `from` + `to` (`YYYY-MM-DD`), dan
+`start_date`/`end_date` tetap diterima sebagai nama lain. Nilai `period` yang
+tidak dikenal dijawab `400 VALIDATION_ERROR` beserta `details.allowed_values` —
+**tidak** diabaikan diam-diam. Batas hari dihitung di `Asia/Jakarta`; hari
+terakhir rentang ikut terhitung penuh.
+
 ```json
 // Request Query
-GET /transactions/history?cursor=&limit=20&type=ALL
+GET /transactions/history?cursor=&limit=20&type=ALL&period=LAST_30_DAYS
 
 // type: ALL, TRANSFER, EWALLET, PAYMENT, PULSA
+// period: LAST_7_DAYS | LAST_30_DAYS | LAST_90_DAYS | THIS_MONTH | LAST_MONTH | CUSTOM
+// from, to: wajib saat period=CUSTOM (YYYY-MM-DD, WIB, kedua ujung inklusif)
 
 // Response 200
 {
@@ -1090,9 +1478,20 @@ Aturan kepemilikan sama dengan versi JSON: transaksi milik orang lain menjawab
 
 **Auth:** Bearer Token
 **Purpose:** Daftar notifikasi — Screen: **Beranda** (bell icon)
-**Cache:** Redis 1 menit
+**Cache:** Redis 1 menit — kunci cache memuat filter, jadi tab yang disaring
+tidak pernah tersaji sebagai daftar "Semua"
+
+**Filter jenis:** `type` menerima satu atau beberapa nilai dipisah koma dari
+daftar tertutup `TRANSACTION`, `PROMO`, `SECURITY`, `SYSTEM`, `INFO` (daftar yang
+sama dengan CHECK constraint `notifications.type`). Tanpa `type` = semua jenis.
+Nilai tak dikenal dijawab `400 VALIDATION_ERROR` beserta
+`details.allowed_values`. Urutan nilai tidak berpengaruh:
+`?type=PROMO,INFO` dan `?type=INFO,PROMO` adalah permintaan yang sama.
 
 ```json
+// Request Query
+GET /notifications?cursor=&limit=20&type=PROMO,SECURITY
+
 // Response 200
 {
   "status": "success",
@@ -1192,7 +1591,30 @@ Aturan kepemilikan sama dengan versi JSON: transaksi milik orang lain menjawab
 
 ---
 
-## 9. Registrasi (Buka Rekening)
+## 9. Registrasi (Buka Rekening) — **USANG**
+
+> **Keluarga endpoint ini usang. Pakai `/v1/onboarding/*`
+> (`docs/06-BUKA-REKENING-API-SPEC.md`).**
+>
+> Kedua keluarga menggambarkan fitur yang sama dengan dua kontrak berbeda:
+> `/v1/registration/*` memakai Registration Token, `/v1/onboarding/*` memakai
+> `session_id`. Aplikasi Android mengimplementasikan yang kedua, dan itu yang
+> dipelihara.
+>
+> `/v1/registration/*` **masih berjalan** untuk build lama dan tidak akan
+> dihapus diam-diam. Setiap responsnya membawa penanda, jadi integrasi baru bisa
+> melihatnya tanpa membaca dua spec:
+>
+> ```
+> Deprecation: true
+> Link: </v1/onboarding/*>; rel="successor-version"
+> X-API-Deprecation-Info: docs/01-API-SPECIFICATION.md#9-registrasi-buka-rekening
+> ```
+>
+> Header `Sunset` **tidak** dikirim: belum ada tanggal penghapusan yang
+> disepakati, dan mengarangnya di sini adalah janji yang tidak bisa ditepati
+> repo ini. Integrasi baru: jangan pakai keluarga ini.
+
 
 ### `POST /registration/initiate`
 > **Dev only:** saat `APP_ENV=development`, response memuat `otp_debug` berisi
@@ -1223,6 +1645,11 @@ Aturan kepemilikan sama dengan versi JSON: transaksi milik orang lain menjawab
 }
 ```
 
+**`503 OTP_DELIVERY_FAILED`:** provider SMS menolak kiriman. Registrasi tetap
+tersimpan di cache dan kodenya tetap sah, tapi `201 OTP_PENDING` untuk SMS yang
+tidak pernah terkirim adalah jawaban yang salah — keluarga endpoint ini tidak
+punya `resend-otp`, jadi nasabah tidak punya jalan keluar selain mengulang.
+
 ### `POST /registration/verify-otp`
 **Auth:** None
 
@@ -1252,6 +1679,73 @@ Aturan kepemilikan sama dengan versi JSON: transaksi milik orang lain menjawab
 
 ---
 
+## 10. Konten Statis
+
+Dua halaman terakhir di seksi BANTUAN & INFORMASI layar Profil Saya.
+
+**Keduanya TANPA `Authorization`.** Tidak ada data nasabah di dalamnya, dan
+nasabah yang terkunci di luar aplikasi justru yang paling butuh nomor CS.
+Keduanya membawa `Cache-Control: public, max-age=300` dan di-cache Redis 24 jam
+(docs/03-REDIS-STRATEGY.md). Tetap kena rate limit per IP: 60 permintaan/menit.
+
+Sumber datanya tabel `content_help_center` dan `content_contact_cs`
+(migrasi `000023`) — bukan konstanta di kode, supaya nomor CS dan jawaban FAQ
+bisa diperbaiki tanpa rilis.
+
+### `GET /content/help-center`
+**Auth:** — **Purpose:** Pusat Bantuan (FAQ)
+
+```json
+// Response 200
+{
+  "status": "success",
+  "data": {
+    "categories": [
+      {
+        "key": "CARD",
+        "title": "Kartu Paspor",
+        "items": [
+          {
+            "question": "Bagaimana cara memblokir kartu yang hilang?",
+            "answer": "Buka Profil Saya, pilih kartu yang hilang, lalu tekan Blokir Kartu…"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- `key` yang saat ini terbit: `CARD`, `TRANSACTION`, `SECURITY`, `ACCOUNT`.
+  Daftar ini **bisa bertambah** tanpa perubahan kode; `title` selalu ikut
+  dikirim supaya client yang belum mengenal sebuah key tetap punya teks untuk
+  ditampilkan, bukan kunci mentah.
+- Urutan kategori dan item ditentukan server. Tampilkan apa adanya.
+- Tabel kosong dijawab `200` dengan `{"categories": []}` — bukan `404`.
+
+### `GET /content/contact-cs`
+**Auth:** — **Purpose:** Kontak Halo BCA
+
+```json
+// Response 200
+{
+  "status": "success",
+  "data": {
+    "phone": "1500888",
+    "phone_free": "+62 21 23588000",
+    "whatsapp": "+62 811 1500 998",
+    "email": "halobca@bca.co.id",
+    "chat_url": "https://www.bca.co.id/halobca",
+    "hours": "24 jam setiap hari"
+  }
+}
+```
+
+- Semua field string siap tampil. `phone` untuk panggilan dalam negeri,
+  `phone_free` untuk dari luar negeri.
+
+---
+
 ## Error Code Reference
 
 | Code | HTTP | Description |
@@ -1262,6 +1756,8 @@ Aturan kepemilikan sama dengan versi JSON: transaksi milik orang lain menjawab
 | `AUTH_TOKEN_INVALID` | 401 | Token tidak valid |
 | `AUTH_BIOMETRIC_NOT_REGISTERED` | 401 | Biometrik belum terdaftar |
 | `AUTH_OLD_PIN_MISMATCH` | 422 | PIN lama salah saat ganti PIN |
+| `AUTH_PIN_KEY_UNKNOWN` | 422 | `encryption_key_id` bukan kunci PIN yang aktif. `details.expected_key_id` menyebut yang benar — ambil ulang dari `GET /auth/pin/public-key` |
+| `AUTH_BIOMETRIC_KEY_UNSUPPORTED` | 422 | `public_key` bukan EC P-256 saat register biometrik |
 | `AUTH_DEVICE_NOT_RECOGNIZED` | 403 | Device tidak dikenal |
 | `AUTH_SESSION_REVOKED` | 401 | Sesi sudah di-logout/dicabut — access token tidak berlaku lagi meski belum expired |
 | `ACCOUNT_FORBIDDEN` | 403 | `account_id` / `source_account_id` bukan milik pemegang token |
@@ -1279,7 +1775,14 @@ Aturan kepemilikan sama dengan versi JSON: transaksi milik orang lain menjawab
 | `OTP_INVALID` | 422 | Kode OTP salah |
 | `OTP_EXPIRED` | 422 | OTP kedaluwarsa atau belum diminta |
 | `OTP_BLOCKED` | 429 | Terlalu banyak percobaan OTP |
+| `ONBOARDING_DEVICE_MISMATCH` | 403 | `X-Device-ID` bukan perangkat pembuat sesi onboarding |
+| `CARD_NOT_FOUND` | 404 | Kartu tidak ditemukan **atau** bukan milik pemegang token — dua hal itu sengaja dijawab sama |
+| `CARD_BLOCKED` | 409 | Sakelar kanal tidak bisa diubah pada kartu terblokir |
+| `CARD_REPLACEMENT_IN_PROGRESS` | 409 | Sudah ada permintaan penggantian yang belum selesai untuk kartu ini |
+| `CARD_DELIVERY_UNAVAILABLE` | 422 | `delivery_method` tidak dilayani untuk jenis kartu ini |
 | `PROVIDER_NOT_CONFIGURED` | 503 | Integrasi eksternal (OCR, Dukcapil, biometrik, core banking) belum dipasang di environment ini |
+| `OTP_DELIVERY_FAILED` | 503 | Kode OTP terbit dan tersimpan, tapi provider SMS menolak kiriman. Kodenya tetap sah — tawarkan kirim ulang |
+| `OTP_CHANNEL_NOT_ALLOWED` | 400 | `channel` yang diminta tidak tersedia di deployment ini (atau tidak dikenal). Tidak ada yang dikirim dan tidak ada kuota terpakai — ulangi dengan `sms`. Lihat `docs/06-BUKA-REKENING-API-SPEC.md` §Channel pengiriman OTP |
 | `RATE_LIMIT_EXCEEDED` | 429 | Terlalu banyak request |
 | `MAINTENANCE_MODE` | 503 | Sedang maintenance |
 | `IDEMPOTENCY_CONFLICT` | 409 | Transaksi sudah diproses |

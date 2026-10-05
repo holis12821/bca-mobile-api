@@ -70,12 +70,28 @@ func (r *DeviceRepo) RegisterPushToken(ctx context.Context, userID uuid.UUID, de
 }
 
 // ListPushTokens returns the push tokens of a user's active devices.
-func (r *DeviceRepo) ListPushTokens(ctx context.Context, userID uuid.UUID) ([]string, error) {
+//
+// The JOIN onto users is what makes PUT /account/settings mean something. The
+// switch used to be stored and read by nobody, so a customer who turned
+// notifications off would still have been pushed to the moment a real provider
+// was wired in. Suppressing it here rather than in notify.Notifier is
+// deliberate: the in-app row must still be written, because that is what the
+// Notifikasi screen and the unread badge read.
+//
+// overrideMuted is passed true only for SECURITY notifications — "your access
+// code was changed" has to reach the handset even of someone who muted the rest.
+func (r *DeviceRepo) ListPushTokens(ctx context.Context, userID uuid.UUID, overrideMuted bool) ([]string, error) {
 	const query = `
-		SELECT push_token FROM devices
-		WHERE user_id = $1 AND revoked_at IS NULL AND push_token IS NOT NULL AND push_token <> ''`
+		SELECT d.push_token
+		FROM devices d
+		JOIN users u ON u.id = d.user_id
+		WHERE d.user_id = $1
+		  AND d.revoked_at IS NULL
+		  AND d.push_token IS NOT NULL
+		  AND d.push_token <> ''
+		  AND ($2 OR u.push_notification_enabled)`
 
-	rows, err := r.pool.Query(ctx, query, userID)
+	rows, err := r.pool.Query(ctx, query, userID, overrideMuted)
 	if err != nil {
 		return nil, fmt.Errorf("list push tokens: %w", err)
 	}
@@ -90,6 +106,23 @@ func (r *DeviceRepo) ListPushTokens(ctx context.Context, userID uuid.UUID) ([]st
 		tokens = append(tokens, t)
 	}
 	return tokens, rows.Err()
+}
+
+// ClearPushToken removes a token FCM has rejected as permanently invalid.
+//
+// Scoped to the token value, not to a user or device: a token can move between
+// installs, and what FCM rejected is the token itself. A token that is already
+// gone matches no row, and that is a success — this runs on a best-effort push
+// path and must not turn a cleanup into an error.
+func (r *DeviceRepo) ClearPushToken(ctx context.Context, token string) error {
+	const query = `
+		UPDATE devices SET push_token = NULL, updated_at = NOW()
+		WHERE push_token = $1`
+
+	if _, err := r.pool.Exec(ctx, query, token); err != nil {
+		return fmt.Errorf("clear push token: %w", err)
+	}
+	return nil
 }
 
 // UpdateLastActive updates last_active_at on the device.

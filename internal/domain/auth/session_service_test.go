@@ -55,6 +55,11 @@ type mockSessionRepo struct {
 	mu       sync.Mutex
 	sessions map[string]*auth.Session // keyed by refresh_token_hash
 	revoked  map[uuid.UUID]bool
+
+	// findActiveCalls menghitung query Postgres yang benar-benar terjadi.
+	// Dipakai untuk membuktikan token mati tidak membeli satu query per
+	// permintaan.
+	findActiveCalls int
 }
 
 func newMockSessionRepo() *mockSessionRepo {
@@ -100,6 +105,7 @@ func (m *mockSessionRepo) FindByRefreshTokenHash(_ context.Context, hash string)
 func (m *mockSessionRepo) FindActiveByID(_ context.Context, sessionID uuid.UUID) (*auth.Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.findActiveCalls++
 	if m.revoked[sessionID] {
 		return nil, nil
 	}
@@ -144,6 +150,12 @@ func (m *mockSessionRepo) RevokeByUserID(_ context.Context, userID uuid.UUID) er
 	return nil
 }
 
+func (m *mockSessionRepo) findActiveCallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.findActiveCalls
+}
+
 func (m *mockSessionRepo) isRevoked(id uuid.UUID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -153,10 +165,18 @@ func (m *mockSessionRepo) isRevoked(id uuid.UUID) bool {
 type mockSessionCache struct {
 	mu    sync.Mutex
 	store map[string]bool
+
+	// inactive meniru penanda session:inactive:{id} di Redis. Disimpan
+	// sungguhan, bukan di-stub ke false, supaya test bisa membuktikan jawaban
+	// Postgres benar-benar diingat.
+	inactive map[uuid.UUID]bool
 }
 
 func newMockSessionCache() *mockSessionCache {
-	return &mockSessionCache{store: make(map[string]bool)}
+	return &mockSessionCache{
+		store:    make(map[string]bool),
+		inactive: make(map[uuid.UUID]bool),
+	}
 }
 
 func (m *mockSessionCache) StoreSession(_ context.Context, s *auth.Session, _ string, _ string) error {
@@ -185,14 +205,17 @@ func (m *mockSessionCache) IsActive(_ context.Context, _ uuid.UUID) (bool, error
 	// the path these tests care about.
 	return false, nil
 }
-func (m *mockSessionCache) MarkInactive(_ context.Context, _ uuid.UUID, _ time.Duration) error {
+func (m *mockSessionCache) MarkInactive(_ context.Context, sessionID uuid.UUID, _ time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inactive[sessionID] = true
 	return nil
 }
 
-// Report "not remembered" so the validator keeps falling through to the repo,
-// which is the path these tests exercise.
-func (m *mockSessionCache) IsKnownInactive(_ context.Context, _ uuid.UUID) (bool, error) {
-	return false, nil
+func (m *mockSessionCache) IsKnownInactive(_ context.Context, sessionID uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inactive[sessionID], nil
 }
 func (m *mockSessionCache) RevokeActive(_ context.Context, _, _ uuid.UUID) error { return nil }
 func (m *mockSessionCache) RevokeAllActive(_ context.Context, _ uuid.UUID) error { return nil }
@@ -348,6 +371,38 @@ func hashToken(token string) string {
 }
 
 // --- Tests ---
+
+// Regresi: satu token mati dulu membeli satu query Postgres per permintaan.
+//
+// Penanda "hidup" di Redis sudah hilang begitu sesi dicabut, jadi IsActive
+// selalu miss dan fallback ke Postgres berjalan lagi dan lagi — selama sisa umur
+// access token (15 menit), tanpa rate limiter di rute terautentikasi. Jawaban
+// Postgres sekarang diingat: sesi yang sudah mati tidak pernah hidup kembali,
+// jadi mengingatnya aman.
+func TestIsSessionActive_RevokedSessionHitsPostgresOnce(t *testing.T) {
+	svc, sessionRepo, _, _, jwtMgr := setupService(t)
+	userID := uuid.New()
+	_, sessionID := createTestSession(t, jwtMgr, sessionRepo, userID)
+
+	if err := sessionRepo.RevokeByID(context.Background(), sessionID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	before := sessionRepo.findActiveCallCount()
+	for i := range 5 {
+		active, err := svc.IsSessionActive(context.Background(), sessionID)
+		if err != nil {
+			t.Fatalf("panggilan %d: %v", i, err)
+		}
+		if active {
+			t.Fatalf("panggilan %d: sesi yang dicabut dilaporkan aktif", i)
+		}
+	}
+
+	if got := sessionRepo.findActiveCallCount() - before; got != 1 {
+		t.Errorf("query Postgres: got %d untuk 5 permintaan, want 1", got)
+	}
+}
 
 func TestRefreshToken_HappyPath(t *testing.T) {
 	svc, sessionRepo, tokenRevocation, auditRepo, jwtMgr := setupService(t)

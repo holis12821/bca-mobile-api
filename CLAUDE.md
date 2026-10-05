@@ -39,13 +39,19 @@ Backend API m-BCA: Go 1.26 modular monolith, `chi` + `pgx/v5` (PostgreSQL 16)
 + `go-redis/v9` (Redis 7). Melayani aplikasi Android. Sekitar 20 ribu baris Go
 di luar test.
 
-Dua skill sudah tersedia dan **lebih detail** daripada file ini — pakai itu
+Skill di `.claude/skills/` **lebih detail** daripada file ini — pakai itu
 untuk pekerjaan mendalam:
 
 | Skill | Untuk |
 |---|---|
-| `bca-mobile-backend` | auth/PIN, saldo, Beranda, mutasi, transfer, e-wallet, QRIS, notifikasi, ledger, migrasi, Redis |
-| `buka-rekening-backend` | seluruh `/v1/onboarding/*` — OCR, Dukcapil, biometrik, video call, kredensial |
+| `bca-mobile-backend` | auth/PIN, saldo, Beranda, mutasi, transfer, e-wallet, QRIS, ledger, migrasi, Redis |
+| `buka-rekening-backend` | seluruh `/v1/onboarding/*` — OCR, Dukcapil, biometrik, kredensial, submit |
+| `buka-rekening-video-call-backend` | video call e-KYC — antrean, WebSocket signaling, siklus panggilan, sisi CS |
+| `buka-rekening-otp` | OTP onboarding — penerbitan, verifikasi, blokir, kirim ulang |
+| `buka-rekening-kartu` | katalog kartu + pemilihan kartu pada flow buka rekening |
+| `profil-saya-kartu-api` | kartu milik nasabah, `tier`, konten Pusat Bantuan & Kontak CS |
+| `push-notification-api` | `POST /account/device/push-token`, `internal/pkg/notify` + `push`, filter `type` notifikasi, transport FCM |
+| `twilio-sms-otp` | setup & integrasi provider SMS: kredensial Twilio, `SMS_*`, `internal/pkg/sms`, normalisasi E.164, menelusuri OTP yang tidak sampai |
 
 File ini hanya memuat yang **tidak** ada di skill: workflow harian, jebakan
 nyata di repo ini, dan aturan di atas.
@@ -63,7 +69,7 @@ make setup      # salin .env, generate kunci RSA, infra up, migrate, seed
 ### Harian
 
 ```bash
-make infra-up   # Postgres + Redis session + Redis cache
+make infra-up   # Postgres + Redis session + Redis cache + coturn (STUN/TURN)
 make dev        # server + hot reload (air)
 make stop       # hentikan server
 ```
@@ -118,7 +124,7 @@ internal/
   middleware/        auth, rate limit, CORS, body limit, timeout, audit
   pkg/               util lintas konteks: apperr, crypto, response, notify, pdf…
   websocket/         hub signaling video call
-migrations/          000001…000018, berpasangan .up.sql / .down.sql
+migrations/          000001…000025, berpasangan .up.sql / .down.sql
 ```
 
 **Arah impor satu arah, dan saat ini bersih — jaga tetap begitu:**
@@ -184,10 +190,16 @@ Hal-hal yang sudah pernah menggigit. Jangan diulang.
 
 ### Environment
 
-- Semua integrasi eksternal (OCR, Dukcapil, biometrik, object storage, core
+- Integrasi eksternal (OCR, Dukcapil, biometrik, object storage, core
   banking, SMS) hanya punya **mock**. Dipilih lewat `APP_ENV`:
   development → mock; selain itu → tolak `503 PROVIDER_NOT_CONFIGURED`.
   **Jangan pernah** memasang mock tanpa gerbang environment.
+- **Kecuali push notification**, yang punya transport sungguhan: `FCMPusher`
+  dipakai begitu `FCM_CREDENTIALS_FILE` diisi, kosong → `LoggingPusher` di
+  development dan `NoopPusher` + peringatan boot di lingkungan lain. Terisi tapi
+  tidak sah **menggagalkan boot** — itu sebabnya `router.New` mengembalikan
+  `(http.Handler, error)`. Berkas kredensialnya tinggal di `keys/` dan tidak
+  pernah ikut commit.
 - `otp_debug` di response **hanya** saat `APP_ENV=development`.
 
 ### Skema

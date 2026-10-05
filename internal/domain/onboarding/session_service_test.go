@@ -2,8 +2,11 @@ package onboarding
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 )
 
 // --- in-memory mocks ---
@@ -165,6 +168,49 @@ func TestCreateSession_Success(t *testing.T) {
 	}
 }
 
+// A session_id is a bearer secret with no token behind it, so a copy of one —
+// from a screenshot, a log line, a shared clipboard — must not be usable from
+// another phone. Every session-scoped handler calls this before touching the
+// session (docs/10-HANDOVER-BLOCKER-BACKEND.md butir 3).
+func TestAssertDeviceOwnsSession(t *testing.T) {
+	svc, _, _, _ := newService()
+	ctx := context.Background()
+
+	resp, err := svc.CreateSession(ctx, CreateSessionRequest{
+		ProductType:        "TAHAPAN_BCA",
+		DeviceID:           "dev_owner",
+		AcceptedTNCVersion: "2026-09-01",
+	}, "127.0.0.1", "test-agent")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if err := svc.AssertDeviceOwnsSession(ctx, resp.SessionID, "dev_owner"); err != nil {
+		t.Fatalf("the owning device must pass: %v", err)
+	}
+
+	// An absent header still passes: answering 403 to every build already in
+	// testers' hands would turn a hardening step into an outage.
+	if err := svc.AssertDeviceOwnsSession(ctx, resp.SessionID, ""); err != nil {
+		t.Fatalf("a client that sends no header must not be locked out: %v", err)
+	}
+
+	err = svc.AssertDeviceOwnsSession(ctx, resp.SessionID, "dev_someone_else")
+	if err == nil {
+		t.Fatal("a foreign device must be rejected")
+	}
+	if code := asAppErr(t, err).Code; code != apperr.OnboardingDeviceMismatch.Code {
+		t.Fatalf("expected ONBOARDING_DEVICE_MISMATCH, got %s", code)
+	}
+
+	// An unknown session is still reported as unknown — the device check must
+	// not turn a 404 into a 403.
+	err = svc.AssertDeviceOwnsSession(ctx, "onb_does_not_exist", "dev_owner")
+	if code := asAppErr(t, err).Code; code != apperr.OnboardingNotFound.Code {
+		t.Fatalf("expected ONBOARDING_NOT_FOUND, got %s", code)
+	}
+}
+
 func TestCreateSession_InvalidProduct(t *testing.T) {
 	svc, _, _, _ := newService()
 	ctx := context.Background()
@@ -317,5 +363,117 @@ func TestTransitionStep(t *testing.T) {
 	err = svc.TransitionStep(ctx, created.SessionID, StepBiometric, "127.0.0.1", "test-agent")
 	if err == nil {
 		t.Fatal("expected error for invalid step transition")
+	}
+}
+
+// Membatalkan sesi harus membatalkan panggilan video call yang masih hidup.
+//
+// Soft-delete sesi tidak menyentuh baris panggilan — foreign key-nya ON DELETE CASCADE,
+// tapi tidak ada baris yang benar-benar dihapus. Jadi panggilannya dulu tetap QUEUED,
+// tetap anggota sorted set, dan tetap muncul di daftar petugas sebagai panggilan yang bisa
+// diambil, padahal sesinya sudah tidak ada. `CANCELLED` adalah status yang sebelumnya
+// tidak pernah ditulis siapa pun.
+func TestCancelSessionCancelsLiveVideoCall(t *testing.T) {
+	repo := newMockSessionRepo()
+	cache := newMockSessionCache()
+	audit := &mockAuditRepo{}
+
+	vcRepo := newMockVideoCallRepo()
+	queueCache := newMockQueueCache()
+	vcSvc := NewVideoCallService(VideoCallServiceConfig{
+		Sessions:         repo,
+		Cache:            cache,
+		VideoCalls:       vcRepo,
+		QueueCache:       queueCache,
+		JWTManager:       testJWTManager(),
+		Audit:            audit,
+		SignalingBaseURL: "ws://test:8080",
+		Clock:            testClockWIB(),
+	})
+
+	svc := NewSessionService(SessionServiceConfig{
+		Sessions:   repo,
+		Cache:      cache,
+		Audit:      audit,
+		VideoCalls: vcSvc,
+	})
+
+	ctx := context.Background()
+	created, err := svc.CreateSession(ctx, CreateSessionRequest{
+		ProductType:        "TAHAPAN_BCA",
+		DeviceID:           "dev_cancel_vc",
+		AcceptedTNCVersion: "2026-09-01",
+	}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Sesi dibawa ke VIDEO_CALL lalu mengantre.
+	session := repo.sessions[created.SessionID]
+	session.CurrentStep = StepVideoCall
+	cache.data[created.SessionID] = session
+
+	joined, err := vcSvc.JoinQueue(ctx, JoinQueueRequest{SessionID: created.SessionID}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("join queue: %v", err)
+	}
+
+	if err := svc.CancelSession(ctx, created.SessionID, "127.0.0.1", "test"); err != nil {
+		t.Fatalf("cancel session: %v", err)
+	}
+
+	if got := vcRepo.byQueue[joined.QueueID].Status; got != VCStatusCancelled {
+		t.Errorf("status panggilan = %s, mau CANCELLED", got)
+	}
+	if _, ok := queueCache.members[joined.QueueID]; ok {
+		t.Error("panggilan sesi yang dibatalkan masih jadi anggota antrean")
+	}
+}
+
+// Pembatalan panggilan yang gagal tidak boleh menggagalkan pembatalan sesi: nasabah sudah
+// meminta sesinya dibatalkan dan itu sudah terjadi.
+func TestCancelSessionSucceedsWhenVideoCallCancelFails(t *testing.T) {
+	repo := newMockSessionRepo()
+	cache := newMockSessionCache()
+	audit := &mockAuditRepo{}
+
+	vcRepo := newMockVideoCallRepo()
+	vcRepo.cancelErr = errors.New("postgres sedang tersendat")
+	vcSvc := NewVideoCallService(VideoCallServiceConfig{
+		Sessions:         repo,
+		Cache:            cache,
+		VideoCalls:       vcRepo,
+		QueueCache:       newMockQueueCache(),
+		JWTManager:       testJWTManager(),
+		Audit:            audit,
+		SignalingBaseURL: "ws://test:8080",
+		Clock:            testClockWIB(),
+	})
+
+	svc := NewSessionService(SessionServiceConfig{
+		Sessions: repo, Cache: cache, Audit: audit, VideoCalls: vcSvc,
+	})
+
+	ctx := context.Background()
+	created, err := svc.CreateSession(ctx, CreateSessionRequest{
+		ProductType:        "TAHAPAN_BCA",
+		DeviceID:           "dev_cancel_err",
+		AcceptedTNCVersion: "2026-09-01",
+	}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	session := repo.sessions[created.SessionID]
+	session.CurrentStep = StepVideoCall
+	cache.data[created.SessionID] = session
+	if _, err := vcSvc.JoinQueue(ctx, JoinQueueRequest{SessionID: created.SessionID}, "127.0.0.1", "test"); err != nil {
+		t.Fatalf("join queue: %v", err)
+	}
+
+	if err := svc.CancelSession(ctx, created.SessionID, "127.0.0.1", "test"); err != nil {
+		t.Fatalf("pembatalan sesi harus tetap berhasil: %v", err)
+	}
+	if repo.sessions[created.SessionID].DeletedAt == nil {
+		t.Error("sesinya tidak di-soft-delete")
 	}
 }

@@ -133,7 +133,7 @@ func (s *Service) ListMutations(ctx context.Context, userID uuid.UUID, accountID
 }
 
 // ListHistory returns keyset-paginated transaction history.
-func (s *Service) ListHistory(ctx context.Context, userID uuid.UUID, txnType *string, cursorStr string, limit int) ([]TransactionItem, bool, string, error) {
+func (s *Service) ListHistory(ctx context.Context, userID uuid.UUID, txnType *string, period *DateRange, cursorStr string, limit int) ([]TransactionItem, bool, string, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
@@ -149,7 +149,7 @@ func (s *Service) ListHistory(ctx context.Context, userID uuid.UUID, txnType *st
 		cursor = &HistoryCursorValues{CreatedAt: c, ID: id}
 	}
 
-	rows, err := s.txns.ListByUserID(ctx, userID, txnType, cursor, limit+1)
+	rows, err := s.txns.ListByUserID(ctx, userID, txnType, period, cursor, limit+1)
 	if err != nil {
 		return nil, false, "", fmt.Errorf("list history: %w", err)
 	}
@@ -459,6 +459,14 @@ func (s *Service) GetReceipt(ctx context.Context, userID, txnID uuid.UUID) (*Rec
 	var sourceNumber, sourceName string
 	if txn.SourceAccountID != nil {
 		accounts, err := s.accounts.FindActiveByUserID(ctx, userID)
+		// Not fatal: a receipt without the source account label is still a
+		// receipt. But the error used to vanish without a trace, so "the source
+		// account is blank on some receipts" had nothing in the logs to explain
+		// it.
+		if err != nil {
+			slog.Error("resolve source account for receipt failed",
+				"transaction_id", txn.ID, "error", err)
+		}
 		if err == nil {
 			for _, a := range accounts {
 				if a.ID == *txn.SourceAccountID {

@@ -95,7 +95,8 @@ type NotificationRepository interface {
 	// ListByUserID returns paginated notifications for a user.
 	// Uses keyset pagination: cursor is the last notification ID.
 	// Returns limit+1 rows so caller can compute has_more.
-	ListByUserID(ctx context.Context, userID uuid.UUID, cursor *uuid.UUID, limit int) ([]Notification, error)
+	// types, when non-empty, keeps only those notification types.
+	ListByUserID(ctx context.Context, userID uuid.UUID, types []string, cursor *uuid.UUID, limit int) ([]Notification, error)
 
 	// CountUnread returns the number of unread notifications.
 	CountUnread(ctx context.Context, userID uuid.UUID) (int, error)

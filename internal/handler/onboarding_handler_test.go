@@ -12,7 +12,7 @@ import (
 // built with nil services is exactly the right instrument for testing it: if a
 // request ever got past validation, the test would panic instead of passing.
 func newValidationOnlyHandler() *OnboardingHandler {
-	return NewOnboardingHandler(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	return NewOnboardingHandler(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 }
 
 func postJSON(t *testing.T, h http.HandlerFunc, body string) *httptest.ResponseRecorder {

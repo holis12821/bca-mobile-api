@@ -95,6 +95,23 @@ Fields:
   created_at    → timestamp
 ```
 
+### Signaling Token (sekali pakai)
+
+```
+Key:    signal:jti:{jti}
+Type:   String ("1")
+TTL:    sisa umur token (maks 5 menit)
+Write:  SETNX saat WebSocket signaling tersambung
+```
+
+Token signaling video call dibawa di query string `?token=`, jadi ia berakhir di
+log proxy dan laporan crash: URL yang tersalin adalah kredensial yang tersalin.
+`SETNX` yang gagal berarti token sudah dipakai → koneksi ditolak `401`.
+
+Kalau Redis tidak terjangkau, koneksi ditolak `503`, **tidak** diterima. Ini satu
+dari sedikit tempat di mana gagal-terbuka tidak boleh: yang masuk adalah video
+call e-KYC yang sedang berjalan.
+
 ### User Session Set (untuk logout-all tanpa SCAN)
 
 ```
@@ -234,6 +251,61 @@ TTL:    5 menit
 Invalidation:
   - Saat transfer berhasil → DEL cache:transfers:recent:{user_id}
 ```
+
+### Konten Statis (Pusat Bantuan & Kontak CS)
+
+```
+Key:    content:help_center:v1
+Key:    content:contact_cs:v1
+Type:   String (JSON)
+TTL:    24 jam
+
+Invalidation:
+  - TIDAK ADA invalidasi eksplisit — dan itu disengaja.
+    Isinya diubah lewat SQL (UPDATE content_help_center / content_contact_cs),
+    dan siapa pun yang mengubahnya lewat psql tidak akan menjalankan perintah
+    invalidasi. TTL 24 jam adalah janji bahwa perubahan PASTI terlihat tanpa
+    ada yang perlu diingat.
+  - Perlu langsung terlihat? DEL kedua key itu setelah UPDATE.
+  - Versi ada di dalam key: mengubah BENTUK response berarti menaikkan v1 → v2,
+    dan entri lama kedaluwarsa sendiri.
+```
+
+Kegagalan Redis di dua key ini **tidak boleh** menggagalkan permintaan: layanan
+jatuh ke Postgres dan mencatat peringatan. Halaman inilah tempat nasabah yang
+terkunci di luar aplikasi mencari nomor CS — mematikannya karena cache bermasalah
+justru menutup pintu keluarnya.
+
+### Syarat & Ketentuan Buka Rekening
+
+```
+Key:    onboarding:tnc:v1:active          ← versi yang sedang berlaku
+Key:    onboarding:tnc:v1:ver:{version}   ← satu versi tertentu (termasuk yang dicabut)
+Type:   String (JSON)
+TTL:    24 jam
+
+Invalidation:
+  - Mengaktifkan versi baru WAJIB diikuti DEL onboarding:tnc:v1:active.
+    Ini satu-satunya key di dokumen ini yang invalidasinya wajib, bukan opsional.
+    Tanpa DEL, nasabah melihat teks LAMA sampai TTL habis — dan karena
+    ValidateVersion membaca key yang sama, persetujuannya tetap DITERIMA.
+    Jadi yang terjadi bukan error yang terlihat, tapi sehari penuh persetujuan
+    yang tercatat atas versi yang sudah dicabut. Itu justru kerusakan yang
+    seluruh migrasi 000025 dibuat untuk mencegah.
+  - Entri :ver:{version} tidak perlu di-DEL: isinya per versi dan versi lama
+    tidak berubah lagi.
+  - Versi BENTUK response ada di dalam key (v1): mengubah bentuknya berarti
+    menaikkan v1 → v2, dan entri lama kedaluwarsa sendiri.
+```
+
+`{version}` yang ikut ke dalam key dibatasi `^[A-Za-z0-9._-]{1,20}$` sebelum dipakai.
+Nilainya datang dari query string dan dari body request, jadi tanpa batas itu setiap nilai
+karangan mencetak key baru — dan titik dua di dalamnya bisa menyelipkan pemisah tambahan
+ke dalam key. Pelajaran yang sama dari `normalizeRegionCode` pada katalog kartu.
+
+Kegagalan Redis di sini **tidak boleh** menggagalkan permintaan: layanan jatuh ke Postgres
+dan mencatat peringatan. Ini layar PERTAMA buka rekening — mematikannya karena cache
+bermasalah berarti menutup pintu masuk nasabah baru.
 
 ### Notifications
 
@@ -449,6 +521,7 @@ func (r *RedisRepo) InvalidateTransactionCaches(ctx context.Context, parties []A
 | `session:*` | 15 menit | Access token lifetime |
 | `refresh:*` | 7 hari | Refresh token lifetime |
 | `bio_challenge:*` | 60 detik | Single-use, security |
+| `signal:jti:*` | ≤ 5 menit | Token signaling sekali pakai; TTL = sisa umur token |
 | `vtoken:*` | 120 detik | Transaction window |
 | `cache:balance:*` | 30 detik | Saldo berubah cepat |
 | `cache:dashboard:*` | 60 detik | Agregasi balance + notif |

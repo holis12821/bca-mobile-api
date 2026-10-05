@@ -68,7 +68,6 @@ internal/
 │   ├── monitoring_service.go    ← Audit trail retrieval + alert evaluation
 │   ├── ktp_parser.go            ← Indonesian KTP text parser + NIK validator
 │   ├── dukcapil_client.go       ← Mock Dukcapil client (implements DukcapilClient)
-│   ├── sms_gateway.go           ← Mock SMS gateway (implements SMSGateway)
 │   ├── biometric_engine.go      ← Mock biometric engine (implements BiometricEngine)
 │   └── core_banking.go          ← Mock core banking client (implements CoreBankingClient)
 ├── handler/
@@ -99,6 +98,8 @@ onboarding_biometrics    -- hasil biometrik
 onboarding_video_calls   -- rekaman & hasil video call
 onboarding_credentials   -- hash kode akses & PIN (Argon2id)
 onboarding_audit_logs    -- immutable audit trail
+onboarding_tnc_documents -- versi S&K; baris lama TIDAK PERNAH dihapus (migrasi 000025)
+onboarding_tnc_sections  -- pasal per versi S&K, berurut
 
 -- Redis keys
 onboarding:session:{session_id}           -- session cache (TTL 24h)
@@ -110,6 +111,8 @@ onboarding:bio_rate:{session_id}         -- biometric attempt counter (5/hour)
 onboarding:queue:active                  -- video call sorted set (score = join timestamp)
 onboarding:queue:counter:{YYYY-MM-DD}   -- daily sequential queue number
 onboarding:idem:{session_id}:{idempotency_key}  -- submit idempotency slot (SETNX claim 60s, response TTL 24h)
+onboarding:tnc:v1:active                 -- versi S&K yang berlaku (TTL 24h) — WAJIB DEL saat mengaktifkan versi baru
+onboarding:tnc:v1:ver:{version}          -- satu versi S&K tertentu (TTL 24h)
 ```
 
 ### Session State Machine
@@ -118,7 +121,12 @@ onboarding:idem:{session_id}:{idempotency_key}  -- submit idempotency slot (SETN
 TNC → OCR → PERSONAL_DATA → OTP_VERIFY → BIOMETRIC → VIDEO_CALL → CREDENTIALS → REVIEW → COMPLETED
 ```
 
-- Session dimulai di step `OCR` (TNC accepted saat create session)
+- Session dimulai di step `OCR` (TNC accepted saat create session). Layar S&K sendiri
+  TIDAK punya step: ia dibaca lewat `GET /tnc` sebelum sesi ada
+- `accepted_tnc_version` pada create session divalidasi ke `onboarding_tnc_documents`,
+  bukan sekadar dicek tidak kosong. Versi lama → `409 TNC_VERSION_OUTDATED` +
+  `details.current_version`; versi karangan → `422 TNC_VERSION_UNKNOWN`. Diperiksa SEBELUM
+  batas 3 sesi per perangkat, supaya persetujuan yang salah versi tidak menghabiskan jatah
 - Setiap transisi hanya boleh maju 1 step (enforced oleh `CanTransition()`)
 - TTL rolling 24 jam — diperpanjang di setiap step transition
 - Side states: session bisa di-soft-delete (cancel) atau expired (lazy check)
@@ -130,6 +138,7 @@ Semua route di bawah `/v1/onboarding/` sub-router dengan `OnboardingAudit` middl
 **Public endpoints (nasabah):**
 | Method | Path | Handler |
 |--------|------|---------|
+| GET | `/tnc` | GetTNC — teks S&K, tanpa session_id & tanpa auth |
 | POST | `/sessions` | CreateSession |
 | GET | `/sessions/{session_id}` | GetSession |
 | DELETE | `/sessions/{session_id}` | CancelSession |
@@ -279,7 +288,7 @@ Requirements:
   - Store in `onboarding_personal_data` table
   - Generate 6-digit OTP (crypto/rand), hash with SHA-256
   - Store OTP hash in Redis (key: onboarding:otp:{session_id}, TTL 5 minutes)
-  - Send OTP via SMS gateway (SMSGateway interface)
+  - Send OTP via SMSGateway (dipilih di router.New; lihat skill `twilio-sms-otp`)
   - Transition: PERSONAL_DATA → OTP_VERIFY
 
 - POST /v1/onboarding/verify-otp
@@ -332,6 +341,12 @@ On success: transition BIOMETRIC → VIDEO_CALL
 
 ## Prompt 5: Video Call Queue & Signaling Server
 
+> **Sudah terimplementasi, dan arsitekturnya didokumentasikan terpisah.**
+> Untuk pekerjaan apa pun di video call — antrean, signaling, siklus panggilan, sisi CS —
+> pakai skill `buka-rekening-video-call-backend`. Prompt di bawah hanya jejak implementasi
+> awal dan **tidak lagi akurat** (TTL token sudah 5 menit, bukan 1 jam, dan emisi
+> server→client sudah punya pemiliknya sendiri).
+
 ```
 Implement video call queue management and WebRTC signaling server.
 
@@ -344,7 +359,7 @@ PART A: Queue Management
   - Store in PostgreSQL `onboarding_video_calls` table
   - Add to Redis sorted set (key: onboarding:queue:active, score = join timestamp)
   - Daily counter key: onboarding:queue:counter:{YYYY-MM-DD}
-  - Return signaling WebSocket URL with short-lived JWT token (1 hour TTL)
+  - Return signaling WebSocket URL with short-lived JWT token (5 minutes, single-use)
 
 - POST /v1/onboarding/video-call/result — submit result (internal, requires X-Internal-API-Key)
   - Validate queue_id and session_id match

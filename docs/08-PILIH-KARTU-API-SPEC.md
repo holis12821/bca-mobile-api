@@ -6,17 +6,20 @@
 >
 > Layar client yang dilayani: `BukaRekeningPilihKartuScreen.kt`.
 
-> ### ⚠ Angka dalam dokumen ini bukan angka resmi
+> ### ⚠ Angka dalam dokumen ini adalah data portofolio
 >
-> Seluruh nominal biaya dan limit pada contoh payload (`14000`, `16000`, `19000`,
-> limit tarik tunai, dst.) **disalin dari `strings.xml` client** — lihat §1. Itu
-> **data desain untuk layar**, bukan tarif produk yang disahkan.
+> Nominal biaya dan limit pada contoh payload **sama dengan yang benar-benar
+> disajikan API**, karena keduanya berasal dari satu sumber:
+> `migrations/000022_card_catalog_rates.up.sql`.
 >
-> **Jangan menyemai angka-angka itu ke database staging atau produksi.** Angka
-> resmi harus diminta ke product owner lebih dulu; lihat §17.
+> Angka itu **diputuskan di dalam proyek ini** — proyek portofolio — bukan tarif
+> resmi BCA, dan bukan lagi salinan dari `strings.xml` client (`14000` / `16000` /
+> `19000`, lihat §1). Nilainya dipilih supaya koheren antar tingkat kartu:
+> setiap limit dan biaya bulanan naik dari Blue ke Gold ke Platinum.
 >
-> Contoh di dokumen ini ada untuk menunjukkan **bentuk** payload — nama field,
-> tipe data, susunan objek — bukan **isinya**.
+> Kalau layanan ini pernah dipakai sungguhan, tarif resmi masuk lewat admin API
+> katalog (§3), yang menaikkan `catalog_version` dan mencatat nilai lama + baru —
+> bukan lewat migrasi baru. Lihat §17.
 
 ---
 
@@ -26,7 +29,7 @@ Sampai hari ini layar pilih kartu memakai data lokal: `defaultKartuPasporList()`
 biaya administrasi dan limit dari `strings.xml` (`buka_rekening_kartu_blue_biaya`,
 `..._tarik_tunai`, dst). Akibatnya:
 
-- Mengubah biaya admin Rp14.000 → Rp15.000 berarti **rilis ulang APK**.
+- Mengubah biaya admin Rp15.000 → Rp16.000 berarti **rilis ulang APK**.
 - Kartu yang stoknya habis di satu wilayah tetap terlihat bisa dipilih.
 - Server tidak pernah tahu kartu mana yang dipilih nasabah, jadi `POST /onboarding/submit`
   tidak bisa membuat permintaan cetak kartu.
@@ -109,7 +112,7 @@ GET /v1/onboarding/products/{product_type}/cards
 | Nama | Wajib | Keterangan |
 |---|---|---|
 | `product_type` (path) | ya | `TAHAPAN_BCA` \| `TAHAPAN_XPRESI` \| `TABUNGANKU` |
-| `region_code` (query) | tidak | Kode wilayah untuk cek stok kartu fisik, mis. `DKI` |
+| `region_code` (query) | tidak | Kode wilayah untuk cek stok kartu fisik, mis. `DKI`. Bentuknya ditegakkan: huruf besar dan angka, 1–10 karakter (`^[A-Z0-9]{1,10}$`). Huruf kecil dibakukan jadi huruf besar; kosong berarti katalog nasional. Bentuk lain dijawab `VALIDATION_ERROR` (400) dengan `details.invalid_field: "region_code"` — nilainya ikut membentuk kunci cache Redis, jadi nilai bebas berarti entri cache tanpa batas |
 
 ### Header
 
@@ -141,12 +144,12 @@ Endpoint ini **tidak** butuh `Authorization` maupun `session_id`.
         "is_popular": true,
         "display_order": 1,
         "fees": {
-          "monthly_admin": 14000,
+          "monthly_admin": 15000,
           "card_issuance": 0,
-          "card_replacement": 15000
+          "card_replacement": 25000
         },
         "limits": {
-          "cash_withdrawal": 10000000,
+          "cash_withdrawal": 7000000,
           "transfer_bca": 50000000,
           "transfer_interbank": 15000000,
           "debit_purchase": 50000000
@@ -175,9 +178,9 @@ Endpoint ini **tidak** butuh `Authorization` maupun `session_id`.
         "badge_key": "FLEXIBLE_TRANSACTION",
         "is_popular": false,
         "display_order": 2,
-        "fees": { "monthly_admin": 16000, "card_issuance": 0, "card_replacement": 15000 },
+        "fees": { "monthly_admin": 17000, "card_issuance": 0, "card_replacement": 25000 },
         "limits": {
-          "cash_withdrawal": 15000000,
+          "cash_withdrawal": 10000000,
           "transfer_bca": 75000000,
           "transfer_interbank": 20000000,
           "debit_purchase": 75000000
@@ -200,9 +203,9 @@ Endpoint ini **tidak** butuh `Authorization` maupun `session_id`.
         "badge_key": "MAX_LIMIT",
         "is_popular": false,
         "display_order": 3,
-        "fees": { "monthly_admin": 19000, "card_issuance": 0, "card_replacement": 15000 },
+        "fees": { "monthly_admin": 20000, "card_issuance": 0, "card_replacement": 50000 },
         "limits": {
-          "cash_withdrawal": 20000000,
+          "cash_withdrawal": 12500000,
           "transfer_bca": 100000000,
           "transfer_interbank": 25000000,
           "debit_purchase": 100000000
@@ -239,6 +242,7 @@ Bila `If-None-Match` cocok → `304 Not Modified` tanpa body.
 | `ONBOARDING_PRODUCT_UNKNOWN` | 404 | `product_type` di luar enum |
 | `ONBOARDING_PRODUCT_UNAVAILABLE` | 422 | Produk sedang maintenance |
 | `CARD_CATALOG_EMPTY` | 404 | Produk valid tapi belum punya satu pun kartu aktif |
+| `VALIDATION_ERROR` | 400 | `X-Device-Id` tidak ada (`details.missing_header`), atau `region_code` di luar bentuk yang diizinkan (`details.invalid_field`) |
 | `RATE_LIMIT_EXCEEDED` | 429 | Sertakan `details.retry_after_seconds` |
 
 ---
@@ -253,7 +257,7 @@ memaksa client menanam nilai visual. **Wajib dipatuhi di sisi server:**
    ke token `CardArt` di `ui/theme/Color.kt`. Menambah gaya baru berarti menambah token
    di client lebih dulu — koordinasikan, jangan kirim nilai yang belum dikenal.
 2. **Nominal dikirim sebagai integer rupiah penuh**, bukan string terformat.
-   `14000`, bukan `"Rp14.000"`. Pemformatan milik client.
+   `15000`, bukan `"Rp15.000"`. Pemformatan milik client.
 3. **Label statis dikirim sebagai key, bukan kalimat.** `badge_key: "RECOMMENDED_BEGINNER"`,
    bukan `"Rekomendasi Pemula"`. Client memetakannya ke `strings.xml`. Key yang tidak dikenal
    client → badge tidak ditampilkan, bukan crash.
@@ -360,7 +364,7 @@ client bisa menyegarkan tampilan biaya sebelum layar Ringkasan.
       "card_type": "PASPOR_BLUE",
       "name": "Blue Mastercard",
       "style": "BLUE",
-      "fees": { "monthly_admin": 14000 },
+      "fees": { "monthly_admin": 15000 },
       "catalog_version": "2026-09-22.1"
     },
     "current_step": "OCR",
@@ -399,7 +403,7 @@ di `CARD_SELECTION`, atau mengubah kartu dari layar Ringkasan.
       "card_type": "PASPOR_GOLD",
       "name": "Gold Mastercard",
       "style": "GOLD",
-      "fees": { "monthly_admin": 16000 },
+      "fees": { "monthly_admin": 17000 },
       "catalog_version": "2026-09-22.1"
     },
     "current_step": "OCR",
@@ -426,6 +430,7 @@ permintaan cetak sudah masuk ke core banking.
 | `CARD_TYPE_UNAVAILABLE` | 409 | Stok habis atau kartu dinonaktifkan |
 | `CARD_NOT_ELIGIBLE` | 422 | Umur/setoran awal tidak memenuhi; sertakan `details.reason_key` |
 | `CARD_LOCKED` | 409 | Pengajuan sudah disubmit |
+| `VALIDATION_ERROR` | 400 | `region_code` di luar bentuk yang diizinkan; lihat §4 |
 
 ---
 
@@ -439,7 +444,7 @@ Tambahan pada payload `GET /v1/onboarding/sessions/{session_id}`:
     "card_type": "PASPOR_GOLD",
     "name": "Gold Mastercard",
     "style": "GOLD",
-    "fees": { "monthly_admin": 16000 },
+    "fees": { "monthly_admin": 17000 },
     "catalog_version": "2026-09-22.1"
   },
   "steps_completed": {
@@ -715,7 +720,7 @@ kapan, nilai lama, nilai baru.
 
 | Endpoint | Limit |
 |---|---|
-| `GET /onboarding/products/{type}/cards` | 60/jam per device (respons cacheable, ini hanya penjaga) |
+| `GET /onboarding/products/{type}/cards` | 60/jam per device (respons cacheable, ini hanya penjaga) **dan** 600/jam per IP |
 | `PUT /onboarding/sessions/{id}/card` | 10/session |
 
 ---
@@ -761,37 +766,42 @@ kapan, nilai lama, nilai baru.
 - [x] Admin API katalog (§3) beserta jejak `card_catalog_audit_log`: satu kenaikan
       versi per transaksi, nilai lama + baru tersimpan
 - [x] Metrik, alert rasio `CARD_TYPE_UNAVAILABLE`, dan kedua query audit (§10b)
-- [ ] Tidak ada satu pun angka placeholder §4 yang tersemai di staging/produksi
-      — **masih terbuka, dan ini satu-satunya yang menahan rilis.** Seluruh angka
-      fee/limit dan kode core banking yang ada sekarang adalah placeholder dev
-      (`11111`, `CB-DEV-BLUE`, …). Lihat §17.
+- [x] Tidak ada satu pun angka placeholder yang tersemai — angka berulang
+      (`11111`/`22222`/`33333`) sudah hilang dari repo, diganti katalog yang
+      diputuskan di `migrations/000022_card_catalog_rates.up.sql`. Angka itu
+      **data portofolio, bukan tarif resmi BCA**; penggantiannya lewat admin API
+      (§3), bukan migrasi baru. Kode core banking masih `CB-DEV-*` — fiktif, dan
+      memang tidak ada core banking sungguhan di proyek ini. Lihat §17.
 
 ---
 
-## 17. Keputusan yang Belum Diambil
+## 17. Keputusan — sudah diambil di dalam proyek
 
-Lima hal di bawah **belum punya jawaban** dan tidak boleh ditebak. Sampai terisi,
-implementasi boleh jalan dengan placeholder **di lingkungan dev saja**.
+**Proyek ini portofolio, jadi keenam butir di bawah diputuskan sendiri** (2026-09-25),
+bukan ditunggu dari product owner, engineering manager, tim core banking, atau
+compliance. Setiap keputusan menyebut di mana nilainya hidup dan apa yang harus
+diganti kalau layanan ini pernah dipakai sungguhan.
 
-**Status:** seluruh kode yang bergantung pada kelima butir ini SUDAH ditulis dan diuji,
-memakai placeholder dev yang digerbangi `APP_ENV` dan feature flag. Yang tersisa adalah
-mengganti nilainya — bukan menulis kodenya. Tiap baris di bawah menyebut apa yang perlu
-diganti dan di mana.
+Yang **tidak** berubah: tarif di sini bukan tarif resmi BCA, dan tidak ada satu
+pun angka yang disalin dari `strings.xml` client. Penggantian tarif adalah
+operasi lewat admin API katalog (§3) — bukan migrasi baru, bukan seeder.
 
-Skill `buka-rekening-kartu` memakai daftar ini sebagai gerbang: agent tidak mulai
-menulis kode sebelum kolom "Jawaban" terisi.
+| # | Pertanyaan | Keputusan | Hidup di mana |
+|---|---|---|---|
+| 1 | Kartu apa yang ditawarkan untuk Xpresi dan TabunganKu | Xpresi: Blue + Gold. TabunganKu: Blue saja. Kelas kartu naik bersama kelas produknya — menawarkan kartu bersyarat setoran awal Rp10 juta pada produk setoran awal Rp20 ribu berarti memajang pilihan yang pasti tidak bisa diambil. Default selalu Blue: kartu termurah adalah pilihan paling tidak mengejutkan bagi nasabah yang menekan lanjut tanpa membaca | `migrations/000022_card_catalog_rates.up.sql` (`product_card_options`) |
+| 2 | Biaya administrasi, penerbitan, dan penggantian per kartu | Admin/bln **15.000 / 17.000 / 20.000** (Blue/Gold/Platinum). Penerbitan **0** untuk ketiganya — kartu pertama tidak ditagih, dan biaya penggantian yang menanggung kartu kedua. Penggantian **25.000 / 25.000 / 50.000**; ini satu-satunya biaya yang tidak naik bertingkat, karena yang membedakan hanya biaya cetak kartunya | `migrations/000022_card_catalog_rates.up.sql` (`card_products`) |
+| 3 | Keempat limit per kartu | Tarik tunai **7 / 10 / 12,5 juta**; transfer BCA **50 / 75 / 100 juta**; antar bank **15 / 20 / 25 juta**; debit **50 / 75 / 100 juta**. Naik bertingkat tanpa kecuali — katalog yang tingkatnya tidak berurutan membuat layar pilih kartu kehilangan alasan keberadaannya | `migrations/000022_card_catalog_rates.up.sql` (`card_products`) |
+| 7 | Siapa yang boleh menulis katalog | `X-Internal-API-Key` sebagai satu-satunya gerbang, dengan `X-Admin-Actor` **dicatat, tidak diverifikasi** — diterima apa adanya untuk lingkup portofolio: pemanggilnya satu backend CS yang dipercaya. Deployment sungguhan menaruh SSO + peran di depannya, dan saat itu `X-Admin-Actor` berhenti menjadi header dan menjadi klaim token | `middleware.InternalAPIKey`, `CardAdminHandler.adminActor` |
+| 8 | Kode kartu core banking | `CB-DEV-BLUE` / `CB-DEV-GOLD` / `CB-DEV-PLAT`. **Sengaja tetap bernama DEV**: tidak ada core banking sungguhan di proyek ini, hanya mock yang digerbangi `APP_ENV`, jadi nama yang terlihat resmi hanya akan menyesatkan. Diverifikasi saat startup — kartu aktif tanpa pemetaan menolak start | `ONBOARDING_CARD_CORE_BANKING_CODES` di `.env.example` |
+| 9 | Lama penyimpanan `onboarding_card_selection_log` | **10 tahun**, sejajar dengan kewajiban penyimpanan dokumen perusahaan, karena yang dibuktikan baris ini adalah biaya yang dilihat nasabah saat memilih. **Belum ada job pembersihan yang dipasang** dan itu disengaja: penghapusan data audit harus dijalankan terjadwal dan dapat diaudit sendiri, bukan disisipkan sebagai efek samping migrasi | keputusan tercatat di sini; komentar tabel di `migrations/000019_card_products.up.sql` |
 
-| # | Pertanyaan | Dibutuhkan oleh | Pemilik | Jawaban | Placeholder yang dipakai sekarang |
-|---|---|---|---|---|---|
-| 1 | Kartu apa yang ditawarkan untuk Xpresi dan TabunganKu | seed, §4 | Product owner | _belum_ | Xpresi: Blue+Gold; TabunganKu: Blue — `scripts/seed/main.go` |
-| 2 | Biaya administrasi, penerbitan, dan penggantian resmi per kartu | §4, §11, seed | Product owner / tarif resmi | _belum_ | `11111`/`22222`/`33333` — `scripts/seed/main.go` |
-| 3 | Keempat limit resmi per kartu (`limit_cash_withdrawal`, `limit_transfer_bca`, `limit_transfer_interbank`, `limit_debit_purchase`) | §4, §11, seed | Product owner | _belum_ | angka berulang senada — `scripts/seed/main.go` |
-| 7 | Siapa yang boleh menulis katalog, dan otorisasi apa di atas `X-Internal-API-Key` | §3, §13 | Engineering manager | _belum_ | `X-Internal-API-Key` + header `X-Admin-Actor` yang **hanya dicatat**, tidak diverifikasi — `CardAdminHandler.adminActor` |
-| 8 | Kode kartu yang dipakai core banking untuk permintaan cetak | §10 | Tim core banking | _belum_ | `CB-DEV-BLUE`/`-GOLD`/`-PLAT` — `ONBOARDING_CARD_CORE_BANKING_CODES` di `.env.example` |
-| 9 | Lama penyimpanan `onboarding_card_selection_log` | §11 | Compliance | _belum_ | tanpa batas; tidak ada job pembersihan yang dipasang, sesuai komentar tabelnya |
+### Yang masih perlu orang, bukan kode
 
-Penomoran mengikuti daftar sembilan informasi wajib di skill; butir 1, 4, 5, dan 6
-sudah terjawab oleh dokumen ini:
+Tidak ada — untuk katalog kartu. Yang tersisa di seluruh proyek ada di
+`docs/10-HANDOVER-BLOCKER-BACKEND.md`, dan tidak ada satu pun yang menyangkut §17.
+
+Penomoran mengikuti daftar sembilan informasi wajib di skill. Butir 1, 4, 5, dan 6
+terjawab oleh dokumen ini sejak awal:
 
 | # | Pertanyaan | Terjawab di |
 |---|---|---|
@@ -800,11 +810,16 @@ sudah terjawab oleh dokumen ini:
 | 5 | Stok kartu dipantau per wilayah | §4 & §11 — `region_code` |
 | 6 | SLA pengiriman dan ambil di cabang | §4 & §11 — `delivery_days_min/max`, `branch_pickup_available` |
 
-### Kenapa butir 2 dan 3 paling berbahaya
+### Kenapa butir 2 dan 3 tetap ditangani hati-hati
 
 Angka di `strings.xml` client dibuat supaya layar terlihat benar, bukan supaya
-tagihan benar. Menyalinnya ke database produksi menghasilkan sistem yang
-**konsisten dengan mockup dan salah terhadap nasabah** — dan karena
-`monthly_admin_fee_shown` ikut tercatat di audit log, angka yang salah itu
-menjadi bukti tertulis bahwa nasabah diberi tahu tarif yang keliru.
+tagihan benar. Menyalinnya ke database menghasilkan sistem yang **konsisten
+dengan mockup dan salah terhadap nasabah** — dan karena `monthly_admin_fee_shown`
+ikut tercatat di audit log, angka yang salah itu menjadi bukti tertulis bahwa
+nasabah diberi tahu tarif yang keliru.
+
+Itu sebabnya katalog sekarang tidak memakai angka client (`14000`/`16000`/`19000`)
+maupun angka yang jelas palsu (`11111`/`22222`/`33333`), melainkan satu himpunan
+yang diputuskan sendiri, ditulis di satu tempat, dan dijelaskan alasannya baris
+per baris di migrasinya.
 

@@ -461,6 +461,12 @@ func (s *CardService) SetCard(ctx context.Context, req SetCardRequest, ipAddress
 		return nil, err
 	}
 
+	// Sesi milik perangkat lain tidak boleh diubah dari sini. Header kosong
+	// tetap lewat — lihat assertSessionDevice.
+	if err := assertSessionDevice(session, req.DeviceID); err != nil {
+		return nil, err
+	}
+
 	// Setelah submit, permintaan cetak sudah masuk ke core banking. Mengganti
 	// kartu di sini hanya akan membuat data sesi berbeda dari kartu yang
 	// benar-benar dicetak.

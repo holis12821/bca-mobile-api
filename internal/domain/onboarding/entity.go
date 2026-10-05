@@ -488,6 +488,15 @@ type SavePersonalDataRequest struct {
 	SessionID    string            `json:"session_id"`
 	OCRID        string            `json:"ocr_id"`
 	PersonalData PersonalDataInput `json:"personal_data"`
+
+	// Channel picks how the OTP is delivered: "sms" (the default) or "call",
+	// where the provider reads the code out loud. Optional, so an older app build
+	// that omits it keeps getting SMS.
+	//
+	// Only honoured when the provider owns the code (SMS_PROVIDER=twilio_verify)
+	// and the deployment has enabled that channel; otherwise the request is
+	// refused with OTP_CHANNEL_NOT_ALLOWED rather than quietly downgraded to SMS.
+	Channel string `json:"channel,omitempty"`
 }
 
 // SavePersonalDataResponse is returned on successful personal data save.
@@ -523,6 +532,12 @@ type ResendOTPRequest struct {
 	SessionID string `json:"session_id"`
 	// DeviceID comes from the X-Device-ID header. See VerifyOTPRequest.
 	DeviceID string `json:"-"`
+
+	// Channel picks the delivery channel for this resend. See
+	// SavePersonalDataRequest.Channel. This is the field that makes "the SMS
+	// never arrived" recoverable: a nasabah on an operator that is filtering the
+	// message can ask for a call instead.
+	Channel string `json:"channel,omitempty"`
 }
 
 // ResendOTPResponse is returned on successful OTP resend.
@@ -640,13 +655,36 @@ type JoinQueueResponse struct {
 	EstimatedWaitSeconds int64          `json:"estimated_wait_seconds"`
 	OperatingHours       OperatingHours `json:"operating_hours"`
 	SignalingURL         string         `json:"signaling_url"`
+
+	// SignalingExpiresIn adalah umur token di dalam signaling_url, dalam detik.
+	// Token sekali pakai: sambungan yang terputus harus join ulang untuk
+	// mendapat token baru, bukan memakai URL yang sama (§5b).
+	SignalingExpiresIn int `json:"signaling_expires_in"`
+
+	// ICEServers adalah daftar STUN/TURN yang dipakai WebRTC. Kosong berarti
+	// belum ada TURN yang dikonfigurasi: panggilan masih jadi di jaringan yang
+	// ramah dan gagal di seluler ber-NAT ketat.
+	ICEServers []ICEServer `json:"ice_servers"`
+}
+
+// ICEServer mengikuti bentuk RTCIceServer di WebRTC, jadi client bisa
+// meneruskannya apa adanya ke PeerConnection tanpa memetakan ulang.
+type ICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
 }
 
 // SubmitVideoCallResultRequest is sent by the CS backend after a call.
+//
+// `agent_employee_id` **tidak** ada di sini lagi. Identitas petugas datang dari kredensial
+// yang diautentikasi middleware (X-Agent-Employee-ID + X-Agent-API-Key), bukan dari body:
+// selama ia sebuah field payload, siapa pun yang memegang INTERNAL_API_KEY bisa
+// menandatangani hasil verifikasi dengan nama pegawai mana pun. Dibiarkan ada tapi
+// diabaikan akan lebih buruk — pemanggil mengira field itu masih berfungsi.
 type SubmitVideoCallResultRequest struct {
 	SessionID           string `json:"session_id"`
 	QueueID             string `json:"queue_id"`
-	AgentEmployeeID     string `json:"agent_employee_id"`
 	Result              string `json:"result"`
 	KTPShownLive        bool   `json:"ktp_shown_live"`
 	IdentityConfirmed   bool   `json:"identity_confirmed"`
@@ -682,6 +720,55 @@ type AgentSignalingResponse struct {
 	QueueNumber  string    `json:"queue_number"`
 	SignalingURL string    `json:"signaling_url"`
 	ExpiresAt    time.Time `json:"expires_at"`
+
+	// ICEServers: sisi agent memakai TURN yang sama dengan nasabah.
+	ICEServers []ICEServer `json:"ice_servers"`
+}
+
+// Jenis pesan signaling (`06-BUKA-REKENING-API-SPEC.md` §5b).
+//
+// Dikumpulkan di sini supaya tidak ada literal "agent_assigned" yang berserak di service,
+// hub, dan test — satu salah ejaan di salah satunya menghasilkan pesan yang dikirim tapi
+// tidak pernah dikenali client, dan itu gagal tanpa jejak.
+const (
+	// Client → Server.
+	SignalJoin         = "join"
+	SignalOffer        = "offer"
+	SignalMediaControl = "media_control"
+
+	// Server → Client.
+	SignalQueueUpdate   = "queue_update"
+	SignalAgentAssigned = "agent_assigned"
+	SignalAnswer        = "answer"
+	SignalInstruction   = "instruction"
+	SignalCallEnded     = "call_ended"
+	SignalError         = "error"
+
+	// Dua arah.
+	SignalICECandidate = "ice_candidate"
+)
+
+// QueuedVideoCall adalah satu panggilan yang menunggu dilayani, dilihat dari sisi CS.
+//
+// Tidak memuat PII apa pun: petugas memilih panggilan berdasarkan urutan, bukan berdasarkan
+// siapa nasabahnya, dan data pribadinya baru terlihat di dalam panggilan itu sendiri.
+type QueuedVideoCall struct {
+	QueueID     string `json:"queue_id"`
+	QueueNumber string `json:"queue_number"`
+	SessionID   string `json:"session_id"`
+	// Position 1-based, sama dengan yang dilihat nasabah di layarnya.
+	Position      int64  `json:"position"`
+	WaitedSeconds int    `json:"waited_seconds"`
+	Status        string `json:"status"`
+}
+
+// ListQueuedVideoCallsResponse dikembalikan GET /v1/onboarding/video-call/queued.
+type ListQueuedVideoCallsResponse struct {
+	Calls          []QueuedVideoCall `json:"calls"`
+	OperatingHours OperatingHours    `json:"operating_hours"`
+	// WithinOperatingHours false berarti antrean tidak menerima yang baru; yang sudah
+	// mengantre tetap boleh dilayani.
+	WithinOperatingHours bool `json:"within_operating_hours"`
 }
 
 // SignalMessage is the JSON envelope for WebSocket signaling messages.
@@ -955,6 +1042,10 @@ type SetCardRequest struct {
 	// RegionCode dan AppVersion tidak datang dari body; diisi handler dari
 	// query dan header, sama seperti pada CreateSessionRequest.
 	RegionCode string `json:"-"`
+
+	// DeviceID berasal dari header X-Device-ID, bukan body. Sesi yang dibuat
+	// perangkat lain tidak boleh diganti kartunya dari sini (§0 butir 1).
+	DeviceID string `json:"-"`
 }
 
 // SetCardResponse dikembalikan setelah kartu tersimpan pada sesi.
@@ -1014,10 +1105,33 @@ type CardIssuanceRequest struct {
 }
 
 // CardIssuanceResult adalah balasan core banking atas permintaan cetak.
+//
+// ValidThru ikut di sini karena masa berlaku kartu ditentukan penerbitnya, bukan
+// layanan ini. Menghitungnya sendiri berarti menampilkan tanggal kedaluwarsa
+// yang tidak tercetak di kartu fisik yang diterima nasabah.
 type CardIssuanceResult struct {
 	MaskedNumber   string
 	Status         CardIssuanceStatus
 	TrackingNumber *string
+	ValidThruMonth int
+	ValidThruYear  int
+}
+
+// IssuedCard adalah kartu terbitan baru dalam bentuk yang dibutuhkan tabel
+// account_cards — kartu yang DIMILIKI nasabah, bukan baris antrean cetak.
+//
+// Dua tabel, dua peran: onboarding_card_issuance adalah antrean permintaan cetak
+// berkunci session_id, sementara account_cards adalah yang dibaca
+// GET /account/cards di layar Profil Saya. Tanpa langkah ini nasabah yang baru
+// buka rekening melihat daftar kartu kosong walau kartunya sudah diminta cetak.
+type IssuedCard struct {
+	UserID         string
+	AccountID      string
+	CardType       string
+	MaskedNumber   string
+	CardholderName string
+	ValidThruMonth int
+	ValidThruYear  int
 }
 
 // CardIssuance adalah baris antrean permintaan cetak kartu.
@@ -1350,4 +1464,64 @@ func statusStrings() []string {
 		out = append(out, string(s))
 	}
 	return out
+}
+
+// --- Syarat & Ketentuan (S&K) ---------------------------------------------
+//
+// Isi layar S&K dilayani server, bukan dibaca dari strings.xml di dalam APK.
+// Alasannya bukan kerapian: sebelum ini `tnc_version` yang tersimpan di baris
+// sesi hanyalah string yang dikirim client, tanpa apa pun di sisi bank yang
+// menjelaskan isinya. Lihat migrasi 000025.
+
+// TNCSection adalah satu pasal pada halaman S&K.
+type TNCSection struct {
+	// IconKey dipetakan client ke drawable-nya sendiri (ACCOUNT_BOX,
+	// VERIFIED_USER, VIDEO_CALL, SAVINGS, LOCK). Bukan URL: ikonnya ada di
+	// dalam APK, jadi mengirim path hanya menciptakan tautan yang bisa putus.
+	IconKey string `json:"icon_key"`
+	Title   string `json:"title"`
+	Body    string `json:"body"`
+}
+
+// TNCConsent adalah kalimat di samping checkbox, dipecah tiga karena bagian
+// tengahnya dicetak tebal dan berwarna oleh aplikasi.
+type TNCConsent struct {
+	Prefix string `json:"prefix"`
+	Link   string `json:"link"`
+	Suffix string `json:"suffix"`
+}
+
+// TNCNotice adalah kotak PENTING di bawah daftar pasal.
+type TNCNotice struct {
+	Label string `json:"label"`
+	Body  string `json:"body"`
+}
+
+// TNCTrustBanner adalah banner pengawasan OJK di atas daftar pasal.
+type TNCTrustBanner struct {
+	Title    string `json:"title"`
+	Subtitle string `json:"subtitle"`
+}
+
+// TNCDocument adalah body GET /v1/onboarding/tnc.
+//
+// Version adalah nilai yang HARUS dikirim kembali sebagai
+// `accepted_tnc_version` pada POST /v1/onboarding/sessions. Nilai lain ditolak
+// — lihat apperr.TNCVersionOutdated.
+type TNCDocument struct {
+	Version       string         `json:"version"`
+	Heading       string         `json:"heading"`
+	Subtitle      string         `json:"subtitle"`
+	TrustBanner   TNCTrustBanner `json:"trust_banner"`
+	Sections      []TNCSection   `json:"sections"`
+	Notice        TNCNotice      `json:"notice"`
+	Consent       TNCConsent     `json:"consent"`
+	AgreeCTA      string         `json:"agree_cta"`
+	EffectiveFrom time.Time      `json:"effective_from"`
+
+	// IsActive membedakan versi yang sedang berlaku dari versi lama yang
+	// diminta eksplisit lewat ?version=. Client yang menampilkan versi dengan
+	// is_active=false TIDAK boleh menawarkan tombol setuju: persetujuannya
+	// akan ditolak saat sesi dibuat.
+	IsActive bool `json:"is_active"`
 }

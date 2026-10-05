@@ -156,9 +156,15 @@ func normalizeDateString(s string) string {
 	if len(s) == 10 && s[4] == '-' {
 		return s
 	}
-	// DD-MM-YYYY
-	if len(s) == 10 && s[2] == '-' {
+	// DD-MM-YYYY, and the two separators a KTP scan produces just as often.
+	// Only "-" was recognised, so "21/04/1995" — a perfectly ordinary OCR
+	// reading — fell through unchanged and the date was dropped downstream.
+	if len(s) == 10 && (s[2] == '-' || s[2] == '/' || s[2] == '.') &&
+		s[2] == s[5] {
 		return s[6:10] + "-" + s[3:5] + "-" + s[0:2]
 	}
+	// Anything else is handed back untouched. The caller stores it as NULL and
+	// the nasabah confirms the date by hand at personal-data, which is the only
+	// place it is required.
 	return s
 }

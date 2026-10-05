@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,11 +29,22 @@ type SessionService struct {
 	// sesi berangkat dari OCR seperti sebelum sisipan ini ada.
 	cards *CardService
 
+	// tnc opsional hanya demi test lama yang membangun service tanpa S&K.
+	// Di router ia SELALU terisi: nil berarti `accepted_tnc_version` kembali
+	// jadi string bebas yang tersimpan tanpa ada yang bisa membuktikan isinya.
+	tnc *TNCService
+
 	// legacyAppVersion adalah ambang X-App-Version untuk fallback client lama
 	// (§7 butir 6). Kosong berarti fallback dimatikan — default yang aman,
 	// karena memaksa kartu default ke nasabah yang tidak memilihnya adalah
 	// keputusan produk, bukan bawaan teknis.
 	legacyAppVersion string
+
+	// videoCalls opsional: tanpa itu pembatalan sesi tetap berhasil, tapi panggilan
+	// video call yang masih mengantre ditinggalkan hidup — ia terus menggeser posisi
+	// orang di belakangnya dan tetap tampil sebagai panggilan yang bisa diambil petugas.
+	// Dibiarkan nil hanya di test yang tidak menyentuh video call.
+	videoCalls VideoCallCanceller
 }
 
 type SessionServiceConfig struct {
@@ -40,7 +52,9 @@ type SessionServiceConfig struct {
 	Cache            SessionCache
 	Audit            AuditRepository
 	Cards            *CardService
+	TNC              *TNCService
 	LegacyAppVersion string
+	VideoCalls       VideoCallCanceller
 }
 
 func NewSessionService(cfg SessionServiceConfig) *SessionService {
@@ -49,7 +63,9 @@ func NewSessionService(cfg SessionServiceConfig) *SessionService {
 		cache:            cfg.Cache,
 		audit:            cfg.Audit,
 		cards:            cfg.Cards,
+		tnc:              cfg.TNC,
 		legacyAppVersion: cfg.LegacyAppVersion,
+		videoCalls:       cfg.VideoCalls,
 	}
 }
 
@@ -68,6 +84,21 @@ func (s *SessionService) CreateSession(ctx context.Context, req CreateSessionReq
 
 	if req.AcceptedTNCVersion == "" {
 		return nil, apperr.ValidationError
+	}
+
+	// Versi S&K diperiksa ke database, bukan sekadar dicek tidak kosong.
+	//
+	// Sebelum migrasi 000025 string apa pun lolos ke kolom tnc_version, jadi
+	// baris sesi mengaku nasabah menyetujui sesuatu yang tidak pernah ada
+	// bentuknya di sisi bank. Versi lama ditolak 409 supaya aplikasi memuat
+	// ulang S&K dan nasabah menyetujui pasal yang benar-benar dilihatnya.
+	//
+	// Diperiksa SEBELUM rate limit per device: persetujuan yang salah versi
+	// tidak boleh menghabiskan satu dari tiga jatah sesi.
+	if s.tnc != nil {
+		if _, err := s.tnc.ValidateVersion(ctx, req.AcceptedTNCVersion); err != nil {
+			return nil, err
+		}
 	}
 
 	// Rate limit: max 3 sessions per device per hour
@@ -321,6 +352,23 @@ func (s *SessionService) CancelSession(ctx context.Context, sessionID, ipAddress
 		return fmt.Errorf("soft delete session: %w", err)
 	}
 
+	// Panggilan video call yang masih hidup dibatalkan bersama sesinya.
+	//
+	// Soft-delete sesi tidak menyentuh baris panggilan — foreign key-nya memang
+	// ON DELETE CASCADE, tapi tidak ada baris yang benar-benar dihapus di sini. Jadi
+	// panggilannya tetap QUEUED, tetap anggota sorted set, dan tetap muncul di daftar
+	// petugas sebagai panggilan yang bisa diambil, padahal sesinya sudah tidak ada.
+	//
+	// Kegagalannya dicatat, bukan dikembalikan: nasabah sudah meminta sesinya dibatalkan
+	// dan itu sudah terjadi: menggagalkan responsnya hanya membuat dia mencoba lagi untuk
+	// sesi yang sudah terhapus.
+	if s.videoCalls != nil {
+		if err := s.videoCalls.CancelForSession(ctx, sessionID); err != nil {
+			slog.Error("cancel video call for cancelled session failed",
+				"session_id", sessionID, "error", err)
+		}
+	}
+
 	// Remove from cache
 	if s.cache != nil {
 		if err := s.cache.Delete(ctx, sessionID); err != nil {
@@ -400,6 +448,46 @@ func (s *SessionService) TransitionStep(ctx context.Context, sessionID string, t
 // resolveSession loads a session from cache or DB.
 func (s *SessionService) resolveSession(ctx context.Context, sessionID string) (*Session, error) {
 	return resolveOnboardingSession(ctx, s.sessions, s.cache, sessionID)
+}
+
+// AssertDeviceOwnsSession rejects a session_id replayed from another device.
+//
+// A session_id is a bearer secret with no token behind it, so without this a
+// leaked id — a screenshot, a log line, a shared clipboard — could be continued
+// from any phone. Handlers call it before touching a session, which is why it
+// lives on the service rather than inside each flow: eleven endpoints take a
+// session_id, and a check that only some of them perform is not a check.
+//
+// An ABSENT header still passes. Answering 403 to every build already in
+// testers' hands would turn a hardening step into an outage; clients that send
+// the header get the binding immediately. Making it mandatory is a follow-up
+// decision, not a code change (§0 butir 2).
+func (s *SessionService) AssertDeviceOwnsSession(ctx context.Context, sessionID, deviceID string) error {
+	if strings.TrimSpace(deviceID) == "" {
+		return nil
+	}
+	session, err := s.resolveSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	return assertSessionDevice(session, deviceID)
+}
+
+// assertSessionDevice compares a request's device against the session owner.
+//
+// Reinstalling the app produces a new ANDROID_ID, so the old draft can no
+// longer be continued — it expires on its own after 24 hours and the nasabah
+// starts over. That is the intended behaviour: a device binding that survives a
+// reinstall would have to trust a value the client picks, which binds nothing
+// (docs/06-BUKA-REKENING-API-SPEC.md §0).
+func assertSessionDevice(session *Session, deviceID string) error {
+	if deviceID == "" || session == nil || session.DeviceID == "" {
+		return nil
+	}
+	if deviceID != session.DeviceID {
+		return apperr.OnboardingDeviceMismatch
+	}
+	return nil
 }
 
 // resolveOnboardingSession memuat sesi dari cache, lalu database.

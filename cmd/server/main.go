@@ -83,6 +83,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load pin keys: %w", err)
 	}
+	// The key id travels with the published PEM, so it has to be attached at
+	// load time rather than re-derived by each handler that serves the key.
+	pinKeys.KeyID = cfg.PIN.KeyID
 
 	// JWT RSA keys
 	jwtKeys, err := crypto.LoadRSAKeyPair(cfg.JWT.PrivateKeyPath, cfg.JWT.PublicKeyPath)
@@ -118,7 +121,7 @@ func run() error {
 	}
 
 	// Router
-	handler := router.New(router.Deps{
+	handler, err := router.New(router.Deps{
 		DB:           pool,
 		RedisSession: rdb.Session,
 		RedisCache:   rdb.Cache,
@@ -127,6 +130,9 @@ func run() error {
 		Config:       cfg,
 		PIIKey:       piiKey,
 	})
+	if err != nil {
+		return fmt.Errorf("router: %w", err)
+	}
 
 	// HTTP server
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)

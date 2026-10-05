@@ -86,10 +86,15 @@ func (s *Service) Initiate(ctx context.Context, req InitiateRequest) (*InitiateR
 		return nil, fmt.Errorf("store registration: %w", err)
 	}
 
+	// Swallowing this used to answer 200 OTP_PENDING for an SMS that was never
+	// handed over — and unlike onboarding there is no resend endpoint here, so
+	// the nasabah had no way out but to start again. The registration stays in
+	// the cache and the code stays valid; only the response says delivery
+	// failed, which is what lets the app offer "coba lagi".
 	if s.sms != nil {
 		if err := s.sms.SendOTP(ctx, req.PhoneNumber, otpCode); err != nil {
 			slog.Error("send registration otp failed", "registration_id", regID.String(), "error", err)
-			// Not fatal: the code is stored, the nasabah can ask for a resend.
+			return nil, apperr.OTPDeliveryFailed
 		}
 	}
 

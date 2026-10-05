@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -92,8 +93,25 @@ func applyMigrations(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 
 // seedCards memasang katalog uji. Angkanya sengaja berbeda per kartu supaya
 // kolom yang tertukar saat pemindaian langsung terlihat.
+//
+// Katalognya dikosongkan lebih dulu. Migrasi 000022 membawa katalog sungguhan
+// (angka portofolio, lineup tiga produk), dan test ini butuh katalog yang DIA
+// tentukan: angka unik per kolom untuk menangkap kolom tertukar, dan produk yang
+// sengaja dibiarkan tanpa kartu supaya kebocoran antar produk bisa dibuktikan.
+// Menumpuk fixture di atas katalog migrasi membuat kedua hal itu tidak bisa
+// diuji. Container-nya baru dan kosong, jadi belum ada baris yang merujuk ke
+// card_products.
 func seedCards(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
+
+	for _, stmt := range []string{
+		`DELETE FROM product_card_options`,
+		`DELETE FROM card_products`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("kosongkan katalog (%s): %v", stmt, err)
+		}
+	}
 
 	cards := []struct {
 		Type, Name, Tier, Style string
@@ -291,21 +309,38 @@ func TestCardRepo_CatalogVersion(t *testing.T) {
 	pool := setupCardDB(t)
 	repo := postgres.NewCardRepo(pool)
 
+	// Versi awal dibaca, bukan ditebak. Migrasi yang mengubah isi katalog WAJIB
+	// menaikkan versinya (000022 melakukannya), jadi jumlah kenaikan sebelum test
+	// ini berjalan adalah urusan migrasi — yang diuji di sini adalah bentuk versi
+	// dan bahwa satu bump menaikkan counter tepat satu.
 	first, err := repo.CatalogVersion(ctx)
 	if err != nil {
 		t.Fatalf("CatalogVersion: %v", err)
 	}
-	today := time.Now().Format("2006-01-02")
-	if first != today+".1" {
-		t.Fatalf("versi awal: got %q, want %q", first, today+".1")
+	// Tanggalnya dibaca dari Postgres, bukan dari time.Now() di Go.
+	//
+	// Nilainya dibuat SQL dengan CURRENT_DATE, dan kontainer test berjalan di UTC
+	// sementara mesin pengembang di WIB (UTC+7). Membandingkannya dengan jam Go membuat
+	// test ini gagal setiap hari antara 00:00 dan 07:00 WIB dan lolos 17 jam sisanya —
+	// kegagalan yang terlihat seperti bug acak dan sangat mahal ditelusuri.
+	var today string
+	if err := pool.QueryRow(ctx, "SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD')").Scan(&today); err != nil {
+		t.Fatalf("baca CURRENT_DATE: %v", err)
+	}
+	if !strings.HasPrefix(first, today+".") {
+		t.Fatalf("versi awal harus berawalan tanggal basis data: got %q, want %s.n", first, today)
+	}
+	startCounter, err := strconv.Atoi(strings.TrimPrefix(first, today+"."))
+	if err != nil {
+		t.Fatalf("counter versi tidak terbaca dari %q: %v", first, err)
 	}
 
 	bumped, err := repo.BumpCatalogVersion(ctx)
 	if err != nil {
 		t.Fatalf("BumpCatalogVersion: %v", err)
 	}
-	if bumped != today+".2" {
-		t.Fatalf("versi setelah bump: got %q, want %q", bumped, today+".2")
+	if want := today + "." + strconv.Itoa(startCounter+1); bumped != want {
+		t.Fatalf("versi setelah bump: got %q, want %q", bumped, want)
 	}
 
 	// Bump harus terlihat oleh pembaca berikutnya, bukan hanya dikembalikan.
@@ -767,4 +802,108 @@ func parseCounter(t *testing.T, version string) int {
 		t.Fatalf("counter versi %q: %v", version, err)
 	}
 	return n
+}
+
+// TestAccountCardRepo_RegisterIssuedCard menguji satu-satunya jalur tulis ke
+// account_cards di luar seeder, terhadap skema yang dipasang migrasi sungguhan.
+//
+// Sampai jalur ini ada, tabelnya hanya diisi `make seed`: nasabah yang baru
+// selesai onboarding mendapat baris di onboarding_card_issuance dan daftar kosong
+// di GET /account/cards. Yang dibuktikan di sini bukan hanya "baris masuk", tapi
+// tiga aturan yang hidup di SQL-nya: kartu pertama jadi kartu utama, kartu kedua
+// TIDAK (idx_account_cards_primary itu unique partial, jadi salah di sini berarti
+// insert-nya gagal), dan permintaan ulang dengan nomor tersamar yang sama tidak
+// melahirkan kartu kedua.
+func TestAccountCardRepo_RegisterIssuedCard(t *testing.T) {
+	pool := setupCardDB(t)
+	ctx := context.Background()
+	seedCards(ctx, t, pool)
+
+	var userID, accountID, secondAccountID string
+	err := pool.QueryRow(ctx, `
+		INSERT INTO users (full_name, display_name, phone_encrypted, phone_hash, pin_hash, pin_salt)
+		VALUES ('MUHAMMAD ARDAN PRAYOGI','ARDAN','\x00','hash-owner','h','s')
+		RETURNING id`).Scan(&userID)
+	if err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	for number, dst := range map[string]*string{"7770001111": &accountID, "7770002222": &secondAccountID} {
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO accounts (user_id, account_number, account_type, account_label, balance, owner_type)
+			VALUES ($1,$2,'TAHAPAN','Tahapan BCA',0,'CUSTOMER')
+			RETURNING id`, userID, number).Scan(dst); err != nil {
+			t.Fatalf("seed account %s: %v", number, err)
+		}
+	}
+
+	repo := postgres.NewAccountCardRepo(pool)
+	issued := onboarding.IssuedCard{
+		UserID:         userID,
+		AccountID:      accountID,
+		CardType:       "PASPOR_GOLD",
+		MaskedNumber:   "•••• 5678",
+		CardholderName: "MUHAMMAD ARDAN PRAYOGI",
+		ValidThruMonth: 9,
+		ValidThruYear:  2031,
+	}
+	if err := repo.RegisterIssuedCard(ctx, issued); err != nil {
+		t.Fatalf("register issued card: %v", err)
+	}
+
+	// Permintaan cetak yang diulang antrean retry tidak boleh menambah kartu.
+	if err := repo.RegisterIssuedCard(ctx, issued); err != nil {
+		t.Fatalf("register ulang: %v", err)
+	}
+
+	// Kartu kedua pada rekening lain: nomornya beda, jadi ini kartu sungguhan.
+	second := issued
+	second.AccountID = secondAccountID
+	second.CardType = "PASPOR_BLUE"
+	second.MaskedNumber = "•••• 9012"
+	if err := repo.RegisterIssuedCard(ctx, second); err != nil {
+		t.Fatalf("register kartu kedua: %v", err)
+	}
+
+	// Dibaca kembali lewat jalur baca layar Profil Saya, bukan lewat SQL test
+	// sendiri: kalau kolomnya tidak cocok, di sinilah ketahuan.
+	owner, err := uuid.Parse(userID)
+	if err != nil {
+		t.Fatalf("parse user id: %v", err)
+	}
+	cards, err := repo.ListByUserID(ctx, owner)
+	if err != nil {
+		t.Fatalf("list cards: %v", err)
+	}
+	if len(cards) != 2 {
+		t.Fatalf("jumlah kartu: %d, harusnya 2 (register ulang tidak boleh menambah)", len(cards))
+	}
+
+	// Primary first — itu urutan ORDER BY di ListByUserID.
+	if !cards[0].IsPrimary {
+		t.Errorf("kartu pertama harus jadi kartu utama: %+v", cards[0])
+	}
+	if cards[1].IsPrimary {
+		t.Errorf("kartu kedua tidak boleh ikut jadi kartu utama: %+v", cards[1])
+	}
+	if cards[0].MaskedNumber != "•••• 5678" || cards[0].CardType != "PASPOR_GOLD" {
+		t.Errorf("kartu utama: %+v", cards[0])
+	}
+	if cards[0].ValidThruMonth != 9 || cards[0].ValidThruYear != 2031 {
+		t.Errorf("masa berlaku tidak tersimpan: %d/%d", cards[0].ValidThruMonth, cards[0].ValidThruYear)
+	}
+	if cards[0].CardholderName != "MUHAMMAD ARDAN PRAYOGI" {
+		t.Errorf("nama pemegang: %q", cards[0].CardholderName)
+	}
+	// Default dua sakelar kanal ikut diuji: keduanya ditulis skema, bukan kode.
+	if !cards[0].DebitOnlineEnabled || cards[0].InternationalEnabled {
+		t.Errorf("default sakelar kanal: debit_online=%v international=%v",
+			cards[0].DebitOnlineEnabled, cards[0].InternationalEnabled)
+	}
+	if cards[0].Status != "ACTIVE" {
+		t.Errorf("status kartu baru: %q", cards[0].Status)
+	}
+	// Dan nama produk datang dari join ke katalog, bukan disalin ke kartunya.
+	if cards[0].ProductName != "Gold Mastercard" {
+		t.Errorf("nama produk dari katalog: %q", cards[0].ProductName)
+	}
 }

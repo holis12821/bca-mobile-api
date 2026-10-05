@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"time"
 )
 
 // MockCoreBankingClient simulates the core banking system for development.
@@ -54,9 +55,16 @@ func (m *MockCoreBankingClient) IssueCard(_ context.Context, req CardIssuanceReq
 	// Status awal selalu REQUESTED: pencetakan fisik berjalan di luar
 	// permintaan ini, dan melaporkan PRINTING seketika akan menjanjikan
 	// kemajuan yang belum terjadi.
+	// Lima tahun dari bulan penerbitan — jendela yang dipakai kartu Paspor
+	// sungguhan. Mock, tapi tetap ditentukan di sisi penerbit supaya jalur
+	// kodenya sama ketika core banking sungguhan yang menjawab.
+	validThru := time.Now().UTC().AddDate(5, 0, 0)
+
 	return &CardIssuanceResult{
-		MaskedNumber: masked,
-		Status:       CardIssuanceRequested,
+		MaskedNumber:   masked,
+		Status:         CardIssuanceRequested,
+		ValidThruMonth: int(validThru.Month()),
+		ValidThruYear:  validThru.Year(),
 	}, nil
 }
 

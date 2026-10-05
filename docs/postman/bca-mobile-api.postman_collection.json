@@ -32,6 +32,26 @@
       "key": "internal_base_url",
       "value": "http://localhost:8080/internal/v1",
       "type": "string"
+    },
+    {
+      "key": "pin_key_id",
+      "value": "pin-key-v1",
+      "type": "string"
+    },
+    {
+      "key": "internal_api_key",
+      "value": "dev-internal-key",
+      "type": "string"
+    },
+    {
+      "key": "agent_employee_id",
+      "value": "CS-1042",
+      "type": "string"
+    },
+    {
+      "key": "agent_api_key",
+      "value": "dev-agent-key",
+      "type": "string"
     }
   ],
   "item": [
@@ -193,6 +213,45 @@
       "name": "Auth",
       "item": [
         {
+          "name": "PIN Public Key (publik, bukan /dev)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const data = pm.response.json().data;",
+                  "// key_id ini yang dikirim sebagai encryption_key_id di request ber-PIN.",
+                  "pm.collectionVariables.set('pin_key_id', data.key_id);",
+                  "pm.test('algoritma OAEP-SHA256', () => pm.expect(data.algorithm).to.eql('RSA-OAEP-SHA256'));",
+                  "pm.test('ada PEM', () => pm.expect(data.public_key_pem).to.include('BEGIN PUBLIC KEY'));",
+                  "console.log('key_id aktif:', data.key_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/auth/pin/public-key",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "auth",
+                "pin",
+                "public-key"
+              ]
+            },
+            "description": "Kunci publik RSA-2048 untuk `pin_encrypted`, beserta `key_id`. Publik dan tanpa token: client membutuhkan kuncinya SEBELUM bisa login, dan ini memang paruh publiknya.\n\nBeda dari `/dev/pin-public-key`: endpoint ini ada di semua environment. Bentuk responsnya sama dengan `GET /onboarding/credentials/public-key` — kuncinya pun kunci yang sama.\n\nJalankan ini lebih dulu: skrip test-nya menyimpan `key_id` ke variabel `pin_key_id` yang dipakai request ber-PIN lainnya."
+          }
+        },
+        {
           "name": "Login (PIN)",
           "event": [
             {
@@ -252,7 +311,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"device_id\": \"{{device_id}}\",\n  \"pin_encrypted\": \"{{pin_encrypted}}\",\n  \"device_info\": {\n    \"device_name\": \"Postman\",\n    \"device_model\": \"iPhone 15 Pro Max\",\n    \"os_version\": \"iOS 17.5\",\n    \"app_version\": \"1.0.0\"\n  }\n}"
+              "raw": "{\n  \"device_id\": \"{{device_id}}\",\n  \"pin_encrypted\": \"{{pin_encrypted}}\",\n  \"encryption_key_id\": \"{{pin_key_id}}\",\n  \"device_info\": {\n    \"device_name\": \"Postman\",\n    \"device_model\": \"iPhone 15 Pro Max\",\n    \"os_version\": \"iOS 17.5\",\n    \"app_version\": \"1.0.0\"\n  }\n}"
             },
             "url": {
               "raw": "{{base_url}}/auth/login/pin",
@@ -320,7 +379,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"pin_encrypted\": \"{{pin_encrypted}}\",\n  \"purpose\": \"TRANSFER\"\n}"
+              "raw": "{\n  \"pin_encrypted\": \"{{pin_encrypted}}\",\n  \"encryption_key_id\": \"{{pin_key_id}}\",\n  \"purpose\": \"TRANSFER\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/auth/pin/verify",
@@ -333,7 +392,7 @@
                 "verify"
               ]
             },
-            "description": "purpose menentukan endpoint mana yang menerima token ini: TRANSFER, EWALLET_TOPUP, QRIS_PAYMENT, CHANGE_LIMIT, CHANGE_PIN, CHANGE_PROFILE. Token sekali pakai dan berlaku 120 detik; purpose yang tidak cocok ditolak."
+            "description": "purpose menentukan endpoint mana yang menerima token ini: TRANSFER, EWALLET_TOPUP, QRIS_PAYMENT, CHANGE_LIMIT, CHANGE_PIN, CHANGE_PROFILE. Token sekali pakai dan berlaku 120 detik; purpose yang tidak cocok ditolak.\n\n**Purpose menentukan token ini bisa dipakai untuk apa.** Delapan nilai diterima: TRANSFER, EWALLET_TOPUP, QRIS_PAYMENT, CHANGE_LIMIT, CHANGE_PIN, CHANGE_PROFILE, BLOCK_CARD, REPLACE_CARD.\n\nUbah `purpose` di body sebelum memakai request kartu: `BLOCK_CARD` untuk blokir, `REPLACE_CARD` untuk penggantian. Token dengan purpose yang salah ditolak saat dikonsumsi — token transfer tidak bisa memblokir kartu."
           }
         },
         {
@@ -441,7 +500,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"key_id\": \"bio-key-001\",\n  \"public_key\": \"-----BEGIN PUBLIC KEY-----\\n...\\n-----END PUBLIC KEY-----\",\n  \"biometric_type\": \"FACE_ID\"\n}"
+              "raw": "{\n  \"key_id\": \"bio-key-001\",\n  \"public_key\": \"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE... (base64 X.509 SPKI, EC P-256)\",\n  \"biometric_type\": \"FACE_ID\",\n  \"attestation\": \"<base64 rantai Android Key Attestation, opsional>\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/auth/biometric/register",
@@ -454,7 +513,7 @@
                 "register"
               ]
             },
-            "description": "Server hanya menyimpan public key. Template biometrik tidak pernah dikirim — pencocokan terjadi di perangkat.\n\nDari Postman ini tidak bisa diselesaikan sungguhan: butuh keypair yang dibuat di Keystore/Secure Enclave."
+            "description": "`public_key` harus EC P-256 (base64 X.509 SubjectPublicKeyInfo; PEM juga diterima). RSA ditolak `422 AUTH_BIOMETRIC_KEY_UNSUPPORTED` di sini, bukan nanti saat login.\n\nPengikatan perangkat diambil dari access token, bukan dari body.\n\n**Pendaftaran ulang mengganti**: semua kunci aktif nasabah ini pada perangkat ini dicabut lebih dulu, dan jumlahnya dilaporkan sebagai `replaced_keys`. Itu yang dibutuhkan saat sidik jari baru menghanguskan kunci Keystore. Perangkat lain tidak terpengaruh.\n\n`attestation` disimpan, tidak diverifikasi ke akar Google (docs/04-SECURITY.md §2.2).\n\nRespons `201`: `biometric_id`, `key_id`, `registered_at`, `replaced_keys`."
           }
         },
         {
@@ -472,7 +531,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"device_id\": \"{{device_id}}\",\n  \"key_id\": \"bio-key-001\",\n  \"challenge_id\": \"{{challenge_id}}\",\n  \"signature\": \"<base64 signature atas challenge>\"\n}"
+              "raw": "{\n  \"device_id\": \"{{device_id}}\",\n  \"key_id\": \"bio-key-001\",\n  \"challenge_id\": \"{{challenge_id}}\",\n  \"signed_challenge\": \"<base64 DER, SHA256withECDSA atas 32 byte challenge>\",\n  \"biometric_type\": \"FACE_ID\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/auth/login/biometric",
@@ -485,7 +544,7 @@
                 "biometric"
               ]
             },
-            "description": "Butuh tanda tangan dari private key di perangkat — tidak bisa dipalsukan dari Postman. Ada di sini sebagai dokumentasi kontrak."
+            "description": "Butuh tanda tangan dari private key di perangkat — tidak bisa dipalsukan dari Postman. Ada di sini sebagai dokumentasi kontrak.\n\n**Kontrak tanda tangan** (docs/01-API-SPECIFICATION.md §2):\n\n- kunci: EC P-256; kunci lain ditolak saat register (`422 AUTH_BIOMETRIC_KEY_UNSUPPORTED`)\n- algoritma: `SHA256withECDSA`\n- yang ditandatangani: **32 byte challenge mentah** — base64-decode field `challenge` lebih dulu; tidak ada penggabungan dengan `device_id`\n- `signed_challenge`: base64 dari DER ASN.1 (keluaran bawaan `java.security.Signature`). Nama `signature` juga diterima\n- challenge sekali pakai, TTL 60 detik; pemakaian kedua dijawab `401 AUTH_TOKEN_INVALID`\n\nVektor uji (public_key, challenge, signed_challenge) ada di §2 spec, diverifikasi oleh `TestBiometricLogin_PublishedTestVector`."
           }
         },
         {
@@ -533,7 +592,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"old_pin_encrypted\": \"{{old_pin_encrypted}}\",\n  \"new_pin_encrypted\": \"{{new_pin_encrypted}}\"\n}"
+              "raw": "{\n  \"old_pin_encrypted\": \"{{old_pin_encrypted}}\",\n  \"new_pin_encrypted\": \"{{new_pin_encrypted}}\",\n  \"encryption_key_id\": \"{{pin_key_id}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/auth/pin/change",
@@ -606,7 +665,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"old_pin_encrypted\": \"{{pin_encrypted}}\",\n  \"new_pin_encrypted\": \"{{new_pin_encrypted}}\"\n}",
+              "raw": "{\n  \"old_pin_encrypted\": \"{{pin_encrypted}}\",\n  \"new_pin_encrypted\": \"{{new_pin_encrypted}}\",\n  \"encryption_key_id\": \"{{pin_key_id}}\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -716,6 +775,150 @@
               ]
             },
             "description": "Agregat untuk Beranda: saldo, mutasi terbaru, promo, jumlah notifikasi belum dibaca. Cache 60 detik."
+          }
+        },
+        {
+          "name": "Cards",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "// card_id disimpan untuk langkah kartu berikutnya (sakelar, blokir, ganti).",
+                  "if (body.status === 'success' && body.data.cards && body.data.cards.length) {",
+                  "  pm.environment.set('card_id', body.data.cards[0].card_id);",
+                  "}",
+                  "pm.test('cards selalu array, tidak pernah null', function () {",
+                  "  pm.expect(body.data.cards).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/account/cards",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "cards"
+              ]
+            },
+            "description": "Kartu yang DIMILIKI nasabah, bukan katalog kartu buka rekening.\n\nTanpa parameter: pemilik diambil dari klaim `sub` pada access token.\n\nNasabah tanpa kartu membalas 200 dengan `{\"cards\": []}`, bukan 404 — seed dev sengaja membuat SITI RAHAYU tanpa kartu untuk menguji jalur itu (login dengan device `device-siti-001`, PIN `111111`).\n\n`status` dihitung server saat dibaca: kartu yang masa berlakunya lewat dilaporkan `EXPIRED` walau kolomnya masih `ACTIVE`, dan `BLOCKED` menang atas kedaluwarsa."
+          }
+        },
+        {
+          "name": "Cards — Sakelar Kanal (settings)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"international_enabled\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/account/cards/{{card_id}}/settings",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "cards",
+                "{{card_id}}",
+                "settings"
+              ]
+            },
+            "description": "Dua sakelar kanal kartu. Jalankan `Cards` lebih dulu — script-nya yang mengisi `card_id`.\n\n**Field yang tidak dikirim tidak diubah.** Keduanya opsional; body di atas hanya menyalakan transaksi luar negeri dan membiarkan debit online apa adanya.\n\nBody `{}` dijawab 422 VALIDATION_ERROR — bukan 200 — supaya salah ketik nama field tidak terbaca sebagai penulisan berhasil.\n\nKartu BLOCKED menolak dengan 409 CARD_BLOCKED. Kartu milik nasabah lain dijawab 404 CARD_NOT_FOUND, sama seperti kartu yang tidak ada.\n\nTanpa verification_token: kedua sakelar bisa dikembalikan nasabah sendiri."
+          }
+        },
+        {
+          "name": "Cards — Blokir Kartu",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"LOST\",\n  \"verification_token\": \"{{verification_token}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/account/cards/{{card_id}}/block",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "cards",
+                "{{card_id}}",
+                "block"
+              ]
+            },
+            "description": "Blokir kartu hilang atau dicuri.\n\n**Urutan:** `PIN Verify` dengan `purpose = \"BLOCK_CARD\"` lebih dulu — script-nya mengisi `verification_token`.\n\n`reason`: LOST | STOLEN | DAMAGED | SUSPECTED_FRAUD.\n\nIdempoten: memblokir kartu yang sudah BLOCKED dijawab 200 dengan keadaan yang sama, bukan error.\n\n**Tidak ada endpoint buka blokir** — itu keputusan cabang. Di dev, jalankan `make seed` untuk mengembalikan kartu ke ACTIVE."
+          }
+        },
+        {
+          "name": "Cards — Ganti Kartu (replacement)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('replay memakai kunci idempotensi yang sama membalas 200', function () {",
+                  "  pm.expect([200, 201]).to.include(pm.response.code);",
+                  "});",
+                  "// Kirim ulang request ini APA ADANYA: kunci yang sama membalas 200",
+                  "// dengan header X-Idempotent-Replayed dan request_id yang sama —",
+                  "// verification_token yang sudah hangus TIDAK diperlukan lagi."
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{$guid}}",
+                "description": "WAJIB. Ganti manual saat ingin menguji replay: kunci yang sama = jawaban yang sama."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"DAMAGED\",\n  \"delivery_method\": \"COURIER\",\n  \"verification_token\": \"{{verification_token}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/account/cards/{{card_id}}/replacement",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "account",
+                "cards",
+                "{{card_id}}",
+                "replacement"
+              ]
+            },
+            "description": "Permintaan kartu pengganti. **Berbiaya** (card_products.fee_card_replacement), jadi `X-Idempotency-Key` wajib.\n\n**Urutan:** `PIN Verify` dengan `purpose = \"REPLACE_CARD\"` lebih dulu.\n\n`reason`: DAMAGED | LOST | UPGRADE. `delivery_method`: COURIER | BRANCH_PICKUP (default COURIER).\n\n201 untuk permintaan baru. Kirim ulang dengan kunci yang SAMA → 200 + header `X-Idempotent-Replayed: true` + `request_id` yang sama, dan token yang sudah hangus tidak masalah.\n\nKunci BERBEDA pada kartu yang permintaannya masih terbuka → 409 CARD_REPLACEMENT_IN_PROGRESS.\n\n`fee` dan jendela estimasi dibekukan saat permintaan dibuat; perubahan katalog berikutnya tidak mengubah angka yang sudah diberitahukan."
           }
         },
         {
@@ -914,7 +1117,7 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/notifications?limit=20",
+              "raw": "{{base_url}}/notifications?limit=20&type=PROMO,SECURITY",
               "host": [
                 "{{base_url}}"
               ],
@@ -930,6 +1133,12 @@
                   "key": "cursor",
                   "value": "",
                   "disabled": true
+                },
+                {
+                  "key": "type",
+                  "value": "PROMO,SECURITY",
+                  "disabled": true,
+                  "description": "TRANSACTION | PROMO | SECURITY | SYSTEM | INFO, boleh beberapa dipisah koma. Kosong = semua. Nilai lain -> 400 VALIDATION_ERROR."
                 }
               ]
             },
@@ -974,6 +1183,54 @@
       ]
     },
     {
+      "name": "Konten Statis",
+      "item": [
+        {
+          "name": "Pusat Bantuan (help-center)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/content/help-center",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "content",
+                "help-center"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "FAQ Pusat Bantuan. **Tanpa Authorization** — tidak ada data nasabah di dalamnya.\n\nKategori yang terbit sekarang: CARD, TRANSACTION, SECURITY, ACCOUNT. Daftarnya bisa bertambah tanpa perubahan kode, jadi client memakai `title` yang ikut dikirim, bukan memetakan `key` secara keras.\n\nSumber data: tabel content_help_center (migrasi 000023), cache Redis 24 jam."
+          }
+        },
+        {
+          "name": "Kontak CS (contact-cs)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/content/contact-cs",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "content",
+                "contact-cs"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "description": "Nomor Halo BCA, WhatsApp, email, dan jam layanan. **Tanpa Authorization**: nasabah yang terkunci di luar aplikasi justru yang paling butuh nomor ini.\n\n`phone` untuk panggilan dalam negeri, `phone_free` untuk dari luar negeri."
+          }
+        }
+      ],
+      "description": "Dua halaman terakhir seksi BANTUAN & INFORMASI di layar Profil Saya. Keduanya publik dan kena rate limit 60/menit per IP."
+    },
+    {
       "name": "Transactions",
       "item": [
         {
@@ -1007,10 +1264,20 @@
                   "key": "cursor",
                   "value": "",
                   "disabled": true
+                },
+                {
+                  "key": "from",
+                  "value": "2026-08-01",
+                  "disabled": true
+                },
+                {
+                  "key": "to",
+                  "value": "2026-08-31",
+                  "disabled": true
                 }
               ]
             },
-            "description": "`account_id` wajib — tanpa itu 400. Jalankan **Account → Balance** dulu supaya variabelnya terisi.\n\n`period`: `TODAY`, `LAST_7_DAYS`, `LAST_30_DAYS`, atau rentang eksplisit. Batas hari memakai kalender WIB, bukan UTC."
+            "description": "`account_id` wajib — tanpa itu 400. Jalankan **Account → Balance** dulu supaya variabelnya terisi.\n\n`period` adalah daftar tertutup: `LAST_7_DAYS`, `LAST_30_DAYS`, `LAST_90_DAYS`, `THIS_MONTH`, `LAST_MONTH`, `CUSTOM`. Nilai di luar daftar dijawab `400 VALIDATION_ERROR` dengan `details.allowed_values` — **tidak** diabaikan, karena nilai yang diabaikan berarti \"tanpa filter tanggal\" dan layar menampilkan seluruh riwayat seolah-olah 7 hari terakhir.\n\n`LAST_MONTH` = tanggal 1 bulan lalu sampai hari terakhir bulan lalu (kedua ujung inklusif).\n\n`CUSTOM` wajib membawa tanggal: aktifkan parameter `from` dan `to` (`YYYY-MM-DD`). `start_date`/`end_date` juga diterima sebagai alias.\n\nBatas hari memakai kalender WIB (`Asia/Jakarta`), bukan UTC."
           }
         },
         {
@@ -1035,7 +1302,7 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{base_url}}/transactions/history?limit=20",
+              "raw": "{{base_url}}/transactions/history?limit=20&period=LAST_30_DAYS&from=&to=",
               "host": [
                 "{{base_url}}"
               ],
@@ -1057,6 +1324,24 @@
                   "key": "cursor",
                   "value": "",
                   "disabled": true
+                },
+                {
+                  "key": "period",
+                  "value": "LAST_30_DAYS",
+                  "disabled": true,
+                  "description": "LAST_7_DAYS | LAST_30_DAYS | LAST_90_DAYS | THIS_MONTH | LAST_MONTH | CUSTOM. Nilai lain -> 400 VALIDATION_ERROR."
+                },
+                {
+                  "key": "from",
+                  "value": "",
+                  "disabled": true,
+                  "description": "YYYY-MM-DD (WIB). Wajib bersama to saat period=CUSTOM."
+                },
+                {
+                  "key": "to",
+                  "value": "",
+                  "disabled": true,
+                  "description": "YYYY-MM-DD (WIB). Hari terakhir ikut terhitung penuh."
                 }
               ]
             }
@@ -1580,12 +1865,67 @@
             }
           }
         }
-      ]
+      ],
+      "description": "**USANG — pakai folder Onboarding (Buka Rekening).**\n\n`/v1/registration/*` dan `/v1/onboarding/*` menggambarkan fitur yang sama dengan dua kontrak berbeda: yang pertama memakai Registration Token, yang kedua `session_id`. Aplikasi Android mengimplementasikan yang kedua, dan itu yang dipelihara.\n\nKeluarga ini masih berjalan untuk build lama dan tidak dihapus diam-diam. Setiap responsnya membawa `Deprecation: true` dan `Link: </v1/onboarding/*>; rel=\"successor-version\"`. Header `Sunset` tidak dikirim: belum ada tanggal penghapusan yang disepakati."
     },
     {
       "name": "Onboarding (Buka Rekening)",
-      "description": "Alur buka rekening: Session → OCR e-KTP → Personal Data → OTP → Biometrik → Video Call → Credentials → Submit.\n\nSemua provider eksternal (OCR, Dukcapil, biometrik, SMS, core banking) memakai implementasi mock di dalam proses — tidak ada panggilan keluar.\n\n**WebSocket signaling** (`/v1/onboarding/video-call/signal`) tidak bisa disimpan dalam file collection. Buat manual: New → WebSocket Request → `ws://localhost:8080/v1/onboarding/video-call/signal?token=<signaling_token>&role=nasabah`. Lewat ngrok, skemanya `wss://`.",
+      "description": "Alur buka rekening: Session → OCR e-KTP → Personal Data → OTP → Biometrik → Video Call → Credentials → Submit.\n\nSemua provider eksternal (OCR, Dukcapil, biometrik, SMS, core banking) memakai implementasi mock di dalam proses — tidak ada panggilan keluar.\n\n**WebSocket signaling** (`/v1/onboarding/video-call/signal`) tidak bisa disimpan dalam file collection. Buat manual: New → WebSocket Request → `ws://localhost:8080/v1/onboarding/video-call/signal?token=<signaling_token>&role=nasabah`. Lewat ngrok, skemanya `wss://`.\n\n**`X-Device-ID` di setiap request.** Server membandingkannya dengan perangkat pembuat sesi; berbeda → `403 ONBOARDING_DEVICE_MISMATCH` (docs/06-BUKA-REKENING-API-SPEC.md §0). Header yang tidak dikirim tetap lolos, supaya build yang sudah ada di tangan tester tidak terputus di tengah flow. Untuk `GET /products/{type}/cards` header ini WAJIB.",
       "item": [
+        {
+          "name": "0a. Get Syarat & Ketentuan",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (pm.response.code === 200 && body.status === 'success') {",
+                  "  // Versi disimpan supaya Create Session memakai versi yang BENAR-BENAR",
+                  "  // dilayani server. Nilai yang ditulis tangan ditolak TNC_VERSION_UNKNOWN.",
+                  "  pm.environment.set('tnc_version', body.data.version);",
+                  "  console.log('S&K', body.data.version, '| pasal:', body.data.sections.length);",
+                  "} else {",
+                  "  console.error(body.error && body.error.code);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Device-Id",
+                "value": "device-postman-001",
+                "description": "Opsional di sini. Kalau ada, jatah rate limit per perangkat; kalau tidak, per IP."
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/onboarding/tnc",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "tnc"
+              ],
+              "query": [
+                {
+                  "key": "version",
+                  "value": "",
+                  "disabled": true,
+                  "description": "Kosong = versi yang sedang berlaku. Isi untuk menampilkan kembali versi lama yang pernah disetujui; respons akan ber-is_active: false dan persetujuannya PASTI ditolak 409."
+                }
+              ]
+            },
+            "description": "Layar PERTAMA flow buka rekening. Publik: tanpa Authorization dan tanpa session_id, karena sesi baru lahir setelah nasabah menekan setuju.\n\n**Jalankan ini sebelum `1. Create Session`.** Test script menyimpan `data.version` ke `{{tnc_version}}`, dan Create Session mengirimkannya kembali sebagai `accepted_tnc_version`. Server memeriksa nilai itu ke database — versi yang ditulis tangan ditolak `422 TNC_VERSION_UNKNOWN`, versi lama ditolak `409 TNC_VERSION_OUTDATED` beserta `details.current_version`.\n\nRespons ber-`ETag` (`\"tnc-<versi>\"`) dan `Cache-Control: public, max-age=300`. `If-None-Match` dengan ETag yang sama menjawab `304` tanpa body.\n\n`icon_key` dipetakan client ke drawable-nya sendiri — bukan URL, karena ikonnya ada di dalam APK. Kunci yang dikenal: `ACCOUNT_BOX`, `VERIFIED_USER`, `VIDEO_CALL`, `SAVINGS`, `LOCK`.\n\nRate limit 30/5 menit. `503 TNC_UNAVAILABLE` berarti tidak ada versi aktif di server (migrasi `000025` belum jalan) — itu salah konfigurasi, bukan salah request."
+          }
+        },
         {
           "name": "0. Get Card Catalog",
           "event": [
@@ -1637,7 +1977,7 @@
                 }
               ]
             },
-            "description": "Katalog kartu Paspor per produk. Publik: tanpa Authorization dan tanpa session_id, tapi `X-Device-Id` wajib — itu satu-satunya identitas untuk membatasi laju (60/jam per device).\n\nRespons ber-`ETag` dan `Cache-Control`; kirim `If-None-Match` untuk mendapat `304`.\n\nSisipan pilih kartu mati (`FEATURE_CARD_SELECTION=false`) → `404 CARD_CATALOG_EMPTY`.\n\nKontrak: docs/08-PILIH-KARTU-API-SPEC.md §4."
+            "description": "Katalog kartu Paspor per produk. Publik: tanpa Authorization dan tanpa session_id, tapi `X-Device-Id` wajib — itu satu-satunya identitas untuk membatasi laju (60/jam per device).\n\nRespons ber-`ETag` dan `Cache-Control`; kirim `If-None-Match` untuk mendapat `304`.\n\nSisipan pilih kartu mati (`FEATURE_CARD_SELECTION=false`) → `404 CARD_CATALOG_EMPTY`.\n\nKontrak: docs/08-PILIH-KARTU-API-SPEC.md §4.\n\n**Angka biaya dan limit adalah DATA PORTOFOLIO**, bukan tarif resmi BCA. Sumbernya `migrations/000022_card_catalog_rates.up.sql`, jadi katalog ini sama di setiap environment yang sudah dimigrasi — bukan lagi hasil seeder yang hanya jalan di development. Perubahan tarif berikutnya lewat folder **Onboarding — Admin Katalog Kartu**, bukan migrasi baru.\n\nKatalog kosong (`CARD_CATALOG_EMPTY`) berarti `make migrate-up` belum dijalankan, atau `FEATURE_CARD_SELECTION` mati."
           }
         },
         {
@@ -1672,7 +2012,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"product_type\": \"TAHAPAN_BCA\",\n  \"device_id\": \"device-postman-001\",\n  \"accepted_tnc_version\": \"v1.0\",\n  \"card_type\": \"{{card_type}}\",\n  \"card_catalog_version\": \"{{card_catalog_version}}\"\n}"
+              "raw": "{\n  \"product_type\": \"TAHAPAN_BCA\",\n  \"device_id\": \"device-postman-001\",\n  \"accepted_tnc_version\": \"{{tnc_version}}\",\n  \"card_type\": \"{{card_type}}\",\n  \"card_catalog_version\": \"{{card_catalog_version}}\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/onboarding/sessions",
@@ -1684,7 +2024,7 @@
                 "sessions"
               ]
             },
-            "description": "`product_type` yang sah: `TAHAPAN_BCA`, `TAHAPAN_XPRESI`, `TABUNGANKU`. Nilai lain → `ONBOARDING_PRODUCT_UNAVAILABLE`.\n\nSesi berlaku 24 jam.\n\n`card_type` dan `card_catalog_version` opsional, dan hanya berarti bila `FEATURE_CARD_SELECTION` menyala:\n\n- sisipan mati → `current_step: OCR`, tanpa `card`\n- `card_type` terisi & tersedia → `current_step: OCR`, respons memuat `card`\n- `card_type` kosong → `current_step: CARD_SELECTION`, lanjutkan ke request 1b\n- `card_type` tidak dikenal → `422 CARD_TYPE_INVALID`; tidak tersedia → `409 CARD_TYPE_UNAVAILABLE`\n\nJalankan request 0 lebih dulu supaya `{{card_type}}` dan `{{card_catalog_version}}` terisi. Versi katalog yang tertinggal → `meta.catalog_outdated: true`."
+            "description": "**Jalankan `0a. Get Syarat & Ketentuan` lebih dulu** — ia mengisi `{{tnc_version}}`.\n\n`accepted_tnc_version` wajib dan diperiksa ke database, bukan sekadar dicek tidak kosong. Nilai karangan → `422 TNC_VERSION_UNKNOWN`; versi lama → `409 TNC_VERSION_OUTDATED` dengan `details.current_version`, dan client harus memuat ulang S&K lalu meminta nasabah menyetujui teks baru. Diperiksa SEBELUM batas 3 sesi per perangkat, jadi persetujuan yang salah versi tidak menghabiskan jatah.\n\n`product_type` yang sah: `TAHAPAN_BCA`, `TAHAPAN_XPRESI`, `TABUNGANKU`. Nilai lain → `ONBOARDING_PRODUCT_UNAVAILABLE`.\n\nSesi berlaku 24 jam.\n\n`card_type` dan `card_catalog_version` opsional, dan hanya berarti bila `FEATURE_CARD_SELECTION` menyala:\n\n- sisipan mati → `current_step: OCR`, tanpa `card`\n- `card_type` terisi & tersedia → `current_step: OCR`, respons memuat `card`\n- `card_type` kosong → `current_step: CARD_SELECTION`, lanjutkan ke request 1b\n- `card_type` tidak dikenal → `422 CARD_TYPE_INVALID`; tidak tersedia → `409 CARD_TYPE_UNAVAILABLE`\n\nJalankan request 0 lebih dulu supaya `{{card_type}}` dan `{{card_catalog_version}}` terisi. Versi katalog yang tertinggal → `meta.catalog_outdated: true`."
           }
         },
         {
@@ -1714,6 +2054,10 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
               }
             ],
             "body": {
@@ -1742,7 +2086,12 @@
               "type": "noauth"
             },
             "method": "GET",
-            "header": [],
+            "header": [
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
+              }
+            ],
             "url": {
               "raw": "{{base_url}}/onboarding/sessions/{{session_id}}",
               "host": [
@@ -1777,7 +2126,12 @@
               "type": "noauth"
             },
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
+              }
+            ],
             "body": {
               "mode": "formdata",
               "formdata": [
@@ -1846,7 +2200,12 @@
               "type": "noauth"
             },
             "method": "GET",
-            "header": [],
+            "header": [
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
+              }
+            ],
             "url": {
               "raw": "{{base_url}}/onboarding/ocr/{{session_id}}",
               "host": [
@@ -1871,6 +2230,10 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
               }
             ],
             "body": {
@@ -1967,7 +2330,12 @@
               "type": "noauth"
             },
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
+              }
+            ],
             "body": {
               "mode": "formdata",
               "formdata": [
@@ -2019,6 +2387,11 @@
                   "  pm.environment.set('queue_id', body.data.queue_id);",
                   "  console.log('antrean:', body.data.queue_number, '| posisi:', body.data.position);",
                   "  console.log('signaling URL:', body.data.signaling_url);",
+                  "  console.log('token berlaku (detik):', body.data.signaling_expires_in, '— SEKALI PAKAI');",
+                  "  const ice = body.data.ice_servers || [];",
+                  "  if (ice.length === 0) {",
+                  "    console.warn('ice_servers kosong: TURN belum dikonfigurasi, video call gagal di NAT ketat');",
+                  "  }",
                   "}"
                 ]
               }
@@ -2033,6 +2406,10 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
               }
             ],
             "body": {
@@ -2050,7 +2427,7 @@
                 "queue"
               ]
             },
-            "description": "Respons memuat `signaling_url` lengkap dengan token — itulah URL yang dipakai untuk WebSocket request. Host-nya mengikuti `SIGNALING_BASE_URL`, jadi setel env itu ke `wss://<subdomain>.ngrok-free.app` saat pakai tunnel."
+            "description": "Respons memuat `signaling_url` lengkap dengan token — itulah URL yang dipakai untuk WebSocket request. Host-nya mengikuti `SIGNALING_BASE_URL`, jadi setel env itu ke `wss://<subdomain>.ngrok-free.app` saat pakai tunnel.\n\n`signaling_url` membawa token **5 menit, sekali pakai**: `jti`-nya ditandai terpakai pada sambungan WebSocket pertama, jadi URL yang sama tidak bisa dipakai dua kali. Sambungan yang terputus memanggil endpoint ini lagi untuk `queue_id` yang sama dan menerima token baru. `signaling_expires_in` menyebut umurnya dalam detik.\n\n`ice_servers` berisi STUN/TURN dari environment (`STUN_URLS`, `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL`) dalam bentuk `RTCIceServer`, siap diteruskan ke `PeerConnection`. **Kosong berarti belum ada TURN yang dikonfigurasi** — panggilan akan gagal di seluler ber-NAT ketat."
           }
         },
         {
@@ -2116,6 +2493,10 @@
               {
                 "key": "Content-Type",
                 "value": "application/json"
+              },
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
               }
             ],
             "body": {
@@ -2150,6 +2531,10 @@
               {
                 "key": "X-Idempotency-Key",
                 "value": "{{$guid}}"
+              },
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
               }
             ],
             "body": {
@@ -2176,7 +2561,12 @@
               "type": "noauth"
             },
             "method": "DELETE",
-            "header": [],
+            "header": [
+              {
+                "key": "X-Device-ID",
+                "value": "{{device_id}}"
+              }
+            ],
             "url": {
               "raw": "{{base_url}}/onboarding/sessions/{{session_id}}",
               "host": [
@@ -2197,6 +2587,34 @@
       "description": "Dipanggil backend CS, bukan aplikasi nasabah. Autentikasinya header `X-Internal-API-Key`, bukan Bearer token.",
       "item": [
         {
+          "name": "Queued Video Calls",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/onboarding/video-call/queued",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "onboarding",
+                "video-call",
+                "queued"
+              ]
+            },
+            "description": "Pintu masuk sisi CS dan langkah PERTAMA alur petugas: tanpa daftar ini tidak ada cara menemukan queue_id yang dibutuhkan Agent Signaling Token. GET /monitoring hanya mengembalikan queue_length — sebuah angka, tanpa satu pun pengenal panggilan.\n\nUrutan position-nya identik dengan yang dilihat nasabah. Panggilan yang sudah diambil petugas hilang dari daftar. Tidak memuat PII."
+          },
+          "response": []
+        },
+        {
           "name": "Submit Video Call Result",
           "request": {
             "auth": {
@@ -2211,11 +2629,19 @@
               {
                 "key": "X-Internal-API-Key",
                 "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "X-Agent-Employee-ID",
+                "value": "{{agent_employee_id}}"
+              },
+              {
+                "key": "X-Agent-API-Key",
+                "value": "{{agent_api_key}}"
               }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"queue_id\": \"{{queue_id}}\",\n  \"agent_employee_id\": \"CS-001\",\n  \"result\": \"APPROVED\",\n  \"ktp_shown_live\": true,\n  \"identity_confirmed\": true,\n  \"notes\": \"Identitas sesuai\",\n  \"call_duration_seconds\": 180,\n  \"recording_id\": \"rec-001\"\n}"
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"queue_id\": \"{{queue_id}}\",\n  \"result\": \"APPROVED\",\n  \"ktp_shown_live\": true,\n  \"identity_confirmed\": true,\n  \"notes\": \"Identitas sesuai\",\n  \"call_duration_seconds\": 180,\n  \"recording_id\": \"rec-001\"\n}"
             },
             "url": {
               "raw": "{{base_url}}/onboarding/video-call/result",
@@ -2227,7 +2653,8 @@
                 "video-call",
                 "result"
               ]
-            }
+            },
+            "description": "Identitas petugas ada di header (X-Agent-Employee-ID + X-Agent-API-Key), BUKAN di body: agent_employee_id sudah dihapus dari payload. Selama ia sebuah field body, siapa pun yang memegang INTERNAL_API_KEY bisa menandatangani hasil verifikasi dengan nama pegawai mana pun.\n\nJawaban yang mungkin: 422 VIDEO_CALL_NOT_ACTIVE (panggilan belum diambil petugas), 409 VIDEO_CALL_AGENT_MISMATCH (pelapor bukan petugas yang mengambil panggilan), 200 dengan hasil tersimpan kalau ini pengiriman ulang."
           }
         },
         {
@@ -2242,6 +2669,14 @@
               {
                 "key": "X-Internal-API-Key",
                 "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "X-Agent-Employee-ID",
+                "value": "{{agent_employee_id}}"
+              },
+              {
+                "key": "X-Agent-API-Key",
+                "value": "{{agent_api_key}}"
               }
             ],
             "body": {
@@ -2264,7 +2699,7 @@
                 "agent-token"
               ]
             },
-            "description": "Dipanggil CS backend saat agent mengangkat antrean. Mengembalikan signaling_url dengan role agent yang tertanam di token — WebSocket tidak lagi menerima role dari query string."
+            "description": "Dipanggil CS backend saat petugas mengangkat antrean. Mengembalikan signaling_url dengan role agent yang tertanam di token — WebSocket tidak lagi menerima role dari query string — beserta ice_servers.\n\nIdentitas petugas datang dari X-Agent-Employee-ID + X-Agent-API-Key dan diverifikasi ke tabel cs_agents; nama petugas diambil dari baris itu, bukan dari permintaan. Dua penjaga: X-Internal-API-Key menjawab sistem mana yang memanggil, X-Agent-* menjawab petugas mana yang bertindak.\n\nJawaban yang mungkin: 409 VIDEO_CALL_ALREADY_TAKEN (panggilan sedang ditangani petugas lain — pengambilan ulang oleh petugas yang SAMA tetap boleh, itu jalur menyambung ulang), 422 VIDEO_CALL_NOT_ACTIVE, 403 FORBIDDEN, 503 AGENT_AUTH_UNAVAILABLE."
           }
         },
         {
@@ -2414,7 +2849,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"name\": \"Gold Mastercard\",\n  \"tier_key\": \"DEBIT\",\n  \"style\": \"GOLD\",\n  \"fees\": {\n    \"monthly_admin\": 19000,\n    \"card_issuance\": 0,\n    \"card_replacement\": 22222\n  },\n  \"limits\": {\n    \"cash_withdrawal\": 2222222,\n    \"transfer_bca\": 22222222,\n    \"transfer_interbank\": 2222222,\n    \"debit_purchase\": 22222222\n  },\n  \"delivery\": {\n    \"physical_card_available\": true,\n    \"estimated_days_min\": 3,\n    \"estimated_days_max\": 7,\n    \"branch_pickup_available\": true\n  },\n  \"eligibility\": {\n    \"min_age\": 17,\n    \"min_initial_deposit\": 500000\n  },\n  \"is_active\": true\n}"
+              "raw": "{\n  \"name\": \"Gold Mastercard\",\n  \"tier_key\": \"DEBIT\",\n  \"style\": \"GOLD\",\n  \"fees\": {\n    \"monthly_admin\": 18000,\n    \"card_issuance\": 0,\n    \"card_replacement\": 25000\n  },\n  \"limits\": {\n    \"cash_withdrawal\": 10000000,\n    \"transfer_bca\": 75000000,\n    \"transfer_interbank\": 20000000,\n    \"debit_purchase\": 75000000\n  },\n  \"delivery\": {\n    \"physical_card_available\": true,\n    \"estimated_days_min\": 3,\n    \"estimated_days_max\": 7,\n    \"branch_pickup_available\": true\n  },\n  \"eligibility\": {\n    \"min_age\": 17,\n    \"min_initial_deposit\": 1000000\n  },\n  \"is_active\": true\n}"
             },
             "url": {
               "raw": "{{internal_base_url}}/cards/PASPOR_GOLD",
@@ -2426,7 +2861,7 @@
                 "PASPOR_GOLD"
               ]
             },
-            "description": "Semantik PUT, bukan PATCH: seluruh field yang boleh diubah WAJIB hadir. Field yang tidak dikenal ditolak 400 — `is_ative` yang terabaikan akan menulis `is_active: false` dan menonaktifkan kartu tanpa ada yang meminta.\n\nRespons memuat `catalog_version` baru beserta `old_value` dan `new_value`.\n\n**Menonaktifkan kartu yang sedang menjadi default ditolak 422** kecuali `new_default_card_type` disertakan di badan yang sama. Coba: set `is_active` ke `false` pada `PASPOR_BLUE` (default TAHAPAN_BCA).\n\nNilai di luar daftar yang dikenal client (`style`, `tier_key`) ditolak 422 dengan `details.allowed_values`."
+            "description": "Semantik PUT, bukan PATCH: seluruh field yang boleh diubah WAJIB hadir. Field yang tidak dikenal ditolak 400 — `is_ative` yang terabaikan akan menulis `is_active: false` dan menonaktifkan kartu tanpa ada yang meminta.\n\nRespons memuat `catalog_version` baru beserta `old_value` dan `new_value`.\n\n**Menonaktifkan kartu yang sedang menjadi default ditolak 422** kecuali `new_default_card_type` disertakan di badan yang sama. Coba: set `is_active` ke `false` pada `PASPOR_BLUE` (default TAHAPAN_BCA).\n\nNilai di luar daftar yang dikenal client (`style`, `tier_key`) ditolak 422 dengan `details.allowed_values`.\n\n**Body di atas sengaja tidak merusak katalog**: nilainya sama dengan katalog migrasi 000022 kecuali `monthly_admin` (17.000 → 18.000), jadi menjalankannya memperagakan kenaikan biaya sungguhan — satu kenaikan `catalog_version`, satu baris `card_catalog_audit_log` dengan `old_value`/`new_value` — tanpa meninggalkan limit karangan di database. Contoh sebelumnya memakai angka berulang (`2222222`), yang kalau dijalankan justru menulis limit yang tidak masuk akal ke katalog.\n\nInilah jalur yang dipakai untuk mengganti tarif. **Jangan** menambah migrasi baru untuk perubahan tarif: tarif adalah operasi, bukan skema."
           }
         },
         {

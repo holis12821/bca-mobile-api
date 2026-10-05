@@ -61,6 +61,64 @@ services:
       timeout: 5s
       retries: 5
 
+  # coturn — STUN + TURN untuk video call e-KYC.
+  #
+  # Tanpa TURN, WebRTC hanya jadi di jaringan yang ramah: di seluler ber-NAT
+  # ketat — mayoritas nasabah — kandidat langsung tidak pernah bertemu dan
+  # panggilan gagal setelah nasabah menunggu di antrean. Itu yang membuat butir 7
+  # docs/10-HANDOVER-BLOCKER-BACKEND.md tidak bisa diuji sebelum ini ada.
+  #
+  # KREDENSIAL DI BAWAH UNTUK LOKAL SAJA. Deployment sungguhan memakai TURN milik
+  # infrastruktur dengan kredensial berumur pendek (REST API credential), bukan
+  # satu username statis yang ikut di repo.
+  #
+  # TURN mengalokasikan port relay secara dinamis, jadi rentangnya dipersempit ke
+  # 41160-41210 dan dipetakan eksplisit. Cara yang lebih lazim — network_mode:
+  # host — tidak berlaku di Docker Desktop (macOS/Windows), tempat repo ini
+  # dikembangkan. 50 port cukup untuk pengujian lokal; tidak ada yang menunggu
+  # ribuan panggilan bersamaan di laptop.
+  #
+  # Rentang itu sengaja DI BAWAH 49152. Sebelumnya 49160-49210, dan itu bug:
+  # rentang port efemeral macOS mulai tepat di 49152
+  # (net.inet.ip.portrange.first), jadi rentang relay berada seluruhnya di
+  # dalamnya. Docker mengikat 51 port UDP satu per satu; kalau ada proses lain
+  # di laptop sedang memegang salah satunya sebagai port keluar sesaat, bind-nya
+  # gagal dan seluruh `compose up` batal dengan "address already in use" di port
+  # yang terlihat acak — padahal sedetik kemudian port itu sudah bebas lagi.
+  # Jangan pindahkan rentang ini kembali ke atas 49152.
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    container_name: bca-coturn
+    command: >
+      -n
+      --listening-port=3478
+      --fingerprint
+      --lt-cred-mech
+      --realm=bcamobile.local
+      --user=bcadev:localdev_turn_123
+      --min-port=41160
+      --max-port=41210
+      --no-tls
+      --no-dtls
+      --no-cli
+      --log-file=stdout
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "41160-41210:41160-41210/udp"
+    healthcheck:
+      # Satu STUN binding request ke dirinya sendiri: proses yang hidup tapi tidak
+      # menjawab permintaan terlihat sehat kalau yang diperiksa hanya PID-nya.
+      #
+      # Keluarannya yang di-grep, bukan exit code-nya: turnutils_* mengembalikan 0
+      # bahkan ketika servernya menolak — jadi exit code sendirian tidak
+      # membuktikan apa pun.
+      test: ["CMD-SHELL", "turnutils_stunclient 127.0.0.1 2>&1 | grep -q 'reflexive addr'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   postgres_data:
   redis_session_data:

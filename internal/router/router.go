@@ -2,6 +2,7 @@ package router
 
 import (
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -14,6 +15,8 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/config"
 	"github.com/holis12821/bca-mobile-api/internal/domain/account"
 	"github.com/holis12821/bca-mobile-api/internal/domain/auth"
+	"github.com/holis12821/bca-mobile-api/internal/domain/card"
+	"github.com/holis12821/bca-mobile-api/internal/domain/content"
 	"github.com/holis12821/bca-mobile-api/internal/domain/ewallet"
 	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
 	"github.com/holis12821/bca-mobile-api/internal/domain/qris"
@@ -45,7 +48,10 @@ type Deps struct {
 	PIIKey       []byte // AES-256-GCM key for PII encryption/decryption
 }
 
-func New(deps Deps) http.Handler {
+// New builds the route tree. It returns an error only for wiring that must stop
+// the process — today that is exactly one thing: FCM credentials that are present
+// but unusable.
+func New(deps Deps) (http.Handler, error) {
 	r := chi.NewRouter()
 
 	// Global middleware. RealIP runs first so every downstream consumer — audit
@@ -70,7 +76,8 @@ func New(deps Deps) http.Handler {
 
 	// devMode gates every development-only affordance in one place: the mock
 	// OCR/Dukcapil/biometric/core-banking providers, the SMS gateway that logs
-	// instead of sending, and the otp_debug field. Deriving it once here is
+	// instead of sending when no provider is configured, and the otp_debug
+	// field. Deriving it once here is
 	// what stops a production deployment from inheriting any of them.
 	devMode := appEnv(deps.Config) == "development"
 
@@ -92,15 +99,94 @@ func New(deps Deps) http.Handler {
 	// permanently 0. Every flow that has something to tell the nasabah now
 	// writes through this, and pushes it when a provider is configured.
 	notificationRepo := postgres.NewNotificationRepo(deps.DB)
-	var pusher notify.Pusher = push.NewNoopPusher()
-	if devMode {
+
+	// The one place a pusher is chosen. Order matters, and so does the noise:
+	// a production process running without a provider has to say so, because the
+	// notification rows keep being written and everything downstream looks
+	// healthy while no handset ever rings.
+	var pusher notify.Pusher
+	switch {
+	case pushConfig(deps.Config).CredentialsFile != "":
+		fcm, err := push.NewFCMPusher(deviceRepo, deviceRepo, push.FCMConfig{
+			CredentialsFile: pushConfig(deps.Config).CredentialsFile,
+			Timeout:         pushConfig(deps.Config).Timeout,
+		})
+		if err != nil {
+			// Not a fallback to NoopPusher. Credentials that were configured and
+			// are broken is a deployment mistake, and hiding it behind a working
+			// boot is how it reaches production unnoticed.
+			return nil, fmt.Errorf("push provider: %w", err)
+		}
+		pusher = fcm
+	case devMode:
 		pusher = push.NewLoggingPusher(deviceRepo)
+	default:
+		pusher = push.NewNoopPusher()
+		slog.Warn("push notifications are not configured: FCM_CREDENTIALS_FILE is empty, " +
+			"so notifications are stored in-app only and no device will be notified")
 	}
+
 	notifier := notify.New(notificationRepo, pusher)
 
-	// smsGateway logs the OTP in development and refuses (loudly, without
-	// printing the code) anywhere else.
-	smsGateway := sms.For(devMode)
+	// The one place an SMS gateway is chosen, and the same rule as the pusher
+	// above: configured-and-broken fails the boot. A process that answers 503
+	// OTP_DELIVERY_FAILED for every nasabah is not a healthy process, and the
+	// previous arrangement had no way to say so until someone read the logs.
+	smsCfg := sms.ProviderConfig{
+		Provider:         smsConfig(deps.Config).Provider,
+		AccountSID:       smsConfig(deps.Config).AccountSID,
+		AuthToken:        smsConfig(deps.Config).AuthToken,
+		Sender:           smsConfig(deps.Config).Sender,
+		BaseURL:          smsConfig(deps.Config).BaseURL,
+		Timeout:          smsConfig(deps.Config).Timeout,
+		VerifyServiceSID: smsConfig(deps.Config).VerifyServiceSID,
+		VerifyBaseURL:    smsConfig(deps.Config).VerifyBaseURL,
+		VerifyChannels:   smsConfig(deps.Config).VerifyChannels,
+		VerifyLocale:     smsConfig(deps.Config).VerifyLocale,
+		VerifyCodeTTL:    smsConfig(deps.Config).VerifyCodeTTL,
+	}
+
+	// otpVerifier is set instead of smsGateway when the provider owns the code.
+	//
+	// Only the onboarding flow can use it. Registration and the profile-OTP both
+	// hand a code they generated to a Gateway, so they keep whatever gateway the
+	// switch below picks — which on a Twilio trial means the mock, because the
+	// Messages API refuses custom bodies there (572006).
+	var otpVerifier onboarding.OTPVerifier
+	var smsGateway sms.Gateway
+	switch {
+	case sms.IsVerifierProvider(smsCfg.Provider):
+		v, err := sms.NewVerifier(smsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("sms verifier: %w", err)
+		}
+		otpVerifier = v
+		// The two flows that still need a Gateway get the development mock or a
+		// refusal — never a silent no-op.
+		if devMode {
+			smsGateway = sms.NewMockGateway()
+		} else {
+			smsGateway = sms.NewUnconfiguredGateway()
+			slog.Warn("SMS_PROVIDER is a verifier, so registration and profile OTP have no gateway: " +
+				"those two flows will answer OTP_DELIVERY_FAILED")
+		}
+	case smsCfg.Provider != "":
+		gw, err := sms.NewProvider(smsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("sms provider: %w", err)
+		}
+		smsGateway = gw
+	case devMode:
+		// Logs the code instead of sending it; otp_debug carries it too.
+		smsGateway = sms.NewMockGateway()
+	default:
+		// Unreachable with a validated config (Validate requires SMS_PROVIDER
+		// outside development), and kept anyway: router.New is also built by
+		// tests that pass a bare Deps.
+		smsGateway = sms.NewUnconfiguredGateway()
+		slog.Warn("sms is not configured: SMS_PROVIDER is empty, " +
+			"so every OTP will be generated and never delivered")
+	}
 
 	sessionRepo := postgres.NewSessionRepo(deps.DB)
 	biometricRepo := postgres.NewBiometricRepo(deps.DB)
@@ -172,6 +258,25 @@ func New(deps Deps) http.Handler {
 	notifH := handler.NewNotificationHandler(accountService)
 	deviceH := handler.NewDeviceHandler(deviceRepo)
 
+	// Kartu MILIK nasabah (migrasi 000021). Paket domain terpisah dari account:
+	// kartu punya siklus hidup sendiri (blokir, penggantian, kedaluwarsa).
+	//
+	// accountCardRepo bukan cardRepo di bawah — yang itu membaca KATALOG
+	// (card_products) untuk flow buka rekening.
+	accountCardRepo := postgres.NewAccountCardRepo(deps.DB)
+	accountCardService := card.NewService(card.ServiceConfig{
+		Cards:  accountCardRepo,
+		Writer: accountCardRepo,
+	})
+	accountCardH := handler.NewAccountCardHandler(accountCardService)
+
+	// Konten statis (migrasi 000023): Pusat Bantuan dan Kontak CS.
+	contentService := content.NewService(content.ServiceConfig{
+		Repo:  postgres.NewContentRepo(deps.DB),
+		Cache: redisrepo.NewContentCache(deps.RedisCache),
+	})
+	contentH := handler.NewContentHandler(contentService)
+
 	// Transaction dependencies
 	mutationRepo := postgres.NewMutationRepo(deps.DB)
 	transactionRepo := postgres.NewTransactionRepo(deps.DB)
@@ -210,6 +315,7 @@ func New(deps Deps) http.Handler {
 	// will raise a daily ceiling.
 	authH.SetTransactionService(txnService)
 	accountService.SetVerificationTokenConsumer(txnService)
+	accountCardService.SetVerificationTokenConsumer(txnService)
 
 	txnH := handler.NewTransactionHandler(txnService)
 	transferH := handler.NewTransferHandler(txnService)
@@ -317,12 +423,61 @@ func New(deps Deps) http.Handler {
 		Metrics:      cardMetrics,
 	})
 
+	// S&K dibangun SEBELUM session service: CreateSession memvalidasi
+	// `accepted_tnc_version` lewat service ini, dan tanpa itu kolom tnc_version
+	// kembali menjadi string bebas yang tidak bisa dibuktikan isinya.
+	tncService := onboarding.NewTNCService(onboarding.TNCServiceConfig{
+		Repo:  postgres.NewOnboardingTNCRepo(deps.DB),
+		Cache: redisrepo.NewOnboardingTNCCache(deps.RedisCache),
+	})
+
+	onboardingVideoCallRepo := postgres.NewOnboardingVideoCallRepo(deps.DB)
+
+	// Registry petugas CS. Interface-nya, bukan tipe konkretnya: tanpa database —
+	// hanya terjadi di test perakitan rute — nilainya tetap nil sejati, dan AgentAuth
+	// menolak setiap permintaan. Membangunnya dengan pool nil akan lolos kompilasi lalu
+	// panic pada request pertama yang benar-benar sampai ke lookup.
+	var csAgentLookup middleware.AgentLookup
+	if deps.DB != nil {
+		csAgentLookup = postgres.NewCSAgentRepo(deps.DB)
+	}
+	videoCallQueueCache := redisrepo.NewVideoCallQueueCache(deps.RedisSession)
+
+	sigBaseURL := "ws://localhost:8080"
+	if deps.Config != nil && deps.Config.SignalingBaseURL != "" {
+		sigBaseURL = deps.Config.SignalingBaseURL
+	}
+
+	// Hub dibuat di sini, bukan di bawah bersama handler signaling: VideoCallService
+	// memerlukannya sebagai Notifier, dan tanpa itu `agent_assigned` tidak pernah terkirim —
+	// yang berarti panggilan tidak pernah bisa dimulai.
+	sigHub := ws.NewHub()
+
+	videoCallService := onboarding.NewVideoCallService(onboarding.VideoCallServiceConfig{
+		Sessions:         onboardingSessionRepo,
+		Cache:            onboardingCache,
+		VideoCalls:       onboardingVideoCallRepo,
+		QueueCache:       videoCallQueueCache,
+		JWTManager:       deps.JWTManager,
+		Audit:            onboardingAuditRepo,
+		SignalingBaseURL: sigBaseURL,
+		ICEServers:       iceServers(deps.Config),
+		Notifier:         sigHub,
+	})
+
+	// Video call dibangun SEBELUM session service, dan urutannya mengikat:
+	// CancelSession harus membatalkan panggilan yang masih hidup, jadi ia menerima
+	// VideoCallService sebagai VideoCallCanceller. Dibalik, field itu nil dan panggilan
+	// nasabah yang membatalkan sesinya tetap mengantre — menggeser posisi orang lain dan
+	// tampil di daftar petugas sebagai panggilan yang bisa diambil.
 	onboardingSessionService := onboarding.NewSessionService(onboarding.SessionServiceConfig{
 		Sessions:         onboardingSessionRepo,
 		Cache:            onboardingCache,
 		Audit:            onboardingAuditRepo,
 		Cards:            cardService,
+		TNC:              tncService,
 		LegacyAppVersion: clientCfg.CardLegacyAppVersion,
+		VideoCalls:       videoCallService,
 	})
 
 	// External integrations, chosen once by environment. In development these
@@ -352,7 +507,10 @@ func New(deps Deps) http.Handler {
 	})
 
 	onboardingPersonalDataRepo := postgres.NewOnboardingPersonalDataRepo(deps.DB)
-	onboardingOTPCache := redisrepo.NewOnboardingOTPCache(deps.RedisSession)
+	// The hasher keys the per-number OTP send budget. Same secret as
+	// users.phone_hash, so the key is unguessable without it; nil only in the
+	// bare wiring tests use, where the counter falls back to an unkeyed digest.
+	onboardingOTPCache := redisrepo.NewOnboardingOTPCache(deps.RedisSession, lookupHasher)
 
 	personalDataService := onboarding.NewPersonalDataService(onboarding.PersonalDataServiceConfig{
 		Sessions:     onboardingSessionRepo,
@@ -361,6 +519,7 @@ func New(deps Deps) http.Handler {
 		PersonalData: onboardingPersonalDataRepo,
 		OTPCache:     onboardingOTPCache,
 		SMS:          smsGateway,
+		Verifier:     otpVerifier,
 		DevMode:      devMode,
 		AES:          piiAES,
 		Audit:        onboardingAuditRepo,
@@ -379,24 +538,6 @@ func New(deps Deps) http.Handler {
 		RateLimiter: bioRateLimiter,
 		AES:         piiAES,
 		Audit:       onboardingAuditRepo,
-	})
-
-	onboardingVideoCallRepo := postgres.NewOnboardingVideoCallRepo(deps.DB)
-	videoCallQueueCache := redisrepo.NewVideoCallQueueCache(deps.RedisSession)
-
-	sigBaseURL := "ws://localhost:8080"
-	if deps.Config != nil && deps.Config.SignalingBaseURL != "" {
-		sigBaseURL = deps.Config.SignalingBaseURL
-	}
-
-	videoCallService := onboarding.NewVideoCallService(onboarding.VideoCallServiceConfig{
-		Sessions:         onboardingSessionRepo,
-		Cache:            onboardingCache,
-		VideoCalls:       onboardingVideoCallRepo,
-		QueueCache:       videoCallQueueCache,
-		JWTManager:       deps.JWTManager,
-		Audit:            onboardingAuditRepo,
-		SignalingBaseURL: sigBaseURL,
 	})
 
 	onboardingCredentialRepo := postgres.NewOnboardingCredentialRepo(deps.DB)
@@ -440,6 +581,9 @@ func New(deps Deps) http.Handler {
 		Cards:        cardService,
 		CardIssuance: cardIssuanceRepo,
 		CardCodes:    clientCfg.CardCoreBankingCode,
+		// Repo yang sama dengan pembaca GET /account/cards: kartu yang baru
+		// terbit harus muncul di layar Profil Saya tanpa menunggu seeder.
+		AccountCards: accountCardRepo,
 	})
 
 	monitoringService := onboarding.NewMonitoringService(onboarding.MonitoringServiceConfig{
@@ -449,14 +593,21 @@ func New(deps Deps) http.Handler {
 		Metrics:    cardMetrics,
 	})
 
-	sigHub := ws.NewHub()
-	signalingH := handler.NewSignalingHandler(sigHub, deps.JWTManager, corsOrigins(deps.Config))
+	// The signaling token is single-use; the store is what remembers a spent
+	// jti. It lives on the session Redis, the same instance that holds the
+	// challenges and nonces those tokens are peers of.
+	signalingTokens := redisrepo.NewSignalingTokenStore(deps.RedisSession)
+	// videoCallService memenuhi SignalingLifecycle: socket nasabah yang baru tersambung
+	// langsung menerima posisi antreannya.
+	signalingH := handler.NewSignalingHandler(
+		sigHub, deps.JWTManager, signalingTokens, videoCallService, corsOrigins(deps.Config),
+	)
 
 	cardH := handler.NewCardHandler(cardService, clientCfg.ProductUnderMaintenance)
 	cardAdminH := handler.NewCardAdminHandler(
 		onboarding.NewCardAdminService(cardRepo, cardCache))
 
-	onboardingH := handler.NewOnboardingHandler(onboardingSessionService, ocrService, personalDataService, biometricService, videoCallService, credentialService, submitService, monitoringService, deps.PINKeys)
+	onboardingH := handler.NewOnboardingHandler(onboardingSessionService, ocrService, personalDataService, biometricService, videoCallService, credentialService, submitService, monitoringService, tncService, deps.PINKeys)
 
 	uploadDir := "uploads"
 	if deps.Config != nil && deps.Config.UploadDir != "" {
@@ -494,6 +645,25 @@ func New(deps Deps) http.Handler {
 			r.Get("/auth/biometric/challenge", authH.BiometricChallenge)
 			r.Post("/auth/biometric/challenge", authH.BiometricChallenge)
 			r.Post("/auth/token/refresh", authH.RefreshToken)
+
+			// The PIN public key has to be reachable before login, since every
+			// PIN endpoint needs it first. Public by nature — it is the public
+			// half — and the counterpart to assets/pin_public.pem in the APK,
+			// which cannot be rotated without a release.
+			r.Get("/auth/pin/public-key", authH.PINPublicKey)
+		})
+
+		// Konten statis. Tanpa Authorization dengan sengaja: tidak ada data
+		// nasabah di dalamnya, dan nasabah yang justru terkunci di luar
+		// aplikasi adalah yang paling butuh nomor Halo BCA.
+		//
+		// Tetap kena rate limit publik — dua endpoint tanpa token adalah dua
+		// endpoint yang bisa dipakai membanjiri database.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.RateLimit(rateLimiter, publicContentRateKey, publicContentRateLimit, publicContentRateWindow, false))
+
+			r.Get("/content/help-center", contentH.HelpCenter)
+			r.Get("/content/contact-cs", contentH.ContactCS)
 		})
 
 		// Onboarding — buka rekening
@@ -529,6 +699,23 @@ func New(deps Deps) http.Handler {
 					cardCatalogIPRateLimit, cardCatalogIPRateWindow, false))
 
 				r.Get("/products/{product_type}/cards", cardH.GetCatalog)
+			})
+
+			// S&K dibaca pada layar PERTAMA buka rekening — sebelum sesi ada,
+			// jadi tanpa session_id dan tanpa Authorization. Sama seperti
+			// katalog kartu, ia sengaja DI LUAR grup ber-limit-IP di bawah:
+			// batas itu menjaga penelusuran session_id dan pemerasan OTP, yang
+			// tidak berlaku untuk teks publik dan cacheable.
+			//
+			// Jatahnya sendiri, bukan menumpang bucket katalog kartu. Flow
+			// Android memuat S&K lalu katalog pada dua layar berurutan, jadi
+			// bucket bersama berarti dua endpoint saling menghabiskan jatah dan
+			// nasabah menerima 429 di tengah pendaftaran.
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.RateLimit(rateLimiter, tncRateKey,
+					tncRateLimit, tncRateWindow, false))
+
+				r.Get("/tnc", onboardingH.GetTNC)
 			})
 
 			r.Group(func(r chi.Router) {
@@ -568,10 +755,25 @@ func New(deps Deps) http.Handler {
 			}
 			r.Group(func(r chi.Router) {
 				r.Use(middleware.InternalAPIKey(internalAPIKey))
-				r.Post("/video-call/result", onboardingH.SubmitVideoCallResult)
-				r.Post("/video-call/agent-token", onboardingH.IssueAgentSignalingToken)
+
+				// Melihat antrean, jejak audit, dan kesehatan sistem adalah tindakan
+				// sistem/pengawas, bukan tindakan satu petugas: tidak ada yang
+				// diatribusikan ke seseorang, dan daftar antrean sengaja tidak memuat PII.
+				r.Get("/video-call/queued", onboardingH.ListQueuedVideoCalls)
 				r.Get("/sessions/{session_id}/audit", onboardingH.GetAuditTrail)
 				r.Get("/monitoring", onboardingH.GetMonitoringStatus)
+
+				// Mengambil panggilan dan memutuskan hasil verifikasi JELAS tindakan
+				// seseorang: namanya tampil di layar nasabah dan keputusannya yang
+				// membuka pembukaan rekening. Dua penjaga, dua pertanyaan — sistem mana
+				// yang memanggil (InternalAPIKey) dan petugas mana yang bertindak
+				// (AgentAuth). Urutannya bukan selera: Argon2 di AgentAuth mahal, dan
+				// tidak boleh bisa dipicu lalu lintas yang belum lolos penjaga pertama.
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.AgentAuth(csAgentLookup))
+					r.Post("/video-call/agent-token", onboardingH.IssueAgentSignalingToken)
+					r.Post("/video-call/result", onboardingH.SubmitVideoCallResult)
+				})
 			})
 		})
 
@@ -583,6 +785,13 @@ func New(deps Deps) http.Handler {
 		// walking many of them.
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.RateLimit(rateLimiter, registrationRateKey, registrationRateLimit, registrationRateWindow, false))
+			// /v1/registration/* and /v1/onboarding/* describe the same feature
+			// with two different contracts. /v1/onboarding/* is the one the
+			// Android app implements and the one that is maintained; this family
+			// is kept working for older builds and says so on every response,
+			// so a client integrating today can see which one to pick without
+			// reading both specs (butir 8).
+			r.Use(deprecated("/v1/onboarding/*", "docs/01-API-SPECIFICATION.md#9-registrasi-buka-rekening"))
 
 			r.Post("/registration/initiate", regH.Initiate)
 			r.Post("/registration/verify-otp", regH.VerifyOTP)
@@ -613,6 +822,17 @@ func New(deps Deps) http.Handler {
 			r.Get("/account/dashboard", accountH.Dashboard)
 			r.Get("/account/transaction-limit", accountH.TransactionLimits)
 			r.Put("/account/transaction-limit", accountH.UpdateTransactionLimit)
+
+			// Kartu milik nasabah. Tidak ada parameter apa pun: user id diambil
+			// dari access token, jadi tidak ada jalan meminta kartu orang lain.
+			r.Get("/account/cards", accountCardH.List)
+
+			// Perubahan pada satu kartu. card_id datang dari URL dan SELALU
+			// dipasangkan dengan user id dari token di lapisan repository —
+			// tanpa itu, sebuah UUID tebakan bisa mengubah kartu orang lain.
+			r.Put("/account/cards/{card_id}/settings", accountCardH.UpdateSettings)
+			r.Post("/account/cards/{card_id}/block", accountCardH.Block)
+			r.Post("/account/cards/{card_id}/replacement", accountCardH.RequestReplacement)
 
 			// Account update endpoints
 			r.Post("/account/profile/otp", accountH.RequestProfileOTP)
@@ -681,11 +901,92 @@ func New(deps Deps) http.Handler {
 		})
 	})
 
-	return r
+	return r, nil
+}
+
+// pushConfig returns the push block, tolerating a nil Config the way the other
+// accessors in this file do — router_test builds Deps with almost nothing set.
+func pushConfig(cfg *config.Config) config.Push {
+	if cfg == nil {
+		return config.Push{}
+	}
+	return cfg.Push
+}
+
+// smsConfig returns the SMS block, tolerating a nil Config the same way.
+func smsConfig(cfg *config.Config) config.SMS {
+	if cfg == nil {
+		return config.SMS{}
+	}
+	return cfg.SMS
 }
 
 // appEnv defaults to development so tests that pass a nil Config keep the
 // permissive local behaviour. Every real deployment sets APP_ENV explicitly.
+// iceServers builds the WebRTC ICE list from the environment.
+//
+// Empty is a valid, and currently expected, answer: no TURN credentials have
+// been issued yet (butir 7). Returning an empty list rather than a fabricated
+// server means the app can tell "not configured" from "configured and broken" —
+// and nothing here is a mock, so there is no environment gate to apply.
+func iceServers(cfg *config.Config) []onboarding.ICEServer {
+	if cfg == nil {
+		return nil
+	}
+
+	var servers []onboarding.ICEServer
+	if urls := nonEmpty(cfg.WebRTC.STUNURLs); len(urls) > 0 {
+		servers = append(servers, onboarding.ICEServer{URLs: urls})
+	}
+	if urls := nonEmpty(cfg.WebRTC.TURNURLs); len(urls) > 0 {
+		// A TURN server without credentials is a TURN server that refuses every
+		// allocation. Saying so at startup beats debugging it from a nasabah's
+		// failed video call.
+		if cfg.WebRTC.TURNUsername == "" || cfg.WebRTC.TURNCredential == "" {
+			slog.Error("TURN_URLS set without TURN_USERNAME/TURN_CREDENTIAL: ignoring TURN servers")
+		} else {
+			servers = append(servers, onboarding.ICEServer{
+				URLs:       urls,
+				Username:   cfg.WebRTC.TURNUsername,
+				Credential: cfg.WebRTC.TURNCredential,
+			})
+		}
+	}
+
+	if len(servers) == 0 && appEnv(cfg) != "development" {
+		slog.Warn("no ICE servers configured: video call will fail behind strict NAT")
+	}
+
+	return servers
+}
+
+func nonEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// deprecated marks a route family as superseded. RFC 8594 Sunset is deliberately
+// NOT sent: no removal date has been agreed, and inventing one here would be a
+// promise this repository cannot keep.
+func deprecated(successor, reference string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Deprecation", "true")
+			w.Header().Set("Link", `<`+successor+`>; rel="successor-version"`)
+			w.Header().Set("X-API-Deprecation-Info", reference)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 func appEnv(cfg *config.Config) string {
 	if cfg == nil || cfg.App.Env == "" {
 		return "development"
@@ -719,7 +1020,17 @@ func authRateKey(r *http.Request) string {
 const (
 	registrationRateLimit  = 20
 	registrationRateWindow = 15 * time.Minute
+
+	// Konten statis: longgar, karena layar Bantuan bisa dibuka berkali-kali
+	// dan jawabannya sama untuk semua orang. Yang dibatasi di sini bukan
+	// penyalahgunaan data, melainkan beban database dari alamat yang sama.
+	publicContentRateLimit  = 60
+	publicContentRateWindow = 1 * time.Minute
 )
+
+func publicContentRateKey(r *http.Request) string {
+	return "rate:content:ip:" + middleware.ClientIP(r)
+}
 
 func registrationRateKey(r *http.Request) string {
 	return "rate:registration:ip:" + middleware.ClientIP(r)
@@ -791,6 +1102,27 @@ func setCardRateKey(r *http.Request) string {
 		return "rate:cards:set:ip:" + middleware.ClientIP(r)
 	}
 	return "rate:cards:set:session:" + sessionID
+}
+
+// S&K: 30 per 5 menit. Layarnya dibuka sekali per pendaftaran dan isinya
+// di-cache 5 menit di client, jadi angka ini longgar untuk pemakaian wajar
+// sekaligus menahan client yang mengulang tanpa henti.
+const (
+	tncRateLimit  = 30
+	tncRateWindow = 5 * time.Minute
+)
+
+// tncRateKey membatasi per X-Device-Id, dengan jatuh ke IP bila headernya tidak
+// ada. Berbeda dari katalog kartu, GetTNC TIDAK mewajibkan header itu: teks S&K
+// sama untuk semua perangkat, dan menolak 400 di layar pertama buka rekening
+// hanya menambah satu cara gagal tanpa menjaga apa pun. Cabang IP di bawah
+// karena itu adalah jalur normal untuk client yang tidak mengirimnya, bukan
+// kasus tepi.
+func tncRateKey(r *http.Request) string {
+	if deviceID := strings.TrimSpace(r.Header.Get("X-Device-Id")); deviceID != "" {
+		return "rate:tnc:device:" + deviceID
+	}
+	return "rate:tnc:ip:" + middleware.ClientIP(r)
 }
 
 // cardCatalogRateKey membatasi per X-Device-Id. Belum ada sesi maupun token di

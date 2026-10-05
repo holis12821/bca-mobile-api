@@ -175,6 +175,11 @@ type RecentTransferItem struct {
 type PINVerifyRequest struct {
 	PINEncrypted string `json:"pin_encrypted" validate:"required"`
 	Purpose      string `json:"purpose" validate:"required"`
+
+	// EncryptionKeyID names the PIN public key used for pin_encrypted. Optional;
+	// a stale value is answered with AUTH_PIN_KEY_UNKNOWN rather than with a
+	// wrong-PIN error. See auth.LoginRequest.
+	EncryptionKeyID string `json:"encryption_key_id,omitempty"`
 }
 
 // PINVerifyResponse is returned from POST /auth/pin/verify.
@@ -191,6 +196,12 @@ var ValidPurposes = map[string]bool{
 	"CHANGE_LIMIT":   true,
 	"CHANGE_PIN":     true,
 	"CHANGE_PROFILE": true,
+
+	// Kartu milik nasabah. Memblokir dan mengganti kartu adalah aksi keamanan
+	// dan berbiaya; keduanya minta PIN lewat /auth/pin/verify seperti
+	// CHANGE_LIMIT, bukan cukup access token.
+	"BLOCK_CARD":   true,
+	"REPLACE_CARD": true,
 }
 
 // ExecuteTransferRequest is the request body for POST /transfer/execute.

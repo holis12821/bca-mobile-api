@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -407,9 +408,14 @@ func (s *Service) RequestProfileOTP(ctx context.Context, userID uuid.UUID) (*Req
 		slog.Warn("reset profile otp attempts failed", "error", err)
 	}
 
+	// Sending is the entire point of this endpoint, so a gateway refusal is not
+	// something to log and answer 200 to: that left the nasabah waiting on an
+	// SMS that was never sent, with an expires_in ticking down for nothing. The
+	// code stays stored and valid — only the response says delivery failed.
 	if s.sms != nil {
 		if err := s.sms.SendOTP(ctx, profile.Phone, code); err != nil {
 			slog.Error("send profile otp failed", "user_id", userID, "error", err)
+			return nil, apperr.OTPDeliveryFailed
 		}
 	}
 
@@ -500,14 +506,18 @@ func (s *Service) UpdateSettings(ctx context.Context, userID uuid.UUID, req Upda
 	return nil
 }
 
-// ListNotifications returns paginated notifications.
-func (s *Service) ListNotifications(ctx context.Context, userID uuid.UUID, cursor *uuid.UUID, limit int) (*NotificationListResponse, bool, string, error) {
+// ListNotifications returns paginated notifications, optionally narrowed to a
+// set of types.
+func (s *Service) ListNotifications(ctx context.Context, userID uuid.UUID, types []string, cursor *uuid.UUID, limit int) (*NotificationListResponse, bool, string, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
 
 	ver, _ := s.versions.GetVersion(ctx, "notif", userID)
-	cursorHash := cursorToHash(cursor)
+	// The filter is part of the cache key, not just the cursor. Keying on the
+	// cursor alone would let the first page of the PROMO tab be served as the
+	// first page of the unfiltered list, and vice versa.
+	cursorHash := cursorToHash(cursor, types)
 
 	if s.notifCache != nil {
 		cached, err := s.notifCache.GetNotifications(ctx, userID, ver, cursorHash)
@@ -529,7 +539,7 @@ func (s *Service) ListNotifications(ctx context.Context, userID uuid.UUID, curso
 	}
 
 	// Fetch limit+1 to determine has_more
-	rows, err := s.notifications.ListByUserID(ctx, userID, cursor, limit+1)
+	rows, err := s.notifications.ListByUserID(ctx, userID, types, cursor, limit+1)
 	if err != nil {
 		return nil, false, "", fmt.Errorf("list notifications: %w", err)
 	}
@@ -622,10 +632,24 @@ func toNotificationItem(n Notification) NotificationItem {
 	return item
 }
 
-func cursorToHash(cursor *uuid.UUID) string {
-	if cursor == nil {
-		return "first"
+func cursorToHash(cursor *uuid.UUID, types []string) string {
+	page := "first"
+	if cursor != nil {
+		page = cursor.String()
 	}
-	h := sha256.Sum256([]byte(cursor.String()))
+	if len(types) == 0 {
+		if cursor == nil {
+			// Preserved verbatim so keys written before the filter existed stay
+			// readable across a deploy.
+			return "first"
+		}
+		h := sha256.Sum256([]byte(page))
+		return hex.EncodeToString(h[:8])
+	}
+	// Sorted so ?type=PROMO,INFO and ?type=INFO,PROMO share one cache entry
+	// instead of quietly doubling the keys for one list.
+	sorted := append([]string(nil), types...)
+	sort.Strings(sorted)
+	h := sha256.Sum256([]byte(page + "|" + strings.Join(sorted, ",")))
 	return hex.EncodeToString(h[:8])
 }

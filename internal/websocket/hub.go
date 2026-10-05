@@ -166,6 +166,37 @@ func (h *Hub) SendToSession(sessionID string, role Role, msg onboarding.SignalMe
 	target.Send(data)
 }
 
+// SendToNasabah mengirim pesan ke sisi nasabah sebuah sesi.
+//
+// Ada supaya lapisan domain bisa mengirim tanpa mengenal tipe [Role]: paket ini sudah
+// meng-import `onboarding`, jadi `onboarding` tidak boleh meng-import paket ini. Yang
+// dipakai di sana adalah antarmuka yang dipenuhi metode ini secara struktural.
+func (h *Hub) SendToNasabah(sessionID string, msg onboarding.SignalMessage) {
+	h.SendToSession(sessionID, RoleNasabah, msg)
+}
+
+// HasRole melaporkan apakah sisi [role] sebuah sesi sedang tersambung.
+//
+// Dipakai untuk memutuskan apakah `agent_assigned` perlu ditahan: nasabah yang belum
+// membuka socket tidak akan menerimanya, dan pesan yang menghilang tanpa jejak lebih buruk
+// daripada yang tidak pernah dikirim.
+func (h *Hub) HasRole(sessionID string, role Role) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	room, ok := h.rooms[sessionID]
+	if !ok {
+		return false
+	}
+	switch role {
+	case RoleNasabah:
+		return room.Nasabah != nil
+	case RoleAgent:
+		return room.Agent != nil
+	}
+	return false
+}
+
 // BroadcastToRoom sends a message to all participants in a room.
 func (h *Hub) BroadcastToRoom(sessionID string, msg onboarding.SignalMessage) {
 	h.mu.RLock()

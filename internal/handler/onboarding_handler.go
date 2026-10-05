@@ -13,6 +13,7 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
+	"github.com/holis12821/bca-mobile-api/internal/middleware"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/response"
@@ -51,6 +52,7 @@ type OnboardingHandler struct {
 	credentialService   *onboarding.CredentialService
 	submitService       *onboarding.SubmitService
 	monitoringService   *onboarding.MonitoringService
+	tncService          *onboarding.TNCService
 	pinKeys             *crypto.RSAKeyPair
 }
 
@@ -63,6 +65,7 @@ func NewOnboardingHandler(
 	credSvc *onboarding.CredentialService,
 	submitSvc *onboarding.SubmitService,
 	monSvc *onboarding.MonitoringService,
+	tncSvc *onboarding.TNCService,
 	pinKeys *crypto.RSAKeyPair,
 ) *OnboardingHandler {
 	return &OnboardingHandler{
@@ -74,8 +77,54 @@ func NewOnboardingHandler(
 		credentialService:   credSvc,
 		submitService:       submitSvc,
 		monitoringService:   monSvc,
+		tncService:          tncSvc,
 		pinKeys:             pinKeys,
 	}
+}
+
+// GetTNC menangani GET /v1/onboarding/tnc.
+//
+// Tanpa Authorization dan tanpa session_id: layar S&K adalah langkah PERTAMA
+// buka rekening, dan sesi baru lahir setelah nasabah menekan setuju. Itu juga
+// sebabnya ia tidak ikut grup ber-rate-limit per session_id.
+//
+// `?version=` opsional, untuk menampilkan kembali teks versi lama yang pernah
+// disetujui. Tanpa parameter: versi yang sedang berlaku.
+func (h *OnboardingHandler) GetTNC(w http.ResponseWriter, r *http.Request) {
+	if h.tncService == nil {
+		response.Err(w, r, apperr.TNCUnavailable)
+		return
+	}
+
+	version := strings.TrimSpace(r.URL.Query().Get("version"))
+
+	doc, err := h.tncService.ByVersion(r.Context(), version)
+	if err != nil {
+		h.handleErr(w, r, "get onboarding tnc failed", err)
+		return
+	}
+
+	// ETag memuat versi yang BENAR-BENAR dilayani, bukan yang diminta. Ketika
+	// `?version=` kosong, yang dilayani adalah versi aktif — dan begitu versi
+	// aktif berganti, ETag-nya berganti sendiri. ETag dari nilai query akan
+	// membuat client terus menerima 304 berisi teks lama persis pada hari
+	// pergantian versi, lalu persetujuannya ditolak 409 tanpa ia pernah bisa
+	// melihat teks baru. Pelajaran yang sama dari catalogETag.
+	etag := `"tnc-` + doc.Version + `"`
+	w.Header().Set("ETag", etag)
+
+	// Lima menit, bukan sehari seperti TTL cache server. Teks hukum yang
+	// diperbarui harus cepat terlihat: client yang menahannya lebih lama hanya
+	// akan mengumpulkan penolakan 409 saat nasabah menekan setuju.
+	w.Header().Set("Cache-Control", "public, max-age=300")
+
+	if matchesETag(r.Header.Get("If-None-Match"), etag) {
+		// 304 tidak boleh membawa body — termasuk envelope standar.
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, doc)
 }
 
 // CreateSession handles POST /v1/onboarding/sessions
@@ -130,6 +179,10 @@ func (h *OnboardingHandler) GetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.deviceOwnsSession(w, r, sessionID) {
+		return
+	}
+
 	resp, err := h.sessionService.GetSession(r.Context(), sessionID)
 	if err != nil {
 		h.handleErr(w, r, "get onboarding session failed", err)
@@ -144,6 +197,10 @@ func (h *OnboardingHandler) CancelSession(w http.ResponseWriter, r *http.Request
 	sessionID := chi.URLParam(r, "session_id")
 	if sessionID == "" {
 		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	if !h.deviceOwnsSession(w, r, sessionID) {
 		return
 	}
 
@@ -170,6 +227,10 @@ func (h *OnboardingHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.FormValue("session_id")
 	if sessionID == "" {
 		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	if !h.deviceOwnsSession(w, r, sessionID) {
 		return
 	}
 
@@ -217,6 +278,10 @@ func (h *OnboardingHandler) GetOCRResult(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if !h.deviceOwnsSession(w, r, sessionID) {
+		return
+	}
+
 	result, err := h.ocrService.GetOCRResult(r.Context(), sessionID)
 	if err != nil {
 		h.handleErr(w, r, "get ocr result failed", err)
@@ -242,6 +307,10 @@ func (h *OnboardingHandler) SavePersonalData(w http.ResponseWriter, r *http.Requ
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
+	if !h.deviceOwnsSession(w, r, req.SessionID) {
+		return
+	}
+
 	resp, err := h.personalDataService.SavePersonalData(r.Context(), req, clientIP, userAgent)
 	if err != nil {
 		h.handleErr(w, r, "save personal data failed", err)
@@ -264,7 +333,7 @@ func (h *OnboardingHandler) VerifyOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.DeviceID = r.Header.Get("X-Device-ID")
+	req.DeviceID = deviceIDHeader(r)
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
@@ -289,7 +358,7 @@ func (h *OnboardingHandler) ResendOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.DeviceID = r.Header.Get("X-Device-ID")
+	req.DeviceID = deviceIDHeader(r)
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
@@ -315,6 +384,10 @@ func (h *OnboardingHandler) ProcessBiometric(w http.ResponseWriter, r *http.Requ
 	sessionID := r.FormValue("session_id")
 	if sessionID == "" {
 		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	if !h.deviceOwnsSession(w, r, sessionID) {
 		return
 	}
 
@@ -389,6 +462,10 @@ func (h *OnboardingHandler) JoinVideoCallQueue(w http.ResponseWriter, r *http.Re
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
+	if !h.deviceOwnsSession(w, r, req.SessionID) {
+		return
+	}
+
 	resp, err := h.videoCallService.JoinQueue(r.Context(), req, clientIP, userAgent)
 	if err != nil {
 		h.handleErr(w, r, "join video call queue failed", err)
@@ -410,10 +487,15 @@ func (h *OnboardingHandler) SubmitVideoCallResult(w http.ResponseWriter, r *http
 		return
 	}
 
+	agent, ok := authenticatedAgent(w, r)
+	if !ok {
+		return
+	}
+
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
-	resp, err := h.videoCallService.SubmitResult(r.Context(), req, clientIP, userAgent)
+	resp, err := h.videoCallService.SubmitResult(r.Context(), req, agent, clientIP, userAgent)
 	if err != nil {
 		h.handleErr(w, r, "submit video call result failed", err)
 		return
@@ -438,6 +520,10 @@ func (h *OnboardingHandler) Submit(w http.ResponseWriter, r *http.Request) {
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
 
+	if !h.deviceOwnsSession(w, r, req.SessionID) {
+		return
+	}
+
 	resp, err := h.submitService.Submit(r.Context(), req, idempotencyKey, clientIP, userAgent)
 	if err != nil {
 		h.handleErr(w, r, "submit onboarding failed", err)
@@ -461,6 +547,10 @@ func (h *OnboardingHandler) SetCredentials(w http.ResponseWriter, r *http.Reques
 
 	clientIP := extractIP(r)
 	userAgent := r.UserAgent()
+
+	if !h.deviceOwnsSession(w, r, req.SessionID) {
+		return
+	}
 
 	resp, err := h.credentialService.SetCredentials(r.Context(), req, clientIP, userAgent)
 	if err != nil {
@@ -491,9 +581,28 @@ func (h *OnboardingHandler) GetEncryptionPublicKey(w http.ResponseWriter, r *htt
 
 	response.Success(w, r, http.StatusOK, map[string]any{
 		"algorithm":      "RSA-OAEP-SHA256",
-		"key_id":         "pin-key-v1",
+		"key_id":         h.pinKeys.ActiveKeyID(),
 		"public_key_pem": string(pemBytes),
 	})
+}
+
+// ListQueuedVideoCalls handles GET /v1/onboarding/video-call/queued
+//
+// Internal only. Ini pintu masuk sisi CS: tanpa daftar ini petugas tidak punya cara
+// menemukan `queue_id` yang dibutuhkan /video-call/agent-token.
+//
+// Path-nya `/queued`, bukan GET pada `/video-call/queue`, karena dua alasan: artinya
+// berbeda (melihat antrean vs bergabung ke antrean), dan jalur nasabah pada path itu hidup
+// di grup rute tanpa X-Internal-API-Key — mendaftarkan dua metode pada satu pola di dua
+// grup dengan middleware berbeda mengundang ambiguitas yang tidak perlu.
+func (h *OnboardingHandler) ListQueuedVideoCalls(w http.ResponseWriter, r *http.Request) {
+	resp, err := h.videoCallService.ListQueued(r.Context())
+	if err != nil {
+		h.handleErr(w, r, "list queued video calls failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, resp)
 }
 
 // IssueAgentSignalingToken handles POST /v1/onboarding/video-call/agent-token
@@ -501,6 +610,11 @@ func (h *OnboardingHandler) GetEncryptionPublicKey(w http.ResponseWriter, r *htt
 // Internal only. The CS backend calls it when an agent picks up a queued call;
 // the returned URL carries a signed agent role, so the WebSocket side no longer
 // has to believe a ?role= query parameter.
+//
+// Identitas petugas datang dari kredensial yang diautentikasi middleware.AgentAuth,
+// bukan dari body. Permintaan ini tetap satu-satunya titik saat CS memberi tahu siapa
+// yang mengambil panggilan — nasabah butuh namanya **sekarang**, karena `agent_assigned`
+// dikirim dari sini — tapi sekarang nama itu tidak bisa dikarang pemanggil.
 func (h *OnboardingHandler) IssueAgentSignalingToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		QueueID string `json:"queue_id"`
@@ -514,13 +628,40 @@ func (h *OnboardingHandler) IssueAgentSignalingToken(w http.ResponseWriter, r *h
 		return
 	}
 
-	resp, err := h.videoCallService.AgentSignalingURL(r.Context(), req.QueueID)
+	agent, ok := authenticatedAgent(w, r)
+	if !ok {
+		return
+	}
+
+	resp, err := h.videoCallService.AgentSignalingURL(
+		r.Context(), req.QueueID, agent, extractIP(r), r.UserAgent(),
+	)
 	if err != nil {
 		h.handleErr(w, r, "issue agent signaling token failed", err)
 		return
 	}
 
 	response.Success(w, r, http.StatusOK, resp)
+}
+
+// authenticatedAgent membaca identitas petugas yang dipasang middleware.AgentAuth.
+//
+// Ketiadaannya adalah kesalahan perakitan rute, bukan kesalahan pemanggil: handler ini
+// hanya boleh terpasang di belakang AgentAuth. Dijawab 403 dan dicatat sebagai error
+// supaya rute yang salah rakit terlihat di log, bukan diam-diam mengatribusikan verifikasi
+// ke petugas kosong.
+func authenticatedAgent(w http.ResponseWriter, r *http.Request) (onboarding.AgentInfo, bool) {
+	employeeID, name, ok := middleware.AgentFromCtx(r.Context())
+	if !ok || employeeID == "" {
+		slog.Error("agent endpoint reached without an authenticated agent", "path", r.URL.Path)
+		response.Err(w, r, apperr.Error{
+			Status:  http.StatusForbidden,
+			Code:    "FORBIDDEN",
+			Message: "Akses ditolak.",
+		})
+		return onboarding.AgentInfo{}, false
+	}
+	return onboarding.AgentInfo{EmployeeID: employeeID, Name: name}, true
 }
 
 // GetAuditTrail handles GET /v1/onboarding/sessions/{session_id}/audit
@@ -574,6 +715,29 @@ func optionalInt(raw string) *int {
 }
 
 // handleErr converts domain errors to HTTP responses, logging internal errors.
+// deviceIDHeader reads the device identity the app sends on every request.
+// http.Header.Get is case-insensitive, so X-Device-ID and X-Device-Id both land
+// here — clients disagree on the casing and neither spelling is wrong.
+func deviceIDHeader(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-Device-ID"))
+}
+
+// deviceOwnsSession guards a session-scoped endpoint against a session_id used
+// from a device that did not create it, and writes the error response itself.
+// Returns false when the caller must stop.
+//
+// Every endpoint that takes a session_id calls this. The alternative — each
+// service checking for itself — is what left the binding on the two OTP
+// endpoints only, so a leaked session_id could still be driven through OCR,
+// biometrics, credentials, and submit from another phone.
+func (h *OnboardingHandler) deviceOwnsSession(w http.ResponseWriter, r *http.Request, sessionID string) bool {
+	if err := h.sessionService.AssertDeviceOwnsSession(r.Context(), sessionID, deviceIDHeader(r)); err != nil {
+		h.handleErr(w, r, "onboarding device binding rejected", err)
+		return false
+	}
+	return true
+}
+
 func (h *OnboardingHandler) handleErr(w http.ResponseWriter, r *http.Request, msg string, err error) {
 	appErr := apperr.From(err)
 	if appErr.Code == apperr.InternalError.Code {

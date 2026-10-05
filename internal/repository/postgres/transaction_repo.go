@@ -83,7 +83,7 @@ func NewTransactionRepo(pool *pgxpool.Pool) *TransactionRepo {
 }
 
 // ListByUserID returns keyset-paginated transaction history.
-func (r *TransactionRepo) ListByUserID(ctx context.Context, userID uuid.UUID, txnType *string, cursor *transaction.HistoryCursorValues, limit int) ([]transaction.Transaction, error) {
+func (r *TransactionRepo) ListByUserID(ctx context.Context, userID uuid.UUID, txnType *string, period *transaction.DateRange, cursor *transaction.HistoryCursorValues, limit int) ([]transaction.Transaction, error) {
 	args := []any{userID}
 	where := "WHERE user_id = $1"
 	argIdx := 2
@@ -92,6 +92,19 @@ func (r *TransactionRepo) ListByUserID(ctx context.Context, userID uuid.UUID, tx
 		where += fmt.Sprintf(" AND type = $%d", argIdx)
 		args = append(args, *txnType)
 		argIdx++
+	}
+
+	// The range arrives as two midnights in Asia/Jakarta, so it is compared
+	// against created_at as timestamps rather than cast to a date: casting
+	// (created_at AT TIME ZONE 'Asia/Jakarta')::date would drop the index on
+	// (user_id, created_at DESC) that this keyset pagination depends on. The
+	// upper bound is exclusive at the NEXT midnight, which is what makes the
+	// last day of the range inclusive — account_mutations gets this for free
+	// from its transaction_date column, transactions has only created_at.
+	if period != nil {
+		where += fmt.Sprintf(" AND created_at >= $%d AND created_at < ($%d::timestamptz + INTERVAL '1 day')", argIdx, argIdx+1)
+		args = append(args, period.From, period.To)
+		argIdx += 2
 	}
 
 	if cursor != nil {

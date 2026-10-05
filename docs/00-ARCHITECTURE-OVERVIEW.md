@@ -247,7 +247,7 @@ bca-mobile-api/
 │   └── seed.sh                     # Seed test data
 ├── deployments/
 │   ├── Dockerfile
-│   ├── docker-compose.yml          # Local dev (Postgres + Redis)
+│   ├── docker-compose.yml          # Local dev (Postgres + 2x Redis + coturn)
 │   └── k8s/                        # Kubernetes manifests
 ├── .env.example
 ├── .gitignore

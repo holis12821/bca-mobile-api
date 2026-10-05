@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
@@ -26,6 +27,28 @@ const (
 
 	AuditBiometricLogin    = "AUTH_BIOMETRIC_LOGIN"
 	AuditBiometricRegister = "AUTH_BIOMETRIC_REGISTER"
+
+	// The biometric contract, in one place. docs/01-API-SPECIFICATION.md §2
+	// documents the same values; a client that has to infer them from prose is
+	// the blocker butir 2 of docs/10-HANDOVER-BLOCKER-BACKEND.md describes.
+	//
+	//   key type          EC P-256 (secp256r1 / prime256v1)
+	//   signature         SHA256withECDSA
+	//   signed bytes      the 32 raw challenge bytes, i.e. base64-DECODE the
+	//                     `challenge` field first and sign that — nothing is
+	//                     concatenated, no device_id, no length prefix
+	//   signature wire    base64 of the DER ASN.1 sequence, exactly what
+	//                     java.security.Signature emits
+	//   public key wire   base64 X.509 SubjectPublicKeyInfo, PEM also accepted
+	PINEncryptionAlgorithm      = "RSA-OAEP-SHA256"
+	BiometricKeyAlgorithm       = "EC-P256"
+	BiometricSignatureAlgorithm = "SHA256withECDSA"
+	BiometricSignatureFormat    = "base64(DER ASN.1) of SHA256withECDSA over the raw 32 challenge bytes"
+
+	// maxAttestationBytes caps the stored Android Key Attestation chain. Real
+	// chains are a few kilobytes; the column is TEXT, so without a ceiling an
+	// authenticated caller could park megabytes per registration.
+	maxAttestationBytes = 16 << 10
 )
 
 // CreateChallenge generates a 32-byte random challenge and stores it in Redis.
@@ -63,9 +86,12 @@ func (s *Service) CreateChallenge(ctx context.Context, req BiometricChallengeReq
 	}
 
 	return &BiometricChallengeResponse{
-		ChallengeID: challengeID,
-		Challenge:   base64.StdEncoding.EncodeToString(challenge),
-		ExpiresIn:   challengeTTLSec,
+		ChallengeID:     challengeID,
+		Challenge:       base64.StdEncoding.EncodeToString(challenge),
+		ExpiresIn:       challengeTTLSec,
+		ExpiresAt:       time.Now().UTC().Add(challengeTTLSec * time.Second),
+		Algorithm:       BiometricSignatureAlgorithm,
+		SignatureFormat: BiometricSignatureFormat,
 	}, nil
 }
 
@@ -79,7 +105,8 @@ func (s *Service) CreateChallenge(ctx context.Context, req BiometricChallengeReq
 //  5. Verify signature against the stored public key
 //  6. Resolve user and create session
 func (s *Service) LoginByBiometric(ctx context.Context, req BiometricLoginRequest, clientIP string) (*LoginResponse, error) {
-	if req.DeviceID == "" || req.KeyID == "" || req.ChallengeID == "" || req.Signature == "" {
+	signature := req.SignatureValue()
+	if req.DeviceID == "" || req.KeyID == "" || req.ChallengeID == "" || signature == "" {
 		return nil, apperr.ValidationError
 	}
 
@@ -132,7 +159,7 @@ func (s *Service) LoginByBiometric(ctx context.Context, req BiometricLoginReques
 	}
 
 	// 5. Verify signature
-	sigBytes, err := base64.StdEncoding.DecodeString(req.Signature)
+	sigBytes, err := base64.StdEncoding.DecodeString(signature)
 	if err != nil {
 		return nil, apperr.TokenInvalid
 	}
@@ -188,31 +215,67 @@ func (s *Service) LoginByBiometric(ctx context.Context, req BiometricLoginReques
 	return resp, nil
 }
 
-// RegisterBiometricKey registers a new biometric public key for the authenticated user.
-func (s *Service) RegisterBiometricKey(ctx context.Context, userID uuid.UUID, deviceID string, req BiometricRegisterRequest) error {
+// RegisterBiometricKey registers a biometric public key for the authenticated
+// user and returns what was stored.
+//
+// Re-registration REPLACES: every active key this user holds on this device is
+// revoked first. Android invalidates a Keystore key as soon as a new
+// fingerprint is enrolled (setInvalidatedByBiometricEnrollment(true)), so the
+// app has to register again — and a key that can no longer sign has no business
+// staying valid. This is the behaviour butir 2 of
+// docs/10-HANDOVER-BLOCKER-BACKEND.md asks to settle.
+//
+// Several devices per nasabah remain allowed: the revocation is scoped to one
+// device, so registering on a tablet does not log the phone out of biometrics.
+func (s *Service) RegisterBiometricKey(ctx context.Context, userID uuid.UUID, deviceID string, req BiometricRegisterRequest) (*BiometricRegisterResponse, error) {
 	if req.KeyID == "" || req.PublicKey == "" || req.BiometricType == "" {
-		return apperr.ValidationError
+		return nil, apperr.ValidationError
 	}
 	if req.BiometricType != "FINGERPRINT" && req.BiometricType != "FACE_ID" {
-		return apperr.ValidationError
+		return nil, apperr.ValidationError
 	}
 
-	// Validate the public key is parseable
-	if _, err := parsePublicKey(req.PublicKey); err != nil {
-		return apperr.ValidationError
+	// A device_id in the body is accepted for symmetry with the spec example,
+	// but the binding comes from the access token. Honouring the body value
+	// would let a caller register a key against someone else's device.
+	if req.DeviceID != "" && req.DeviceID != deviceID {
+		return nil, apperr.DeviceNotRecognized
+	}
+
+	// The key must be EC P-256. Anything else parses fine here and then fails
+	// at login, where the nasabah reads it as "my fingerprint stopped working".
+	if err := assertP256PublicKey(req.PublicKey); err != nil {
+		return nil, err
+	}
+
+	// The attestation chain is stored, never verified — see docs/04-SECURITY.md.
+	// Its size is bounded regardless: the column is TEXT.
+	if req.Attestation != "" {
+		raw, err := base64.StdEncoding.DecodeString(req.Attestation)
+		if err != nil {
+			return nil, apperr.ValidationError
+		}
+		if len(raw) > maxAttestationBytes {
+			return nil, apperr.ValidationError
+		}
 	}
 
 	// Find device
 	device, err := s.devices.FindActiveByDeviceID(ctx, deviceID)
 	if err != nil {
-		return fmt.Errorf("find device: %w", err)
+		return nil, fmt.Errorf("find device: %w", err)
 	}
 	if device == nil {
-		return apperr.DeviceNotRecognized
+		return nil, apperr.DeviceNotRecognized
 	}
 
 	if s.biometricKeys == nil {
-		return apperr.InternalError
+		return nil, apperr.InternalError
+	}
+
+	revoked, err := s.biometricKeys.RevokeByUserDevice(ctx, userID, device.ID)
+	if err != nil {
+		return nil, fmt.Errorf("revoke previous biometric keys: %w", err)
 	}
 
 	var attestation *string
@@ -220,6 +283,7 @@ func (s *Service) RegisterBiometricKey(ctx context.Context, userID uuid.UUID, de
 		attestation = &req.Attestation
 	}
 
+	now := time.Now()
 	key := &BiometricKey{
 		ID:            uuid.New(),
 		UserID:        userID,
@@ -229,11 +293,11 @@ func (s *Service) RegisterBiometricKey(ctx context.Context, userID uuid.UUID, de
 		BiometricType: req.BiometricType,
 		Attestation:   attestation,
 		IsActive:      true,
-		CreatedAt:     time.Now(),
+		CreatedAt:     now,
 	}
 
 	if err := s.biometricKeys.Create(ctx, key); err != nil {
-		return fmt.Errorf("create biometric key: %w", err)
+		return nil, fmt.Errorf("create biometric key: %w", err)
 	}
 
 	if s.audit != nil {
@@ -246,10 +310,34 @@ func (s *Service) RegisterBiometricKey(ctx context.Context, userID uuid.UUID, de
 				"device_id":      deviceID,
 				"key_id":         req.KeyID,
 				"biometric_type": req.BiometricType,
+				"replaced_keys":  revoked,
+				"attested":       attestation != nil,
 			},
 		})
 	}
 
+	return &BiometricRegisterResponse{
+		BiometricID:  key.ID.String(),
+		KeyID:        key.KeyID,
+		RegisteredAt: key.CreatedAt.UTC(),
+		ReplacedKeys: revoked,
+	}, nil
+}
+
+// assertP256PublicKey accepts only an EC P-256 SubjectPublicKeyInfo, base64 or
+// PEM. RSA keys and other curves are rejected here, at registration.
+func assertP256PublicKey(encoded string) error {
+	pub, err := parsePublicKey(encoded)
+	if err != nil {
+		return apperr.ValidationError
+	}
+	ec, ok := pub.(*ecdsa.PublicKey)
+	if !ok {
+		return apperr.BiometricKeyUnsupported
+	}
+	if ec.Curve != elliptic.P256() {
+		return apperr.BiometricKeyUnsupported
+	}
 	return nil
 }
 

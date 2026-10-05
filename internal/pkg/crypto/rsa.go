@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -27,6 +28,37 @@ type PINPayload struct {
 type RSAKeyPair struct {
 	PrivateKey *rsa.PrivateKey
 	PublicKey  *rsa.PublicKey
+
+	// KeyID names this pair for the client. It travels with the published PEM
+	// and comes back as `encryption_key_id`, which is what makes a key rotation
+	// diagnosable: a client still encrypting under the previous key is told so
+	// instead of being told its PIN is wrong.
+	KeyID string
+}
+
+// DefaultPINKeyID is used when no PIN_KEY_ID is configured. It matches the
+// value the API published before the field existed, so an app that hardcoded
+// it keeps working.
+const DefaultPINKeyID = "pin-key-v1"
+
+// ActiveKeyID is the key id to publish and to compare against.
+func (kp *RSAKeyPair) ActiveKeyID() string {
+	if kp == nil || strings.TrimSpace(kp.KeyID) == "" {
+		return DefaultPINKeyID
+	}
+	return kp.KeyID
+}
+
+// AcceptsKeyID reports whether a client-supplied encryption_key_id names the
+// key this server decrypts with. An empty id is accepted: builds already in
+// testers' hands do not send the field, and rejecting them would turn a
+// diagnostic into an outage.
+func (kp *RSAKeyPair) AcceptsKeyID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return true
+	}
+	return strings.EqualFold(id, kp.ActiveKeyID())
 }
 
 // LoadRSAKeyPair reads PEM files from disk.

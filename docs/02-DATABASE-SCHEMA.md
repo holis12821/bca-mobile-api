@@ -309,9 +309,14 @@ CREATE TABLE verification_tokens (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id         UUID NOT NULL REFERENCES users(id),
     token_hash      VARCHAR(64) NOT NULL UNIQUE,
+    -- Daftar dilebarkan migrasi 000024 menjadi delapan nilai. Ia HARUS sama
+    -- dengan transaction.ValidPurposes di Go: dua salinan yang melenceng
+    -- membuat POST /auth/pin/verify menjawab 500, dan itu persis yang terjadi
+    -- pada CHANGE_PROFILE sampai migrasi itu ada.
     purpose         VARCHAR(30) NOT NULL
                     CHECK (purpose IN ('TRANSFER', 'EWALLET_TOPUP', 'QRIS_PAYMENT',
-                           'CHANGE_LIMIT', 'CHANGE_PIN')),
+                           'CHANGE_LIMIT', 'CHANGE_PIN', 'CHANGE_PROFILE',
+                           'BLOCK_CARD', 'REPLACE_CARD')),
     transaction_id  UUID,
     expires_at      TIMESTAMPTZ NOT NULL,
     used_at         TIMESTAMPTZ,
@@ -576,6 +581,198 @@ CREATE INDEX idx_reg_expires ON registrations (expires_at) WHERE status NOT IN (
 | Transfer Inquiries | **1 jam** setelah expire | Hard delete via cron |
 | Verification Tokens | **5 menit** setelah expire | Hard delete via cron |
 | Notifications | **1 tahun** | Soft archive |
+| `onboarding_card_selection_log` | **10 tahun** | Belum ada job pembersihan — lihat catatan di bawah |
+
+`onboarding_card_selection_log` menyimpan biaya bulanan yang **dilihat nasabah**
+saat memilih kartu, jadi retensinya sejajar audit log. Job pembersihannya
+**sengaja belum dipasang**: penghapusan data audit harus berjalan terjadwal dan
+bisa diaudit sendiri, bukan disisipkan sebagai efek samping migrasi. Keputusan
+retensinya tercatat di `docs/08-PILIH-KARTU-API-SPEC.md` §17 butir 9.
+
+---
+
+## Katalog Kartu Paspor — dari mana angkanya
+
+`card_products` (migrasi `000019`) menyimpan biaya dan keempat limit per kartu;
+isinya datang dari migrasi `000022_card_catalog_rates`, bukan dari seeder.
+
+Dulu satu-satunya yang mengisi tabel itu adalah `scripts/seed/main.go`, dengan
+angka yang sengaja palsu dan digerbangi `APP_ENV=development`. Akibatnya staging
+tidak pernah punya katalog sama sekali. Katalog adalah data referensi, jadi
+sekarang dibawa migrasi — satu sumber angka, ikut ke setiap environment.
+
+**Angkanya adalah data portofolio, bukan tarif resmi BCA.** Perubahan tarif
+berikutnya dilakukan lewat admin API katalog (`PUT /internal/v1/cards/{card_type}`),
+yang menaikkan `card_catalog_version` dan menulis nilai lama + baru ke
+`card_catalog_audit_log` — bukan lewat migrasi baru: tarif adalah operasi, bukan
+skema.
+
+Migrasi `down`-nya tidak menghapus baris `card_products` tanpa syarat.
+`account_cards.card_type` dan `onboarding_sessions.card_type` keduanya punya
+foreign key ke tabel itu, jadi baris yang masih dirujuk hanya dinolkan dan
+dinonaktifkan; yang tidak dirujuk siapa pun dihapus.
+
+---
+
+## Konten Statis (migrasi `000023`)
+
+Dua tabel yang melayani `GET /v1/content/help-center` dan
+`GET /v1/content/contact-cs`.
+
+```sql
+CREATE TABLE content_help_center (
+    id             BIGSERIAL PRIMARY KEY,
+    category_key   TEXT NOT NULL,
+    category_title TEXT NOT NULL,
+    category_order INT  NOT NULL DEFAULT 1,
+    question       TEXT NOT NULL,
+    answer         TEXT NOT NULL,
+    item_order     INT  NOT NULL DEFAULT 1,
+    is_active      BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT content_help_unique_question UNIQUE (category_key, question)
+);
+
+CREATE TABLE content_contact_cs (
+    id         SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),  -- satu baris saja
+    phone      TEXT NOT NULL,
+    phone_free TEXT NOT NULL,
+    whatsapp   TEXT NOT NULL,
+    email      TEXT NOT NULL,
+    chat_url   TEXT NOT NULL,
+    hours      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+Tiga keputusan yang perlu diketahui sebelum mengubahnya:
+
+- **Tabel FAQ datar, bukan kategori + item di dua tabel.** Isinya dibaca sekali
+  seluruhnya lalu dikelompokkan di aplikasi; join untuk data sebesar ini hanya
+  menambah bagian yang bisa rusak.
+- **`CHECK (id = 1)` memaksa kontak CS hanya punya satu baris.** Pola yang sama
+  dipakai `card_catalog_version`. Tanpa itu, "nomor CS mana yang benar" menjadi
+  pertanyaan yang harus dijawab kode.
+- **Datanya dibawa migrasi, bukan seeder.** Seeder menolak jalan di luar
+  `APP_ENV=development`, jadi konten yang ditanam di sana tidak akan pernah ada
+  di staging — kekeliruan yang sama pernah terjadi pada katalog kartu.
+
+Menarik satu pertanyaan dari peredaran dilakukan dengan `is_active = FALSE`,
+bukan `DELETE`: pertanyaan yang ditarik sementara sering kembali, dan
+menghapusnya menghilangkan jawabannya juga.
+
+---
+
+## Syarat & Ketentuan Buka Rekening (migrasi `000025`)
+
+Dua tabel yang melayani `GET /v1/onboarding/tnc` dan memvalidasi
+`accepted_tnc_version` pada `POST /v1/onboarding/sessions`.
+
+```sql
+CREATE TABLE onboarding_tnc_documents (
+    id      BIGSERIAL PRIMARY KEY,
+    version TEXT NOT NULL UNIQUE CHECK (length(version) BETWEEN 1 AND 20),
+    heading        TEXT NOT NULL,
+    subtitle       TEXT NOT NULL,
+    trust_title    TEXT NOT NULL,
+    trust_subtitle TEXT NOT NULL,
+    notice_label   TEXT NOT NULL,
+    notice_body    TEXT NOT NULL,
+    consent_prefix TEXT NOT NULL,
+    consent_link   TEXT NOT NULL,
+    consent_suffix TEXT NOT NULL DEFAULT '.',
+    agree_cta      TEXT NOT NULL,
+    is_active      BOOLEAN NOT NULL DEFAULT FALSE,
+    effective_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Paling banyak SATU versi aktif, ditegakkan database.
+CREATE UNIQUE INDEX idx_onboarding_tnc_single_active
+    ON onboarding_tnc_documents ((TRUE)) WHERE is_active;
+
+CREATE TABLE onboarding_tnc_sections (
+    id            BIGSERIAL PRIMARY KEY,
+    document_id   BIGINT NOT NULL
+        REFERENCES onboarding_tnc_documents (id) ON DELETE CASCADE,
+    section_order INT  NOT NULL,
+    icon_key      TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    CONSTRAINT onboarding_tnc_sections_order_unique UNIQUE (document_id, section_order)
+);
+```
+
+Empat keputusan yang perlu diketahui sebelum mengubahnya:
+
+- **Baris lama TIDAK PERNAH dihapus.** `onboarding_sessions.tnc_version` (migrasi
+  `000010`) menunjuk ke `version` di sini — bukan lewat foreign key, karena
+  kolomnya `VARCHAR(20)` dan sudah berisi nilai sejak sebelum tabel ini ada.
+  Menghapus versi lama berarti menghapus bukti persetujuan nasabah yang
+  memakainya. Mencabut versi dilakukan dengan `is_active = FALSE`.
+- **`CHECK (length(version) ≤ 20)` menjaga kedua sisi tetap sejalan.** Kolom di
+  sisi sesi `VARCHAR(20)`. Tanpa CHECK ini, versi ke-21 karakter lolos di sini
+  lalu **menggagalkan setiap pembuatan sesi** yang menyebutnya — kegagalan yang
+  muncul jauh dari penyebabnya.
+- **Indeks unik parsial pada `((TRUE))` memaksa satu versi aktif.** Tanpa itu,
+  "versi S&K yang benar hari ini" menjadi pertanyaan yang dijawab `ORDER BY`, dan
+  jawaban yang bergantung pada urutan baris bisa berubah sendiri. Konsekuensinya:
+  mengaktifkan versi baru **harus** didahului `UPDATE … SET is_active = FALSE`
+  dalam transaksi yang sama, atau `INSERT`-nya ditolak.
+- **Pasal di tabel terpisah, bukan JSONB atau lima kolom `section_N_*`.** Jumlah
+  pasalnya berubah tiap revisi teks hukum, dan menambah pasal keenam tidak boleh
+  berarti menambah kolom.
+
+Teks awalnya disalin apa adanya dari `strings.xml` aplikasi Android (`buka_rekening_sk_*`)
+supaya nasabah tidak melihat perubahan kata satu pun saat layarnya pindah ke API, dan
+nomor versinya sengaja sama dengan konstanta `TNC_VERSION` yang sudah beredar — nomor baru
+akan membuat setiap pembukaan rekening dari APK lama ditolak `TNC_VERSION_OUTDATED` pada
+hari migrasi ini jalan.
+
+---
+
+## Petugas CS Video Call (migrasi `000026`)
+
+```sql
+CREATE TABLE cs_agents (
+    employee_id  VARCHAR(32) PRIMARY KEY,
+    name         VARCHAR(128) NOT NULL,
+    api_key_hash TEXT        NOT NULL,
+    is_active    BOOLEAN     NOT NULL DEFAULT true,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_cs_agents_active ON cs_agents (employee_id) WHERE is_active;
+```
+
+Siapa yang berwenang melayani verifikasi video call e-KYC. Sebelum tabel ini,
+`onboarding_video_calls.agent_employee_id` dan `agent_name` diisi dari **body** permintaan
+dan dipercaya apa adanya, dengan satu `INTERNAL_API_KEY` yang sama untuk seluruh integrasi
+CS — jadi siapa pun yang memegang key itu bisa mengaku sebagai pegawai mana pun, dan string
+itulah yang masuk `onboarding_audit_logs.actor` serta tampil ke layar nasabah lewat
+`agent_assigned`. Untuk verifikasi identitas yang hasilnya membuka pembukaan rekening,
+jejaknya harus bisa dipertanggungjawabkan ke orang.
+
+| Kolom | Catatan |
+|---|---|
+| `employee_id` | yang dikirim pemanggil di `X-Agent-Employee-ID`; sama lebarnya dengan `onboarding_video_calls.agent_employee_id` |
+| `api_key_hash` | PHC Argon2id, format yang sama dengan `users.pin_hash` |
+| `is_active` | pencabutan hak tanpa menghapus baris — panggilan lama tetap punya rujukan nama petugasnya |
+
+Hash Argon2 ber-salt **tidak bisa dicari balik**, jadi pemanggil menyebut dirinya lebih
+dulu lewat `X-Agent-Employee-ID` dan membuktikannya dengan `X-Agent-API-Key`: barisnya
+dicari dengan `employee_id`, hash-nya diverifikasi Argon2. Pola yang sama dipakai login
+nasabah.
+
+**Barisnya bukan data referensi dan tidak ikut di migrasi.** Isinya kredensial, jadi
+migrasi ini hanya membuat tabelnya kosong. Di development `make seed` menanam satu petugas
+(`CS-1042`, kunci `dev-agent-key`) dan **digerbangi `APP_ENV=development`** — seeder ini
+tidak punya gerbang environment sendiri, jadi tanpa gerbang di sana satu kali `make seed`
+yang salah arah akan membuat kunci yang diketahui umum bisa dipakai menandatangani hasil
+verifikasi. Di luar development, barisnya dibuat yang mengoperasikan integrasi CS dengan
+kunci acak, lewat jalur yang sama dengan pendistribusian `INTERNAL_API_KEY`.
 
 ---
 

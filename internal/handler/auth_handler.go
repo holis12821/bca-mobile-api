@@ -210,7 +210,8 @@ func (h *AuthHandler) RegisterBiometric(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := h.authService.RegisterBiometricKey(r.Context(), userID, deviceID, req); err != nil {
+	resp, err := h.authService.RegisterBiometricKey(r.Context(), userID, deviceID, req)
+	if err != nil {
 		appErr := apperr.From(err)
 		if appErr.Code == apperr.InternalError.Code {
 			slog.Error("register biometric failed",
@@ -222,7 +223,39 @@ func (h *AuthHandler) RegisterBiometric(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	response.Success(w, r, http.StatusCreated, map[string]string{"message": "Biometrik berhasil didaftarkan."})
+	// biometric_id + registered_at, as docs/01-API-SPECIFICATION.md §2 documents.
+	// The handler used to answer only {"message": ...}, which the app could not
+	// use to remember which key it had registered.
+	response.Success(w, r, http.StatusCreated, resp)
+}
+
+// PINPublicKey handles GET /v1/auth/pin/public-key
+//
+// Public and unauthenticated: a client needs the key BEFORE it can log in, and
+// the key is public by construction. It is the rotatable counterpart to
+// assets/pin_public.pem in the APK — same field names as
+// GET /v1/onboarding/credentials/public-key, so one client code path serves
+// both.
+func (h *AuthHandler) PINPublicKey(w http.ResponseWriter, r *http.Request) {
+	key, err := h.authService.PINEncryptionKey()
+	if err != nil {
+		appErr := apperr.From(err)
+		if appErr.Code == apperr.InternalError.Code {
+			slog.Error("export pin public key failed",
+				"request_id", chimiddleware.GetReqID(r.Context()),
+				"error", err,
+			)
+		}
+		response.Err(w, r, appErr)
+		return
+	}
+
+	// The key changes only on rotation, and a stale copy is what
+	// AUTH_PIN_KEY_UNKNOWN exists to report — so a short cache is safe and
+	// keeps every cold start from hitting this handler.
+	w.Header().Set("Cache-Control", "public, max-age=300")
+
+	response.Success(w, r, http.StatusOK, key)
 }
 
 // PINVerify handles POST /v1/auth/pin/verify (requires auth middleware)
@@ -238,6 +271,10 @@ func (h *AuthHandler) PINVerify(w http.ResponseWriter, r *http.Request) {
 	var req transaction.PINVerifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if err := h.authService.ValidatePINKeyID(req.EncryptionKeyID); err != nil {
+		response.Err(w, r, apperr.From(err))
 		return
 	}
 	if req.PINEncrypted == "" || req.Purpose == "" {

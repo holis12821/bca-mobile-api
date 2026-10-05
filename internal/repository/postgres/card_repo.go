@@ -123,6 +123,17 @@ func (r *CardRepo) GetCard(ctx context.Context, productType onboarding.ProductTy
 }
 
 // CatalogVersion mengembalikan versi katalog saat ini, format YYYY-MM-DD.n
+//
+// **Tanggalnya hari UTC, bukan hari WIB.** Nilainya dibuat `CURRENT_DATE` di Postgres, dan
+// itu berbeda dari konvensi tanggal bisnis di repo ini — `transfer_executor` dan
+// `ewallet_repo` menerima `WIBDate` yang sudah diselesaikan pemanggilnya di Asia/Jakarta.
+//
+// Dibiarkan begitu dengan sengaja: versi ini **token opaque**, bukan tanggal yang dibaca
+// nasabah. Yang dituntut darinya hanya berubah saat katalog berubah dan tidak pernah
+// mundur, dan keduanya dipenuhi karena `BumpCatalogVersion` membandingkan `version_date`
+// dengan `CURRENT_DATE` yang sama. Menggantinya ke WIB berarti migrasi baru untuk nilai
+// awal yang sudah tersimpan, dan itu perubahan yang perlu diputuskan sadar — bukan
+// diselipkan sebagai perbaikan test.
 func (r *CardRepo) CatalogVersion(ctx context.Context) (string, error) {
 	const query = `
 		SELECT to_char(version_date, 'YYYY-MM-DD') || '.' || counter

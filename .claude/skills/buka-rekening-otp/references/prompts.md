@@ -76,13 +76,16 @@ Selesai bila: kode lama benar-benar ditolak setelah kirim ulang, dan kuota diteg
 
 ## Fase 4 — SMS gateway
 
-Satu antarmuka, dua implementasi:
+Satu antarmuka, satu tempat pemilihan (`router.New`). Setup provider-nya ada di
+skill `twilio-sms-otp`; yang mengikat di fase ini:
 
-- Produksi memakai gateway sungguhan. Kegagalan kirim dibalas sebagai error yang
-  jelas — jangan menelan diam-diam, karena nasabah tidak akan pernah menerima kode
-  dan tidak tahu harus kirim ulang.
-- Staging dan test memakai tiruan: catat kode ke log **hanya** di lingkungan
-  non-produksi, pengiriman selalu berhasil.
+- Provider terisi → kirim sungguhan. Kredensial yang salah **menggagalkan boot**,
+  tidak turun diam-diam ke "tidak mengirim".
+- Kegagalan kirim dibalas error yang jelas (`OTP_DELIVERY_FAILED`) — jangan
+  menelan diam-diam, karena nasabah tidak akan pernah menerima kode dan tidak
+  tahu harus kirim ulang.
+- Tanpa provider: tiruan yang mencatat kode ke log **hanya** di `development`.
+- Normalisasi nomor ke E.164 terjadi di dalam gateway, bukan di service.
 
 Selesai bila: test bisa berjalan tanpa menyentuh jaringan, dan tidak ada jalur di
 mana kode OTP tercatat di lingkungan produksi.

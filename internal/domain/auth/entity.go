@@ -80,6 +80,24 @@ type LoginRequest struct {
 	DeviceID     string     `json:"device_id" validate:"required"`
 	PINEncrypted string     `json:"pin_encrypted" validate:"required"`
 	DeviceInfo   DeviceInfo `json:"device_info"`
+
+	// EncryptionKeyID names the PIN public key the client encrypted with, the
+	// same field onboarding already carries. Optional so builds that predate it
+	// keep working; when present and stale the request is rejected as
+	// AUTH_PIN_KEY_UNKNOWN instead of as a wrong PIN.
+	EncryptionKeyID string `json:"encryption_key_id,omitempty"`
+}
+
+// PINEncryptionKey is the published half of the PIN transport key, served by
+// GET /auth/pin/public-key. It mirrors GET /onboarding/credentials/public-key
+// field for field so a client can use one code path for both.
+type PINEncryptionKey struct {
+	Algorithm    string `json:"algorithm"`
+	KeyID        string `json:"key_id"`
+	PublicKeyPEM string `json:"public_key_pem"`
+	PayloadShape string `json:"payload_shape"`
+	Encoding     string `json:"encoding"`
+	MaxSkewSec   int    `json:"max_skew_sec"`
 }
 
 // DeviceInfo contains metadata about the client device.
@@ -135,26 +153,79 @@ type BiometricChallengeRequest struct {
 }
 
 // BiometricChallengeResponse is returned when a challenge is created.
+//
+// expires_in and expires_at are both present: the spec documents the second,
+// the first implementation returned only the first.
 type BiometricChallengeResponse struct {
-	ChallengeID string `json:"challenge_id"`
-	Challenge   string `json:"challenge"` // base64-encoded 32 random bytes
-	ExpiresIn   int    `json:"expires_in"`
+	ChallengeID string    `json:"challenge_id"`
+	Challenge   string    `json:"challenge"` // base64-encoded 32 random bytes
+	ExpiresIn   int       `json:"expires_in"`
+	ExpiresAt   time.Time `json:"expires_at"`
+
+	// Algorithm and SignatureFormat tell the client exactly what to produce.
+	// They are constants, but shipping them here means a client never has to
+	// guess from prose — the guessing is what butir 2 of the handover document
+	// was blocked on.
+	Algorithm       string `json:"algorithm"`
+	SignatureFormat string `json:"signature_format"`
 }
 
 // BiometricLoginRequest is the request body for biometric login.
+//
+// The signature arrives under either name. The spec documents
+// `signed_challenge` and the app was built against it; the first
+// implementation here read `signature`. Serving both is why neither client
+// sees a VALIDATION_ERROR it cannot explain.
 type BiometricLoginRequest struct {
 	DeviceID    string `json:"device_id" validate:"required"`
 	KeyID       string `json:"key_id" validate:"required"`
 	ChallengeID string `json:"challenge_id" validate:"required"`
-	Signature   string `json:"signature" validate:"required"` // base64-encoded
+	Signature   string `json:"signature"`        // base64 DER (ECDSA), alias of signed_challenge
+	SignedChall string `json:"signed_challenge"` // spec name for the same value
+
+	// BiometricType is accepted and logged but never trusted: which biometric
+	// unlocked the key is the phone's business, and the registered key already
+	// records it.
+	BiometricType string `json:"biometric_type,omitempty"`
+}
+
+// SignatureValue returns the signature regardless of which field carried it.
+func (r BiometricLoginRequest) SignatureValue() string {
+	if r.Signature != "" {
+		return r.Signature
+	}
+	return r.SignedChall
 }
 
 // BiometricRegisterRequest is the request to register a biometric key (protected).
 type BiometricRegisterRequest struct {
-	KeyID         string `json:"key_id" validate:"required"`
-	PublicKey     string `json:"public_key" validate:"required"` // PEM-encoded
+	KeyID string `json:"key_id" validate:"required"`
+
+	// PublicKey is an EC P-256 SubjectPublicKeyInfo, base64 (no PEM header) or
+	// PEM. Nothing else is accepted — see registerable().
+	PublicKey     string `json:"public_key" validate:"required"`
 	BiometricType string `json:"biometric_type" validate:"required"`
-	Attestation   string `json:"attestation,omitempty"`
+
+	// Attestation is the base64 Android Key Attestation chain. It is stored,
+	// not verified against the Google root — see docs/04-SECURITY.md.
+	Attestation string `json:"attestation,omitempty"`
+
+	// DeviceID may be sent for symmetry with the spec's example body. The
+	// binding always comes from the access token; a device id in the JSON binds
+	// nothing, so a mismatch is rejected rather than honoured.
+	DeviceID string `json:"device_id,omitempty"`
+}
+
+// BiometricRegisterResponse is returned on successful registration.
+type BiometricRegisterResponse struct {
+	BiometricID  string    `json:"biometric_id"`
+	KeyID        string    `json:"key_id"`
+	RegisteredAt time.Time `json:"registered_at"`
+
+	// ReplacedKeys counts keys revoked by this registration. Re-enrolling a
+	// fingerprint invalidates the Keystore key, so the app registers again;
+	// the previous key for this device is revoked in the same step.
+	ReplacedKeys int `json:"replaced_keys"`
 }
 
 // ChallengeData is the data stored in Redis for a biometric challenge.
@@ -167,6 +238,9 @@ type ChallengeData struct {
 type ChangePINRequest struct {
 	OldPINEncrypted string `json:"old_pin_encrypted" validate:"required"`
 	NewPINEncrypted string `json:"new_pin_encrypted" validate:"required"`
+
+	// EncryptionKeyID: see LoginRequest.
+	EncryptionKeyID string `json:"encryption_key_id,omitempty"`
 }
 
 // AuditEntry represents a single audit log entry to be written.

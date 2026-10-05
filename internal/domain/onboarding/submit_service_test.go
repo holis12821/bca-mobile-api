@@ -7,12 +7,17 @@ import (
 	"time"
 
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 )
 
 // --- in-memory mocks for submit ---
 
 type mockCoreBanking struct {
 	fail bool
+
+	// createCalls counts CreateAccount. A test that asserts an account was never
+	// opened needs to see zero here, not merely an error from Submit.
+	createCalls int
 
 	// Bagian penerbitan kartu (§10).
 	issueFail  bool
@@ -21,6 +26,7 @@ type mockCoreBanking struct {
 }
 
 func (m *mockCoreBanking) CreateAccount(_ context.Context, _ string, _ ProductType, _, _ string) (*CoreBankingResult, error) {
+	m.createCalls++
 	if m.fail {
 		return nil, fmt.Errorf("core banking unavailable")
 	}
@@ -38,8 +44,10 @@ func (m *mockCoreBanking) IssueCard(_ context.Context, req CardIssuanceRequest) 
 		return nil, fmt.Errorf("card printer offline")
 	}
 	return &CardIssuanceResult{
-		MaskedNumber: "•••• 5678",
-		Status:       CardIssuanceRequested,
+		MaskedNumber:   "•••• 5678",
+		Status:         CardIssuanceRequested,
+		ValidThruMonth: 9,
+		ValidThruYear:  2031,
 	}, nil
 }
 
@@ -142,6 +150,27 @@ func (m *mockIdempotencyCache) Release(_ context.Context, sessionID, key string)
 	return nil
 }
 
+// mockAccountCardRegistrar menirukan tabel account_cards — yang dibaca layar
+// Profil Saya, bukan antrean cetak. Termasuk penjaga "satu nomor tersamar per
+// rekening" yang ada di SQL-nya, supaya retry tidak melahirkan kartu kedua.
+type mockAccountCardRegistrar struct {
+	rows []IssuedCard
+	err  error
+}
+
+func (m *mockAccountCardRegistrar) RegisterIssuedCard(_ context.Context, issued IssuedCard) error {
+	if m.err != nil {
+		return m.err
+	}
+	for _, r := range m.rows {
+		if r.AccountID == issued.AccountID && r.MaskedNumber == issued.MaskedNumber {
+			return nil
+		}
+	}
+	m.rows = append(m.rows, issued)
+	return nil
+}
+
 // mockProvisioner stands in for the transaction that creates the m-BCA user.
 // Submit refuses outright without one — a session that ends with an account
 // number and no user row is worse than an error.
@@ -191,6 +220,39 @@ func setupSubmitServiceWithProvisioner(prov AccountProvisioner) (*SubmitService,
 	})
 
 	return svc, sessionRepo, cache, pdRepo, credRepo, cb, idem, prov
+}
+
+// TestSubmit_UnreadablePIIDoesNotReachCoreBanking is the regression test for the
+// worst swallow in this codebase: a failed decrypt used to fall back to the
+// STORED value, so a key rotation or one corrupted row would have opened a real
+// account whose holder name is a hex string. A banking record that wrong has to
+// be unwound by hand; refusing the submit costs one retry.
+func TestSubmit_UnreadablePIIDoesNotReachCoreBanking(t *testing.T) {
+	svc, sessionRepo, cache, pdRepo, credRepo, cb, _ := setupSubmitService()
+	ctx := context.Background()
+
+	// A key IS configured, so the stored fields are supposed to be ciphertext.
+	aes, err := crypto.NewAES("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("NewAES: %v", err)
+	}
+	svc.aes = aes
+
+	sessionID := createSubmitTestSession(sessionRepo, cache, pdRepo, credRepo)
+	// What the seeded row actually holds is plaintext, which this key cannot
+	// decrypt — the same shape as a rotated key or a corrupted row.
+
+	_, err = svc.Submit(ctx, SubmitRequest{
+		SessionID:         sessionID,
+		AgreementAccepted: true,
+		AgreementVersion:  "v1",
+	}, "", "127.0.0.1", "ua")
+	if err == nil {
+		t.Fatal("submit must refuse when the stored PII cannot be decrypted")
+	}
+	if cb.createCalls != 0 {
+		t.Errorf("core banking must not be called at all, got %d calls", cb.createCalls)
+	}
 }
 
 func createSubmitTestSession(sessionRepo *mockSessionRepo, cache *mockSessionCache, pdRepo *mockPersonalDataRepo, credRepo *mockCredentialRepo) string {
@@ -612,13 +674,14 @@ func TestSubmit_AcceptsSessionWithCardWhenFlagOn(t *testing.T) {
 
 // submitServiceWithCard merakit SubmitService lengkap dengan katalog kartu dan
 // antrean penerbitan — rakitan untuk keempat test §10.
-func submitServiceWithCard(issueFail bool) (*SubmitService, *mockSessionRepo, *mockSessionCache, *mockPersonalDataRepo, *mockCredentialRepo, *mockCoreBanking, *mockCardIssuanceRepo) {
+func submitServiceWithCard(issueFail bool) (*SubmitService, *mockSessionRepo, *mockSessionCache, *mockPersonalDataRepo, *mockCredentialRepo, *mockCoreBanking, *mockCardIssuanceRepo, *mockAccountCardRegistrar) {
 	sessionRepo := newMockSessionRepo()
 	cache := newMockSessionCache()
 	pdRepo := newMockPersonalDataRepo()
 	credRepo := newMockCredentialRepo()
 	cb := &mockCoreBanking{issueFail: issueFail}
 	issuance := newMockCardIssuanceRepo()
+	ownedCards := &mockAccountCardRegistrar{}
 
 	minDays, maxDays := 3, 7
 	gold := card("PASPOR_GOLD", CardAvailable, true, 1)
@@ -649,8 +712,9 @@ func submitServiceWithCard(issueFail bool) (*SubmitService, *mockSessionRepo, *m
 		Cards:        cardSvc,
 		CardIssuance: issuance,
 		CardCodes:    func(string) string { return "CB-GOLD" },
+		AccountCards: ownedCards,
 	})
-	return svc, sessionRepo, cache, pdRepo, credRepo, cb, issuance
+	return svc, sessionRepo, cache, pdRepo, credRepo, cb, issuance, ownedCards
 }
 
 // withSelectedCard menyiapkan sesi yang sudah memilih PASPOR_GOLD.
@@ -663,7 +727,7 @@ func withSelectedCard(sessionRepo *mockSessionRepo, cache *mockSessionCache, pdR
 }
 
 func TestSubmit_IssuesExactlyOneCardPrintRequest(t *testing.T) {
-	svc, sessionRepo, cache, pdRepo, credRepo, cb, issuance := submitServiceWithCard(false)
+	svc, sessionRepo, cache, pdRepo, credRepo, cb, issuance, ownedCards := submitServiceWithCard(false)
 	sessionID := withSelectedCard(sessionRepo, cache, pdRepo, credRepo)
 
 	resp, err := svc.Submit(context.Background(), submitRequestFor(sessionID), "", "127.0.0.1", "ua")
@@ -705,11 +769,34 @@ func TestSubmit_IssuesExactlyOneCardPrintRequest(t *testing.T) {
 	if len(issuance.rows) != 1 {
 		t.Errorf("baris antrean: %d, harusnya 1", len(issuance.rows))
 	}
+
+	// Dan kartunya tercatat sebagai milik nasabah, bukan hanya sebagai
+	// permintaan cetak. Tanpa baris ini GET /account/cards mengembalikan daftar
+	// kosong untuk nasabah yang kartunya baru saja terbit.
+	if len(ownedCards.rows) != 1 {
+		t.Fatalf("baris account_cards: %d, harusnya 1", len(ownedCards.rows))
+	}
+	owned := ownedCards.rows[0]
+	if owned.UserID != "11111111-1111-1111-1111-111111111111" ||
+		owned.AccountID != "22222222-2222-2222-2222-222222222222" {
+		t.Errorf("kartu dilekatkan ke pemilik yang salah: user=%s account=%s",
+			owned.UserID, owned.AccountID)
+	}
+	if owned.MaskedNumber != "•••• 5678" || owned.CardType != "PASPOR_GOLD" {
+		t.Errorf("isi kartu: %+v", owned)
+	}
+	if owned.CardholderName != "MUHAMMAD ARDAN PRAYOGI" {
+		t.Errorf("nama di kartu: %q", owned.CardholderName)
+	}
+	if owned.ValidThruMonth != 9 || owned.ValidThruYear != 2031 {
+		t.Errorf("masa berlaku diambil dari penerbit: %d/%d",
+			owned.ValidThruMonth, owned.ValidThruYear)
+	}
 }
 
 // Submit ulang dengan Idempotency-Key yang sama tidak menambah permintaan cetak.
 func TestSubmit_IdempotentKeyDoesNotReprintCard(t *testing.T) {
-	svc, sessionRepo, cache, pdRepo, credRepo, cb, issuance := submitServiceWithCard(false)
+	svc, sessionRepo, cache, pdRepo, credRepo, cb, issuance, ownedCards := submitServiceWithCard(false)
 	sessionID := withSelectedCard(sessionRepo, cache, pdRepo, credRepo)
 	ctx := context.Background()
 
@@ -726,12 +813,15 @@ func TestSubmit_IdempotentKeyDoesNotReprintCard(t *testing.T) {
 	if len(issuance.rows) != 1 {
 		t.Errorf("baris antrean: %d, harusnya 1", len(issuance.rows))
 	}
+	if len(ownedCards.rows) != 1 {
+		t.Errorf("submit ulang menambah kartu milik nasabah: %d baris", len(ownedCards.rows))
+	}
 }
 
 // Dan tanpa Idempotency-Key sekalipun — ketika slot Redis sudah kedaluwarsa —
 // UNIQUE(session_id) di antrean yang menahan cetakan kedua.
 func TestSubmit_ClaimGuardsSecondPrintWithoutIdempotencyKey(t *testing.T) {
-	svc, sessionRepo, cache, pdRepo, credRepo, cb, issuance := submitServiceWithCard(false)
+	svc, sessionRepo, cache, pdRepo, credRepo, cb, issuance, ownedCards := submitServiceWithCard(false)
 	sessionID := withSelectedCard(sessionRepo, cache, pdRepo, credRepo)
 	ctx := context.Background()
 
@@ -757,6 +847,11 @@ func TestSubmit_ClaimGuardsSecondPrintWithoutIdempotencyKey(t *testing.T) {
 	if len(issuance.rows) != 1 {
 		t.Errorf("baris antrean: %d, harusnya 1", len(issuance.rows))
 	}
+	// Klaim yang kalah berhenti sebelum pencatatan kartu, jadi nasabah tetap
+	// punya satu kartu — bukan dua kartu dengan nomor yang sama.
+	if len(ownedCards.rows) != 1 {
+		t.Errorf("baris account_cards: %d, harusnya tetap 1", len(ownedCards.rows))
+	}
 	// Keadaan yang tersimpan tetap dilaporkan, bukan kosong.
 	if resp.Card == nil || resp.Card.MaskedNumber == nil {
 		t.Errorf("card pada submit kedua: %+v", resp.Card)
@@ -765,7 +860,7 @@ func TestSubmit_ClaimGuardsSecondPrintWithoutIdempotencyKey(t *testing.T) {
 
 // Kegagalan penerbitan kartu tidak membatalkan rekening.
 func TestSubmit_CardIssuanceFailureKeepsAccountActive(t *testing.T) {
-	svc, sessionRepo, cache, pdRepo, credRepo, _, issuance := submitServiceWithCard(true)
+	svc, sessionRepo, cache, pdRepo, credRepo, _, issuance, ownedCards := submitServiceWithCard(true)
 	sessionID := withSelectedCard(sessionRepo, cache, pdRepo, credRepo)
 
 	resp, err := svc.Submit(context.Background(), submitRequestFor(sessionID), "", "127.0.0.1", "ua")
@@ -793,5 +888,11 @@ func TestSubmit_CardIssuanceFailureKeepsAccountActive(t *testing.T) {
 	due, _ := issuance.DueForRetry(context.Background(), row.NextRetryAt.Add(time.Minute), 10)
 	if len(due) != 1 {
 		t.Errorf("permintaan tidak terbaca pekerja retry: %d", len(due))
+	}
+
+	// Dan tidak ada kartu yang dicatat sebagai milik nasabah: kartunya belum
+	// terbit, jadi menampilkannya di Profil Saya adalah kabar bohong.
+	if len(ownedCards.rows) != 0 {
+		t.Errorf("kartu gagal terbit tercatat sebagai milik nasabah: %+v", ownedCards.rows)
 	}
 }

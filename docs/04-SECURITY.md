@@ -116,6 +116,34 @@ Mobile App                          Backend Server
     │<───────────────────────────────────│
 ```
 
+#### Algoritma dan kebijakan kunci biometrik
+
+| Hal | Nilai |
+|---|---|
+| Jenis kunci | EC P-256 (`secp256r1`). Kunci lain ditolak saat register: `422 AUTH_BIOMETRIC_KEY_UNSUPPORTED` |
+| Tanda tangan | `SHA256withECDSA` atas 32 byte challenge mentah |
+| Format wire | tanda tangan base64 DER ASN.1; kunci publik base64 X.509 SPKI (PEM juga diterima) |
+| Challenge | 32 byte acak, TTL 60 detik, **sekali pakai** via `GETDEL` — yang sudah dipakai ditolak, bukan hanya yang kedaluwarsa |
+| Pengikatan perangkat | `key_id` harus milik perangkat yang meminta challenge; kunci perangkat A tidak bisa login di perangkat B |
+| Pendaftaran ulang | **mengganti** — semua kunci aktif nasabah pada perangkat itu dicabut lebih dulu (`replaced_keys` di respons) |
+| Beberapa perangkat | boleh; pencabutan dibatasi satu perangkat |
+
+**Kebijakan attestation (keputusan sadar, bukan kelalaian).** Rantai Android Key
+Attestation di `attestation` **disimpan, tidak diverifikasi** ke akar Google, dan
+tidak ada syarat `security_level` minimal:
+
+- Perangkat tanpa dukungan attestation (emulator, perangkat lama) **tidak**
+  ditolak — menolaknya akan mematikan login biometrik pada perangkat yang sah
+  sementara integrasi ini masih belum punya provider nyata untuk apa pun.
+- Nilainya dibatasi 16 KB dan wajib base64 yang sah, supaya kolom `TEXT` tidak
+  bisa dijadikan tempat parkir data.
+- Yang ditanggung pengamanan di sini bukan attestation, melainkan pengikatan
+  `key_id` ↔ perangkat, challenge sekali pakai, dan pencabutan saat pendaftaran
+  ulang.
+- Menaikkan ini ke verifikasi penuh (TEE atau StrongBox wajib) adalah keputusan
+  produk + risiko: tulis di sini kalau sudah diputuskan, dan tambahkan kolom
+  `security_level` beserta migrasinya saat itu.
+
 ### 2.3 Token Lifecycle
 
 ```
@@ -227,7 +255,8 @@ func VerifyPIN(pin, hash, salt string) bool {
 
 ```
 1. Server generates RSA-2048 key pair
-2. Public key dikirim ke app saat startup (atau di-embed)
+2. Public key dikirim ke app saat startup (GET /v1/auth/pin/public-key, atau
+   di-embed sebagai assets/pin_public.pem)
 3. App encrypts PIN payload dengan public key menggunakan RSA-OAEP-SHA256
    (BUKAN PKCS#1 v1.5 — vulnerable to padding oracle attacks)
 4. Payload terenkripsi berisi: {"pin":"123456","nonce":"<uuid>","ts":<unix>}
@@ -235,8 +264,17 @@ func VerifyPIN(pin, hash, salt string) bool {
    - Tolak jika |ts - now| > 60 detik
    - Tolak jika nonce sudah pernah dipakai (pin_nonce:{nonce}, TTL 120s)
    - Tanpa anti-replay ini, pin_encrypted yang tersadap bisa diputar ulang
-6. Private key disimpan di HSM (production) atau encrypted file (dev)
+6. Private key disimpan di HSM (production) atau encrypted file (dev) dan
+   TIDAK PERNAH meninggalkan backend
+7. Kunci aktif dinamai PIN_KEY_ID (default pin-key-v1). Client boleh mengirim
+   encryption_key_id; yang bukan kunci aktif ditolak 422 AUTH_PIN_KEY_UNKNOWN
+   beserta details.expected_key_id — tanpa itu, kunci yang sudah dirotasi tampak
+   sebagai "PIN selalu salah" dan hampir tidak bisa dilacak
 ```
+
+Kunci yang sama dipakai untuk PIN, kode akses, dan kredensial onboarding. Rotasi:
+terbitkan pasangan baru, naikkan `PIN_KEY_ID`, sajikan lewat endpoint publik, dan
+biarkan berkas di `assets/` client jadi cadangan saat endpoint tak terjangkau.
 
 ### Brute-Force Protection
 
@@ -628,6 +666,36 @@ func (a *AuditService) Log(ctx context.Context, entry AuditEntry) {
 
 // Workers (started at init): for range a.ch { insert to DB, on error log to slog }
 ```
+
+### 9b. Endpoint internal: dua penjaga, dua pertanyaan
+
+`actor` di audit trail hanya berarti kalau yang menulisnya terbukti. Endpoint internal CS
+karena itu punya dua penjaga yang menjawab pertanyaan berbeda:
+
+| Header | Pertanyaan | Middleware |
+|---|---|---|
+| `X-Internal-API-Key` | sistem mana yang memanggil | `middleware.InternalAPIKey` |
+| `X-Agent-Employee-ID` + `X-Agent-API-Key` | petugas mana yang bertindak | `middleware.AgentAuth` → `cs_agents` |
+
+Penjaga kedua dipasang **sesudah** yang pertama, dan urutannya bukan selera: verifikasi
+Argon2id itu mahal (64 MB × 4 thread), jadi ia tidak boleh bisa dipicu lalu lintas yang
+belum membuktikan dirinya sebagai sistem CS.
+
+Yang menuntut keduanya hanya tindakan yang diatribusikan ke orang —
+`POST /onboarding/video-call/agent-token` dan `POST /onboarding/video-call/result`. Melihat
+antrean, jejak audit, dan `GET /onboarding/monitoring` adalah tindakan sistem/pengawas.
+
+Sebelum ini `agent_employee_id` dan `agent_name` adalah **field body** yang dipercaya apa
+adanya. Dengan satu `INTERNAL_API_KEY` yang sama untuk seluruh integrasi CS, siapa pun yang
+memegangnya bisa mengaku sebagai pegawai mana pun — dan string itulah yang tercatat sebagai
+`actor` pada `VIDEO_CALL_STARTED`/`VIDEO_CALL_ENDED` serta tampil ke layar nasabah lewat
+`agent_assigned`. Untuk verifikasi identitas yang hasilnya membuka pembukaan rekening,
+jejak itu tidak bisa dipertanggungjawabkan ke siapa pun.
+
+Kegagalan menghubungi registry petugas dijawab `503 AGENT_AUTH_UNAVAILABLE`, **tidak**
+diluluskan dan tidak diperlakukan sebagai penolakan — pola yang sama dengan penjaga token
+signaling saat Redis gagal. Jangan pernah fail-open di jalur yang menentukan siapa yang
+bertanggung jawab atas sebuah verifikasi.
 
 ---
 

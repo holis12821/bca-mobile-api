@@ -3,6 +3,7 @@ package account_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -113,13 +114,16 @@ type mockNotifRepo struct {
 	notifications []account.Notification
 }
 
-func (r *mockNotifRepo) ListByUserID(_ context.Context, userID uuid.UUID, cursor *uuid.UUID, limit int) ([]account.Notification, error) {
+func (r *mockNotifRepo) ListByUserID(_ context.Context, userID uuid.UUID, types []string, cursor *uuid.UUID, limit int) ([]account.Notification, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var result []account.Notification
 	pastCursor := cursor == nil
 	for _, n := range r.notifications {
 		if n.UserID != userID {
+			continue
+		}
+		if len(types) > 0 && !slices.Contains(types, n.Type) {
 			continue
 		}
 		if !pastCursor {
@@ -419,6 +423,54 @@ func TestUpdateTransactionLimit_InvalidType(t *testing.T) {
 	}
 }
 
+// TestListNotifications_FilterByType also covers the cache key: the filtered
+// and unfiltered lists must not share an entry, which is the failure mode that
+// would show the PROMO tab's rows under "Semua".
+func TestListNotifications_FilterByType(t *testing.T) {
+	userID := uuid.New()
+	now := time.Now()
+	notifs := []account.Notification{
+		{ID: uuid.New(), UserID: userID, Type: "TRANSACTION", Title: "Transfer", Body: "b", CreatedAt: now},
+		{ID: uuid.New(), UserID: userID, Type: "PROMO", Title: "Diskon", Body: "b", CreatedAt: now.Add(-time.Minute)},
+		{ID: uuid.New(), UserID: userID, Type: "SECURITY", Title: "Login baru", Body: "b", CreatedAt: now.Add(-2 * time.Minute)},
+	}
+
+	svc, _ := newTestService(nil, nil, nil, notifs)
+
+	all, _, _, err := svc.ListNotifications(context.Background(), userID, nil, nil, 20)
+	if err != nil {
+		t.Fatalf("unfiltered: %v", err)
+	}
+	if len(all.Notifications) != 3 {
+		t.Fatalf("expected 3 unfiltered, got %d", len(all.Notifications))
+	}
+
+	promo, _, _, err := svc.ListNotifications(context.Background(), userID, []string{"PROMO"}, nil, 20)
+	if err != nil {
+		t.Fatalf("filtered: %v", err)
+	}
+	if len(promo.Notifications) != 1 || promo.Notifications[0].Type != "PROMO" {
+		t.Fatalf("expected only the PROMO row, got %+v", promo.Notifications)
+	}
+
+	// Reading the unfiltered list again must not return the cached PROMO page.
+	again, _, _, err := svc.ListNotifications(context.Background(), userID, nil, nil, 20)
+	if err != nil {
+		t.Fatalf("unfiltered replay: %v", err)
+	}
+	if len(again.Notifications) != 3 {
+		t.Fatalf("filter leaked through the cache: expected 3, got %d", len(again.Notifications))
+	}
+
+	multi, _, _, err := svc.ListNotifications(context.Background(), userID, []string{"PROMO", "SECURITY"}, nil, 20)
+	if err != nil {
+		t.Fatalf("multi: %v", err)
+	}
+	if len(multi.Notifications) != 2 {
+		t.Fatalf("expected 2 for PROMO+SECURITY, got %d", len(multi.Notifications))
+	}
+}
+
 func TestListNotifications_Pagination(t *testing.T) {
 	userID := uuid.New()
 	var notifs []account.Notification
@@ -437,7 +489,7 @@ func TestListNotifications_Pagination(t *testing.T) {
 	svc, _ := newTestService(nil, nil, nil, notifs)
 
 	// Page 1: limit 2
-	resp, hasMore, nextCursor, err := svc.ListNotifications(context.Background(), userID, nil, 2)
+	resp, hasMore, nextCursor, err := svc.ListNotifications(context.Background(), userID, nil, nil, 2)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -453,7 +505,7 @@ func TestListNotifications_Pagination(t *testing.T) {
 
 	// Page 2: use cursor from page 1
 	cursorID, _ := uuid.Parse(nextCursor)
-	resp2, _, _, err := svc.ListNotifications(context.Background(), userID, &cursorID, 2)
+	resp2, _, _, err := svc.ListNotifications(context.Background(), userID, nil, &cursorID, 2)
 	if err != nil {
 		t.Fatalf("page 2 error: %v", err)
 	}

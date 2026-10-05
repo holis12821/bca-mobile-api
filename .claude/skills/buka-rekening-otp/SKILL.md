@@ -54,12 +54,12 @@ Sukses `200 OK` → `data.current_step = "BIOMETRIC"`.
 |---|---|---|
 | `VALIDATION_ERROR` | 400 | `otp_code` bukan 6 digit angka. Tidak memotong jatah percobaan. |
 | `ONBOARDING_NOT_FOUND` | 404 | Sesi tidak dikenal, atau `X-Device-ID` bukan pemiliknya. |
-| `OTP_INVALID` | 422 | Kode salah, percobaan masih tersisa. |
-| `OTP_EXPIRED` | 422 | Lewat `otp_expires_at`, atau OTP sudah diganti karena percobaan gagal beruntun. |
+| `OTP_INVALID` | 422 | Kode salah, percobaan masih tersisa. Juga pada kegagalan ke-3 saat batas kirim per nomor sudah habis: regenerasi dilewati, kode lama tetap sah. |
+| `OTP_EXPIRED` | 422 | Lewat `otp_expires_at`, atau OTP sudah diganti karena percobaan gagal beruntun **dan SMS penggantinya terkirim**. |
 | `ONBOARDING_INVALID_STEP` | 422 | `current_step` bukan `OTP_VERIFY`. |
 | `ONBOARDING_SESSION_EXPIRED` | 422 | Sesi onboarding kedaluwarsa. |
 | `OTP_BLOCKED` | 429 | Percobaan gagal melewati ambang. **Wajib** menyertakan `details.retry_after_seconds`. |
-| `OTP_DELIVERY_FAILED` | 503 | Kode terbit dan tersimpan, tapi SMS gateway menolak. |
+| `OTP_DELIVERY_FAILED` | 503 | Kode terbit dan tersimpan, tapi SMS gateway menolak. Termasuk saat regenerasi otomatis gagal dikirim — lihat §penghitung butir 2. |
 
 > Status di atas mengikuti `06-...-API-SPEC.md`, yang menempatkan seluruh
 > keluarga onboarding di 422. Skill ini sebelumnya menulis 400/409/410;
@@ -70,15 +70,67 @@ Sukses `200 OK` → `data.current_step = "BIOMETRIC"`.
 | Field request | Tipe | Catatan |
 |---|---|---|
 | `session_id` | string | Wajib. |
+| `channel` | string | Opsional. `"sms"` (default) atau `"call"`. Lihat §2b-ter. |
 
 Sukses `200 OK` → `data.otp_sent_to`, `data.otp_expires_at`. Menerima
 `X-Device-ID` opsional dengan aturan yang sama seperti `verify-otp`.
 
 Melebihi kuota kirim ulang (3/jam per sesi) balas `RATE_LIMIT_EXCEEDED` (429)
-dengan `details.retry_after_seconds` berisi sisa jendela. Sesi yang sedang
-diblokir balas `OTP_BLOCKED` (429) — kirim ulang bukan jalan memutar blokir.
+dengan `details.retry_after_seconds` berisi sisa jendela. Batas kedua, 10 SMS/jam
+**per nomor tujuan** dan lintas sesi, balas error yang sama — lihat §penghitung
+butir 4. Sesi yang sedang diblokir balas `OTP_BLOCKED` (429) — kirim ulang bukan
+jalan memutar blokir.
 
-### 2c. Bentuk `details` pada 429
+### 2b-bis. Siapa yang memiliki kodenya
+
+`SMS_PROVIDER` memilih satu dari dua model, dan satu-satunya yang terlihat dari
+luar adalah `otp_debug` dan `otp_expires_at`:
+
+- `twilio` — kita membuat kode, menyimpan hash-nya di Redis (TTL 5 menit), dan
+  memeriksanya sendiri. `otp_debug` ada di development.
+- `twilio_verify` — Twilio Verify membuat, menyimpan, dan memeriksa kodenya.
+  `otp_expires_at` memakai TTL provider — `SMS_VERIFY_CODE_TTL`, default 10 menit,
+  **ditanyakan ke provider lewat `CodeTTL()`** dan bukan konstanta di paket domain.
+  Dulu ada dua salinan angka 10 menit (satu di `sms`, satu di `onboarding`); yang
+  kedua tidak ikut berubah saat expiry diubah di console, jadi aplikasi memasang
+  hitung mundur yang berbeda dari kode di tangan nasabah. **`otp_debug` selalu
+  kosong** karena kodenya tidak pernah lewat server ini. Wajib dipakai selama akun
+  Twilio masih trial (`572006`).
+
+### 2b-ter. Channel pengiriman (`sms` | `call`)
+
+Berlaku di `POST /personal-data` dan `POST /resend-otp`, keduanya lewat field
+`channel` yang opsional. Kosong = `sms`, jadi build Android lama tidak terpengaruh.
+
+`"call"` membuat provider menelepon dan membacakan kodenya. Dijawab
+`400 OTP_CHANNEL_NOT_ALLOWED` kecuali **dua** syarat terpenuhi: provider pemilik
+kode sedang aktif (`twilio_verify` — jalur `Gateway` tidak punya transport suara
+sama sekali), dan `call` ada di `SMS_VERIFY_CHANNELS`.
+
+Penolakannya **sebelum** apa pun terkirim: tidak ada kode terbit, step tidak maju.
+Satu pengecualian yang diterima sadar — allowlist provider hanya diketahui di
+transport, jadi channel yang lolos `resolveChannel` lalu ditolak di sana sudah
+memotong satu jatah dari batas 10 SMS/jam per nomor. Itu berarti client meminta
+channel yang deployment ini memang tidak pernah aktifkan: salah build atau salah
+config, bukan sesuatu yang bisa dialami nasabah biasa.
+
+Yang **tidak** dilakukan: menurunkan `call` menjadi SMS diam-diam. Nasabah yang
+meminta telepon lalu menerima SMS akan menunggu panggilan yang tidak pernah datang.
+
+`verify-otp` **tidak berubah**: kode dari SMS maupun telepon diperiksa di endpoint
+yang sama, karena cara pengiriman tidak mengubah cara pemeriksaan.
+
+Regenerasi otomatis setelah 3 kegagalan verifikasi **selalu `sms`** — kiriman itu
+dipicu server, bukan diminta nasabah, dan telepon yang tidak diminta lebih
+mengagetkan daripada SMS yang tidak diminta.
+
+Di dalam kode, percabangannya hanya ada di dua fungsi — `issueCode` dan
+`checkCode` di `personal_data_service.go`. Semua kebijakan di §penghitung tetap
+milik kita pada kedua model, dan `TestVerifierPath_OurPolicyStillApplies`
+memakunya. Kalau menambah provider lagi, tambahkan di dua fungsi itu, jangan
+menyebar `if` ke seluruh flow.
+
+## 2c. Bentuk `details` pada 429
 
 Client menampilkan hitung mundur dari field ini. Namanya tidak boleh berubah:
 
@@ -149,9 +201,26 @@ dan ikut tertulis di `06-...-API-SPEC.md` §3b:
    penghitung: membanjiri endpoint tidak memperpanjang blokir.
 2. **Regenerasi otomatis tidak memotong kuota kirim ulang.** Nasabah tidak
    meminta SMS itu; menagihkannya berarti tiga tebakan salah diam-diam
-   menghabiskan satu hak kirim ulang.
+   menghabiskan satu hak kirim ulang. Terjadi **tepat sekali**, pada kegagalan
+   ke-3 (`attempts == otpRegenAt`, bukan `>=`): dulu kegagalan ke-4 menerbitkan
+   satu lagi, jadi tiga tebakan salah memakan dua SMS. Tapi regenerasi yang **gagal dikirim**
+   dijawab `OTP_DELIVERY_FAILED` (503), bukan `OTP_EXPIRED`: kode lama sudah
+   ditimpa, jadi "tunggu kode baru" menyuruh nasabah menunggu SMS yang tidak
+   pernah berangkat.
 3. **Kirim ulang tidak mereset penghitung gagal.** Kalau mereset, 3 kirim ulang
    = 12 tebakan tanpa pernah menyentuh blokir.
+4. **Batas keempat mengikuti NOMOR, bukan session: 10 SMS/jam per nomor tujuan**
+   (`otpMaxSendPerPhone`). Kuota kirim ulang di butir 2 dikunci per `session_id`,
+   dan session gratis dibuat — jadi dulu satu alamat bisa memanen SMS dengan
+   membuang session dan membuat yang baru, sebatas rate limit per IP. Tagihan
+   providernya dan HP yang kebanjiran tetap milik kita. Habis →
+   `429 RATE_LIMIT_EXCEEDED` + `retry_after_seconds`, di `personal-data` maupun
+   `resend-otp`. **Tidak** dinolkan oleh session baru — itu justru gunanya.
+
+   Pada regenerasi otomatis batas ini tidak menimpa apa pun: regenerasinya
+   dilewati, kode yang dipegang nasabah tetap sah, jawabannya tetap
+   `OTP_INVALID`. Kuncinya nomor yang sudah dinormalkan ke E.164, jadi menulis
+   nomor yang sama dalam format berbeda tidak memberi jatah baru.
 
 Penghitung gagal dan kuota kirim ulang dinolkan bersama saat `personal-data`
 menerbitkan OTP pembuka sebuah step — bukan saat kirim ulang.
@@ -167,22 +236,34 @@ percobaan.
 ## 6. SMS gateway
 
 Pengiriman SMS berada di balik satu antarmuka agar bisa ditukar per lingkungan.
+**Setup provider-nya ada di skill `twilio-sms-otp`** — kredensial, Geo
+Permissions, kode error Twilio, dan cara menelusuri OTP yang tidak sampai. Di
+sini hanya yang mengikat kebijakan OTP.
 
-Pilihannya dibuat sekali dari `APP_ENV` di `internal/pkg/sms` (`sms.For(devMode)`),
-dipakai bersama oleh flow registrasi dan onboarding. Jangan pernah menyusun
-gateway tiruan sendiri di paket domain — pernah ada `MockSMSGateway` yatim di
-`internal/domain/onboarding/` yang mencatat OTP ke log tanpa gerbang apa pun.
+Pilihannya dibuat sekali di `router.New`, dari `SMS_PROVIDER` dan `APP_ENV`.
+Jangan pernah menyusun gateway tiruan sendiri di paket domain — pernah ada
+`MockSMSGateway` yatim di `internal/domain/onboarding/` yang mencatat OTP ke log
+tanpa gerbang apa pun.
 
-- **Produksi** — gateway sungguhan. Sampai ada yang dipasang, `UnconfiguredGateway`
-  menolak dan tidak pernah mencatat kodenya. Kegagalan kirim **tidak boleh**
-  membatalkan penerbitan OTP secara diam-diam: kode tetap tersimpan dan sesi
-  tetap maju ke `OTP_VERIFY`, tapi response-nya `OTP_DELIVERY_FAILED` (503)
-  supaya client menawarkan kirim ulang, bukan `200` dengan hitung mundur untuk
-  SMS yang tidak pernah berangkat.
-- **Development dan test** — implementasi tiruan. Kode dicatat ke log lingkungan
-  non-produksi saja dan pengiriman selalu dianggap berhasil.
+| Keadaan | Gateway |
+|---|---|
+| `SMS_PROVIDER` terisi | Provider sungguhan (`TwilioGateway`). Kredensial salah → **boot gagal**, bukan diam-diam tidak mengirim |
+| Kosong + `APP_ENV=development` | `MockGateway` — kode hanya ke log, juga muncul sebagai `otp_debug` |
+| Kosong + environment lain | `Config.Validate()` menolak boot |
+
+- Kegagalan kirim **tidak boleh** membatalkan penerbitan OTP secara diam-diam:
+  kode tetap tersimpan dan sesi tetap maju ke `OTP_VERIFY`, tapi response-nya
+  `OTP_DELIVERY_FAILED` (503) supaya client menawarkan kirim ulang, bukan `200`
+  dengan hitung mundur untuk SMS yang tidak pernah berangkat. Aturan yang sama
+  berlaku di `POST /registration/initiate` dan `POST /account/profile/otp`.
 - Pengiriman dilakukan **setelah** OTP tersimpan, bukan sebelum — supaya tidak ada
   SMS untuk kode yang gagal disimpan.
+- Nomor dinormalkan ke E.164 **di dalam gateway**, bukan di service. `0812…`,
+  `62812…`, dan `+62 812…` sama-sama sampai; nomor yang tidak bisa dirutekan
+  ditolak sebelum ada panggilan HTTP yang ditagih.
+- Nomor yang gagal didekripsi berhenti di sini dengan `OTP_DELIVERY_FAILED`.
+  Sebelumnya ciphertext-nya diteruskan ke gateway **dan** dimasking balik ke
+  nasabah sebagai `otp_sent_to`.
 
 ---
 
@@ -212,6 +293,7 @@ Tiga kejadian wajib tercatat, tanpa pernah memuat kodenya:
 - [ ] Gagal beruntun sampai ambang → `OTP_BLOCKED` (429) **dengan** `details.retry_after_seconds`.
 - [ ] Verifikasi saat terblokir tetap `OTP_BLOCKED`, penghitung tidak bertambah lagi.
 - [ ] Kirim ulang melebihi kuota → `RATE_LIMIT_EXCEEDED` (429) dengan `details.retry_after_seconds`.
+- [ ] Sesi baru untuk nomor yang sama, diulang sampai 10 SMS dalam satu jam → sesi ke-11 ditolak `RATE_LIMIT_EXCEEDED` **tanpa** satu pun SMS terkirim, dan nomor lain tetap dilayani.
 - [ ] `verify-otp` saat `current_step` bukan `OTP_VERIFY` → `ONBOARDING_INVALID_STEP`.
 - [ ] `session_id` milik device lain → ditolak.
 - [ ] Sesi kedaluwarsa → `ONBOARDING_SESSION_EXPIRED`.

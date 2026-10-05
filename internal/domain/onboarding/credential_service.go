@@ -85,6 +85,22 @@ func (s *CredentialService) SetCredentials(ctx context.Context, req SetCredentia
 		return nil, apperr.ValidationError
 	}
 
+	// The key id was stored but never compared, so a client encrypting under a
+	// rotated-out key reached the decrypt step and got CRED_DECRYPTION_FAILED
+	// with nothing naming the cause. Saying which key is expected turns that
+	// into a one-line fix on the client.
+	if s.pinKeys != nil && !s.pinKeys.AcceptsKeyID(req.EncryptionKeyID) {
+		return nil, apperr.Error{
+			Status:  apperr.CredDecryptionFailed.Status,
+			Code:    apperr.CredDecryptionFailed.Code,
+			Message: apperr.CredDecryptionFailed.Message,
+			Details: map[string]any{
+				"expected_key_id": s.pinKeys.ActiveKeyID(),
+				"received_key_id": req.EncryptionKeyID,
+			},
+		}
+	}
+
 	// 5. Decrypt access code and PIN
 	accessCode, err := s.decryptCredential(req.AccessCodeEncrypted)
 	if err != nil {

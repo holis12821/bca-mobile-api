@@ -13,11 +13,20 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+
+	"github.com/holis12821/bca-mobile-api/internal/pkg/notify"
 )
 
 // TokenStore reads the push tokens registered for a user.
 type TokenStore interface {
-	ListPushTokens(ctx context.Context, userID uuid.UUID) ([]string, error)
+	// ListPushTokens returns the tokens of the user's active devices.
+	//
+	// overrideMuted ignores users.push_notification_enabled. It is true only for
+	// notifications that have to arrive whatever the customer set — SECURITY,
+	// decided with the product owner. The switch is honoured here, at the token
+	// layer, and never in Notifier: the in-app row must be written either way,
+	// because that is what the Notifikasi screen reads.
+	ListPushTokens(ctx context.Context, userID uuid.UUID, overrideMuted bool) ([]string, error)
 }
 
 // LoggingPusher resolves the user's tokens and logs what would be sent.
@@ -31,7 +40,11 @@ func NewLoggingPusher(tokens TokenStore) *LoggingPusher {
 }
 
 func (p *LoggingPusher) Push(ctx context.Context, userID uuid.UUID, title, body string, data map[string]string) error {
-	tokens, err := p.tokens.ListPushTokens(ctx, userID)
+	// Same rule as the real transport, so what development logs matches what
+	// production would actually deliver.
+	overrideMuted := data["type"] == notify.TypeSecurity
+
+	tokens, err := p.tokens.ListPushTokens(ctx, userID, overrideMuted)
 	if err != nil {
 		return err
 	}

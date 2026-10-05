@@ -93,6 +93,7 @@ func (h *CardHandler) SetCard(w http.ResponseWriter, r *http.Request) {
 	// yang dibatasi laju oleh path.
 	req.SessionID = sessionID
 	req.CardType = strings.TrimSpace(req.CardType)
+	req.DeviceID = deviceIDHeader(r)
 
 	regionCode, ok := normalizeRegionCode(r.URL.Query().Get("region_code"))
 	if !ok {

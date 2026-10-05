@@ -33,7 +33,8 @@ docs/                — API spec, architecture, and runbook
 ### Prerequisites
 
 - Go 1.23+
-- Docker & Docker Compose (for PostgreSQL and Redis)
+- Docker & Docker Compose (PostgreSQL, two Redis instances, and coturn for the
+  video-call STUN/TURN)
 
 ### Run
 
@@ -146,6 +147,7 @@ Di Postman, set `base_url` ke `https://<host>/v1`.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/v1/auth/pin/public-key` | Public key + key_id for `pin_encrypted` (public, cacheable) |
 | POST | `/v1/auth/login/pin` | Login with PIN |
 | POST | `/v1/auth/login/biometric` | Login with biometric |
 | POST | `/v1/auth/logout` | Logout |
@@ -164,6 +166,12 @@ Di Postman, set `base_url` ke `https://<host>/v1`.
 | GET | `/v1/account/transaction-limit` | Limits plus today's usage (WIB) |
 | PUT | `/v1/account/transaction-limit` | Update limits (requires a CHANGE_LIMIT verification token) |
 | POST | `/v1/account/device/push-token` | Register the device's FCM token |
+| GET | `/v1/account/cards` | Cards the customer owns (empty array, never 404) |
+| PUT | `/v1/account/cards/{card_id}/settings` | Toggle debit-online / international; absent fields are left alone |
+| POST | `/v1/account/cards/{card_id}/block` | Block a card (requires a BLOCK_CARD verification token) |
+| POST | `/v1/account/cards/{card_id}/replacement` | Request a replacement (REPLACE_CARD token + `X-Idempotency-Key`) |
+| GET | `/v1/content/help-center` | FAQ — **no auth** |
+| GET | `/v1/content/contact-cs` | Halo BCA contact details — **no auth** |
 | GET | `/v1/transactions/mutations` | List account mutations |
 | GET | `/v1/transactions/history` | List transaction history |
 | GET | `/v1/transactions/{id}/receipt` | Transaction receipt (JSON) |
@@ -178,10 +186,16 @@ Di Postman, set `base_url` ke `https://<host>/v1`.
 | GET | `/v1/notifications` | List notifications |
 | PUT | `/v1/notifications/{id}/read` | Mark notification as read |
 | PUT | `/v1/notifications/read-all` | Mark all notifications as read |
-| POST | `/v1/registration/initiate` | Start registration |
-| POST | `/v1/registration/verify-otp` | Verify registration OTP |
-| POST | `/v1/registration/upload-document` | Upload KYC document |
-| POST | `/v1/registration/complete` | Complete registration |
+| POST | `/v1/registration/initiate` | **Deprecated** — use `/v1/onboarding/*` |
+| POST | `/v1/registration/verify-otp` | **Deprecated** — use `/v1/onboarding/*` |
+| POST | `/v1/registration/upload-document` | **Deprecated** — use `/v1/onboarding/*` |
+| POST | `/v1/registration/complete` | **Deprecated** — use `/v1/onboarding/*` |
+
+`/v1/registration/*` and `/v1/onboarding/*` describe the same feature with two
+contracts. `/v1/onboarding/*` is the one the Android app implements and the one
+that is maintained; the registration family still works for older builds and
+every response carries `Deprecation: true` plus a `Link` to its successor. New
+integrations: use `/v1/onboarding/*`.
 
 ## Environment Variables
 
@@ -196,6 +210,12 @@ See `internal/config/config.go` for all supported variables. Key ones:
 | `JWT_PUBLIC_KEY_PATH` | (required) | RSA public key for JWT verification |
 | `PIN_PRIVATE_KEY_PATH` | (required) | RSA private key for PIN decryption |
 | `PIN_PUBLIC_KEY_PATH` | (required) | RSA public key for PIN encryption |
+| `PIN_KEY_ID` | `pin-key-v1` | Names the active PIN key pair. Published by `GET /v1/auth/pin/public-key` and compared against the client's `encryption_key_id`: a mismatch answers `422 AUTH_PIN_KEY_UNKNOWN` instead of "wrong PIN". Bump it whenever the key pair is rotated — `make pin-public-key` prints the PEM to hand to the Android build |
+| `STUN_URLS` | (empty) | Comma-separated STUN URLs served in `ice_servers` on the video-call queue response. `.env.example` points at the local `coturn` (`stun:localhost:3478`), which `make infra-up` starts |
+| `TURN_URLS` | (empty) | Comma-separated TURN URLs. Without `TURN_USERNAME` + `TURN_CREDENTIAL` they are **ignored and logged as an error** — a TURN server with no credentials refuses every allocation. Empty `ice_servers` means video call fails behind strict NAT, which is most mobile networks. From a real phone, replace `localhost` with this machine's LAN address |
+| `TURN_USERNAME` | (empty) | TURN credential username (`bcadev` for the local coturn) |
+| `TURN_CREDENTIAL` | (empty) | TURN credential secret (local coturn: `localdev_turn_123`, dev-only) |
+| `TURN_CREDENTIAL_TTL` | `12h` | Reported lifetime of the TURN credential |
 | `AES_KEY` | (required) | Hex-encoded 32-byte key for PII encryption |
 | `UPLOAD_DIR` | `uploads` | Directory for document uploads |
 | `APP_ENV` | `development` | `development` also mounts `/v1/dev/*` helpers |
@@ -207,9 +227,20 @@ See `internal/config/config.go` for all supported variables. Key ones:
 | `MAINTENANCE_MODE` | `false` | Served by `GET /v1/health/config`; flips the app's maintenance screen |
 | `MIN_APP_VERSION` | `1.0.0` | Served by `GET /v1/health/config`; drives force-update |
 | `FEATURE_*` | `true` | Feature flags in `GET /v1/health/config` (`FEATURE_BIOMETRIC_LOGIN`, `FEATURE_QRIS_PAYMENT`, `FEATURE_EWALLET_TOPUP`, `FEATURE_ONBOARDING`) |
-| `FEATURE_CARD_SELECTION` | `false` | Turns the Paspor card-selection step on. Off keeps the old flow whole: sessions start at `OCR`, the catalog answers `CARD_CATALOG_EMPTY`, and submit does not demand a card. This is only the default — the Redis key `flag:onboarding:card_selection:enabled` overrides it without a restart |
+| `FEATURE_CARD_SELECTION` | `false` | Turns the Paspor card-selection step on. Off keeps the old flow whole: sessions start at `OCR`, the catalog answers `CARD_CATALOG_EMPTY`, and submit does not demand a card. This is only the default — the Redis key `flag:onboarding:card_selection:enabled` overrides it without a restart. `.env.example` sets it to `true`: the catalog now carries real numbers (migration `000022`), so the screen has something to show. The code default stays `false` so a deployment that has not migrated cannot serve an empty catalog as a feature |
 | `ONBOARDING_CARD_CORE_BANKING_CODES` | (empty) | Maps `card_type` to the core banking card code, e.g. `PASPOR_BLUE:CB-BLUE,PASPOR_GOLD:CB-GOLD`. Verified **at startup** when `FEATURE_CARD_SELECTION` is on: an active catalogued card with no mapping refuses to start, so a hole in the config surfaces at deploy rather than after a nasabah's account exists without a card. The values currently in `.env.example` are dev placeholders |
 | `ONBOARDING_CARD_LEGACY_APP_VERSION` | (empty) | `X-App-Version` threshold below which a session with no `card_type` gets the product's default card instead of stopping at `CARD_SELECTION`. Empty disables the fallback — pushing a default card, and its monthly fee, onto a nasabah who never chose it is a product decision |
+| `SMS_PROVIDER` | (empty) | OTP delivery transport. `twilio` is the only one implemented. Empty is allowed **only** in development (the gateway logs the code); outside development the boot is refused, because a process with no provider generates, stores and audits every OTP while no nasabah can get past `OTP_VERIFY`. An unknown value also fails the boot rather than falling back to silence |
+| `SMS_ACCOUNT_SID` | (empty) | Twilio account SID (`AC…`), used as the basic-auth user. An API key SID (`SK…`) is rejected at startup |
+| `SMS_AUTH_TOKEN` | (empty) | Twilio auth token. A password — never logged, never echoed into an error, never committed |
+| `SMS_SENDER` | (empty) | A Twilio number in E.164 (`+1555…`) or a Messaging Service SID (`MG…`). Prefer the messaging service for Indonesian traffic: it picks the route and sender id per destination operator. The prefix decides which Twilio parameter is sent |
+| `SMS_BASE_URL` | (empty) | Overrides the API host; for tests and a future on-premise aggregator. Leave unset in real deployments |
+| `SMS_TIMEOUT` | `10s` | Bounds one send. The nasabah is watching a spinner, so a slow aggregator is cut off |
+| `SMS_VERIFY_SERVICE_SID` | (empty) | Twilio Verify service SID (`VA…`). Required when `SMS_PROVIDER=twilio_verify`, ignored for `twilio`. A nearly-right value fails the boot rather than 404ing every verification |
+| `SMS_VERIFY_CHANNELS` | `sms` | Verify channels this deployment may use: `sms`, `call`, or both, comma-separated. A channel outside the list is refused with `400 OTP_CHANNEL_NOT_ALLOWED` before Twilio is called. An unknown name fails the boot — `voice` is a plausible typo for `call`, and dropping it silently would leave voice looking enabled. `call` also needs **Voice** Geo Permissions for Indonesia, not just Messaging |
+| `SMS_VERIFY_LOCALE` | `id` | Language Verify renders the code in. Honoured for `sms`. Verify's voice template does not cover Indonesian, so a `call` is spoken in English and the transport omits the parameter instead of sending one Twilio will not honour |
+| `SMS_VERIFY_CODE_TTL` | `10m` | Must match the code expiry configured on the Verify service in the console. Nothing here enforces it — it is what `otp_expires_at` reports, so a mismatch is a countdown that disagrees with the code in the nasabah's hand |
+| `SMS_VERIFY_BASE_URL` | (empty) | Overrides the **Verify** host; tests only. Deliberately separate from `SMS_BASE_URL`, which is the Messages host: Verify used to read that one, so setting it sent every verification to `api.twilio.com`, earned a 404, and a 404 from Verify means "nothing pending" — every nasabah saw `OTP_EXPIRED` with correct credentials |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Cap on any JSON request body. Upload endpoints set their own larger limit |
 | `REQUEST_TIMEOUT` | `30s` | Per-handler timeout |
 
@@ -221,7 +252,7 @@ Everything else refuses rather than pretending:
 | Area | development | anything else |
 |------|-------------|---------------|
 | `/v1/dev/*` helpers | mounted | route does not exist (404) |
-| SMS OTP | logged to stdout, and returned as `otp_debug` in the response | not delivered; the code never reaches the log |
+| SMS OTP, with no `SMS_PROVIDER` | logged to stdout, and returned as `otp_debug` in the response | the boot is refused — see `SMS_PROVIDER` above. With a provider configured, the OTP is sent for real in every environment and `otp_debug` still appears only in development |
 | OCR, Dukcapil, biometrics, object storage, core banking | mock implementations | `503 PROVIDER_NOT_CONFIGURED` |
 | Push notifications | logged with the resolved device tokens | stored in-app only until an FCM provider is wired in |
 

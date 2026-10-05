@@ -35,6 +35,11 @@ type UserProfile struct {
 	Email       string // decrypted at repo layer, masked at handler
 	LastLoginAt *time.Time
 	Accounts    []Account
+
+	// Tier drives the "Prioritas" badge on the profile card. It is a field on
+	// an endpoint the screen already calls, not an endpoint of its own: one
+	// extra round trip for one word is a round trip nobody needs.
+	Tier string
 }
 
 // BalanceResponse is the response for GET /account/balance.
@@ -237,6 +242,14 @@ type LimitStatusResponse struct {
 	Limits map[string]string `json:"limits"`
 }
 
+// NotificationTypes is the closed list the `type` filter on GET /v1/notifications
+// accepts, and it is the same list as the CHECK constraint on
+// notifications.type (migration 000005). An unknown value is rejected rather
+// than ignored: silently dropping the filter answers 200 with every
+// notification, and the Notifikasi tab then looks like it is working while
+// showing the wrong tab's contents.
+var NotificationTypes = []string{"TRANSACTION", "PROMO", "SECURITY", "SYSTEM", "INFO"}
+
 // Notification represents a single notification.
 type Notification struct {
 	ID        uuid.UUID
@@ -314,3 +327,12 @@ type LimitCeiling struct {
 func decPtr(d decimal.Decimal) *decimal.Decimal {
 	return &d
 }
+
+// Customer service tiers, matching the CHECK constraint on users.tier
+// (migration 000021). The client maps a tier to its own badge styling — no
+// colour or icon travels over the wire, the same rule the card catalog follows.
+const (
+	TierReguler   = "REGULER"
+	TierPrioritas = "PRIORITAS"
+	TierSolitaire = "SOLITAIRE"
+)
