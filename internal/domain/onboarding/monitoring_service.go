@@ -2,10 +2,16 @@ package onboarding
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/holis12821/bca-mobile-api/internal/domain/account"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/metrics"
 )
 
@@ -15,24 +21,255 @@ type MonitoringService struct {
 	audit      AuditRepository
 	queueCache VideoCallQueueCache
 
+	// personalData dan videoCalls hanya dipakai detail sesi sisi CS. Keduanya opsional:
+	// tanpa mereka endpoint detail menjawab tanpa bagian itu, bukan gagal — alert dan
+	// daftar sesi tidak boleh ikut mati karena satu dependensi yang tidak terpasang.
+	personalData PersonalDataRepository
+	videoCalls   VideoCallRepository
+
+	// aes membuka PII yang tersimpan terenkripsi. Nil berarti kolomnya dibaca apa adanya,
+	// mengikuti perilaku PersonalDataService supaya development tanpa kunci tetap jalan.
+	aes *crypto.AES
+
 	// metrics opsional: tanpa registry, aturan alert yang bersandar pada counter
 	// dilewati, bukan membuat seluruh endpoint monitoring gagal.
 	metrics *metrics.Registry
+
+	clock func() time.Time
 }
 
 type MonitoringServiceConfig struct {
-	Sessions   SessionRepository
-	Audit      AuditRepository
-	QueueCache VideoCallQueueCache
-	Metrics    *metrics.Registry
+	Sessions     SessionRepository
+	Audit        AuditRepository
+	QueueCache   VideoCallQueueCache
+	PersonalData PersonalDataRepository
+	VideoCalls   VideoCallRepository
+	AES          *crypto.AES
+	Metrics      *metrics.Registry
+
+	// Clock disuntik test. Nil memakai time.Now.
+	Clock func() time.Time
 }
 
 func NewMonitoringService(cfg MonitoringServiceConfig) *MonitoringService {
+	clock := cfg.Clock
+	if clock == nil {
+		clock = func() time.Time { return time.Now().UTC() }
+	}
 	return &MonitoringService{
-		sessions:   cfg.Sessions,
-		audit:      cfg.Audit,
-		queueCache: cfg.QueueCache,
-		metrics:    cfg.Metrics,
+		sessions:     cfg.Sessions,
+		audit:        cfg.Audit,
+		queueCache:   cfg.QueueCache,
+		personalData: cfg.PersonalData,
+		videoCalls:   cfg.VideoCalls,
+		aes:          cfg.AES,
+		metrics:      cfg.Metrics,
+		clock:        clock,
+	}
+}
+
+// Batas paginasi daftar sesi CS.
+//
+// Maksimum 100, bukan tak terbatas: daftar ini di belakang kredensial petugas, dan satu
+// permintaan yang menarik seluruh tabel adalah cara termurah mengeluarkan isinya.
+const (
+	csSessionsDefaultLimit = 20
+	csSessionsMaxLimit     = 100
+)
+
+// ListSessions mengembalikan sesi onboarding untuk layar pemantauan petugas.
+//
+// Mengembalikan (daftar, hasMore, cursorBerikutnya). Tidak memuat PII — lihat
+// [CSSessionSummary].
+func (s *MonitoringService) ListSessions(ctx context.Context, filter ListCSSessionsFilter) ([]CSSessionSummary, bool, *CSSessionCursor, error) {
+	if filter.Limit <= 0 {
+		filter.Limit = csSessionsDefaultLimit
+	}
+	if filter.Limit > csSessionsMaxLimit {
+		filter.Limit = csSessionsMaxLimit
+	}
+
+	rows, err := s.sessions.ListForCS(ctx, filter)
+	if err != nil {
+		return nil, false, nil, err
+	}
+
+	// Baris ke-(limit+1) hanya penanda bahwa masih ada lagi; ia tidak ikut dikirim.
+	hasMore := len(rows) > filter.Limit
+	if hasMore {
+		rows = rows[:filter.Limit]
+	}
+
+	now := s.clock()
+	out := make([]CSSessionSummary, 0, len(rows))
+	for _, sess := range rows {
+		out = append(out, summarizeSession(sess, now))
+	}
+
+	var next *CSSessionCursor
+	if hasMore && len(rows) > 0 {
+		last := rows[len(rows)-1]
+		next = &CSSessionCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	return out, hasMore, next, nil
+}
+
+// GetSessionDetail mengembalikan satu sesi berikut data pribadinya yang sudah disamarkan.
+//
+// actor WAJIB terisi: setiap pembukaan PII dicatat sebagai CS_SESSION_VIEWED, dan baris
+// audit tanpa pelaku tidak menjawab pertanyaan yang membuatnya ditulis. Pemanggil yang
+// tidak punya identitas petugas tidak boleh sampai ke sini.
+func (s *MonitoringService) GetSessionDetail(ctx context.Context, sessionID, actor, ip, userAgent string) (*CSSessionDetail, error) {
+	sess, err := s.sessions.FindBySessionID(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if sess == nil {
+		return nil, apperr.OnboardingNotFound
+	}
+
+	detail := &CSSessionDetail{CSSessionSummary: summarizeSession(sess, s.clock())}
+
+	if s.personalData != nil {
+		pd, err := s.personalData.FindBySessionID(ctx, sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if pd != nil {
+			masked, err := s.maskPersonalData(pd)
+			if err != nil {
+				return nil, err
+			}
+			detail.PersonalData = masked
+		}
+	}
+
+	if s.videoCalls != nil {
+		vc, err := s.videoCalls.FindBySessionID(ctx, sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if vc != nil {
+			detail.VideoCall = &CSSessionVideoCall{
+				QueueID:     vc.QueueID,
+				QueueNumber: vc.QueueNumber,
+				Status:      vc.Status,
+				Result:      vc.Result,
+				AgentName:   vc.AgentName,
+				JoinedAt:    vc.JoinedAt,
+				EndedAt:     vc.EndedAt,
+			}
+		}
+	}
+
+	// Dicatat SETELAH berhasil dirakit: pencarian session_id yang tidak ada bukan
+	// pembukaan data siapa pun, dan mencatatnya akan memenuhi jejak audit dengan
+	// peristiwa yang tidak pernah terjadi.
+	//
+	// Kegagalan menulis audit TIDAK menggagalkan response: data sudah dibaca petugas
+	// saat itu juga, dan menyembunyikannya setelah terbaca tidak memperbaiki apa pun.
+	// Yang penting kegagalannya terlihat di log.
+	s.writeAudit(ctx, sessionID, AuditCSSessionViewed, actor, map[string]any{
+		"current_step":      string(sess.CurrentStep),
+		"personal_data":     detail.PersonalData != nil,
+		"video_call_viewed": detail.VideoCall != nil,
+	}, ip, userAgent)
+
+	return detail, nil
+}
+
+func (s *MonitoringService) writeAudit(ctx context.Context, sessionID string, eventType AuditEventType, actor string, details map[string]any, ip, ua string) {
+	if s.audit == nil {
+		return
+	}
+	err := s.audit.Insert(ctx, &AuditLog{
+		ID:        uuid.New(),
+		SessionID: sessionID,
+		EventType: eventType,
+		Actor:     actor,
+		Details:   details,
+		IPAddress: ip,
+		UserAgent: ua,
+		CreatedAt: s.clock(),
+	})
+	if err != nil {
+		slog.Error("write cs audit failed",
+			"session_id", sessionID, "event_type", string(eventType),
+			"actor", actor, "error", err)
+	}
+}
+
+// maskPersonalData mendekripsi lalu menyamarkan. Kebijakan penyamarannya di
+// [MaskedPersonalData].
+func (s *MonitoringService) maskPersonalData(pd *PersonalData) (*MaskedPersonalData, error) {
+	nama, err := s.decryptField(pd.NamaLengkap)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt nama: %w", err)
+	}
+	nik, err := s.decryptField(pd.NIK)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt nik: %w", err)
+	}
+	phone, err := s.decryptField(pd.NomorHP)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt phone: %w", err)
+	}
+	email, err := s.decryptField(pd.Email)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt email: %w", err)
+	}
+
+	return &MaskedPersonalData{
+		NamaLengkap:         nama,
+		NIKMasked:           account.MaskNIK(nik),
+		TempatLahir:         pd.TempatLahir,
+		TanggalLahir:        pd.TanggalLahir,
+		JenisKelamin:        pd.JenisKelamin,
+		AlamatKTP:           pd.AlamatKTP,
+		AlamatDomisiliSama:  pd.AlamatDomisiliSama,
+		Pekerjaan:           pd.Pekerjaan,
+		PenghasilanPerBulan: pd.PenghasilanPerBulan,
+		SumberDanaUtama:     pd.SumberDanaUtama,
+		NomorHPMasked:       account.MaskPhone(phone),
+		EmailMasked:         account.MaskEmail(email),
+	}, nil
+}
+
+func (s *MonitoringService) decryptField(ciphertextHex string) (string, error) {
+	if s.aes == nil || ciphertextHex == "" {
+		return ciphertextHex, nil
+	}
+	ct, err := hex.DecodeString(ciphertextHex)
+	if err != nil {
+		return "", err
+	}
+	pt, err := s.aes.Decrypt(ct)
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
+}
+
+// summarizeSession memetakan sesi ke baris daftar, menghitung turunan yang tidak ada
+// di tabel.
+func summarizeSession(sess *Session, now time.Time) CSSessionSummary {
+	stalled := int(now.Sub(sess.UpdatedAt).Seconds())
+	if stalled < 0 {
+		// Jam yang mundur, atau baris yang baru ditulis di transaksi lain. Nol lebih
+		// jujur daripada angka negatif yang tampil sebagai "diam -3 detik".
+		stalled = 0
+	}
+	return CSSessionSummary{
+		SessionID:      sess.SessionID,
+		ProductType:    sess.ProductType,
+		CurrentStep:    sess.CurrentStep,
+		CardType:       sess.CardType,
+		StepsCompleted: sess.StepsCompleted,
+		CreatedAt:      sess.CreatedAt,
+		UpdatedAt:      sess.UpdatedAt,
+		ExpiresAt:      sess.ExpiresAt,
+		Expired:        now.After(sess.ExpiresAt),
+		StalledSeconds: stalled,
 	}
 }
 

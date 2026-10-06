@@ -101,3 +101,26 @@ func decodeHash(encoded string) (Argon2Params, []byte, []byte, error) {
 
 	return params, salt, hash, nil
 }
+
+// PasswordHasher membungkus [HashPassword] dan [VerifyPassword] dengan satu set
+// parameter Argon2 yang tetap.
+//
+// Ada supaya lapisan domain bisa menerima antarmuka dua-metode tanpa ikut mengenal
+// Argon2Params — parameternya urusan lapisan ini, bukan urusan logika bisnis yang
+// memanggilnya. Dipenuhi secara struktural oleh antarmuka di paket domain.
+type PasswordHasher struct {
+	Params Argon2Params
+}
+
+// NewPasswordHasher memakai [DefaultArgon2Params].
+func NewPasswordHasher() *PasswordHasher {
+	return &PasswordHasher{Params: DefaultArgon2Params}
+}
+
+func (h *PasswordHasher) Hash(ctx context.Context, plaintext string) (string, error) {
+	return HashPassword(ctx, plaintext, h.Params)
+}
+
+func (h *PasswordHasher) Verify(ctx context.Context, plaintext, encoded string) (bool, error) {
+	return VerifyPassword(ctx, plaintext, encoded)
+}

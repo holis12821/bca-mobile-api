@@ -61,8 +61,28 @@ const (
 // `agent_assigned`, `queue_update`, dan `call_ended` yang diwajibkan §5b tidak pernah ada.
 // Nasabah menunggu `agent_assigned` untuk membuat SDP offer, jadi panggilannya tidak pernah
 // bisa dimulai.
+// TerminalGate menegakkan Rule 4: hanya petugas di terminal ONLINE yang boleh mengambil
+// antrean.
+//
+// Dipenuhi *cs.TerminalService secara struktural, supaya paket ini tidak meng-import
+// paket domain lain — pola yang sama dipakai SignalingNotifier.
+//
+// Opsional. Nil berarti Rule 4 TIDAK ditegakkan, dan itu keadaan yang sah hanya di
+// development: tanpa gerbang ini, petugas yang melewati layar kesiapan dengan menyunting
+// state klien tetap bisa mengambil panggilan.
+type TerminalGate interface {
+	// AssertOnline mengembalikan nil kalau terminal itu ONLINE dan terikat ke petugas
+	// yang menyebutkannya. Selain itu error yang sudah siap dikirim ke klien.
+	AssertOnline(ctx context.Context, terminalID, employeeID string) error
+}
+
 type SignalingNotifier interface {
 	SendToNasabah(sessionID string, msg SignalMessage)
+
+	// SendToAgent dibutuhkan supaya `call_ended` sampai ke KEDUA sisi. Selama hanya ada
+	// SendToNasabah, petugas yang nasabahnya pergi lebih dulu tidak melihat apa pun
+	// selain socket yang sunyi — tidak terbedakan dari jaringannya sendiri yang putus.
+	SendToAgent(sessionID string, msg SignalMessage)
 }
 
 type VideoCallService struct {
@@ -76,6 +96,16 @@ type VideoCallService struct {
 	iceServers []ICEServer
 	clock      func() time.Time
 	notifier   SignalingNotifier
+
+	// schedules opsional: tanpa repo ini, penjadwalan ulang dijawab 503 dan sisa jalur
+	// video call tidak terpengaruh sama sekali.
+	schedules VideoCallScheduleRepository
+
+	// terminals menegakkan Rule 4. Nil melewatkannya — lihat [TerminalGate].
+	terminals TerminalGate
+
+	// escalations menahan nasabah NEED_REVIEW supaya tidak mengantre lagi ke Tier 1.
+	escalations VideoCallEscalationRepository
 }
 
 type VideoCallServiceConfig struct {
@@ -86,6 +116,15 @@ type VideoCallServiceConfig struct {
 	JWTManager       *crypto.JWTManager
 	Audit            AuditRepository
 	SignalingBaseURL string
+
+	// Schedules melayani POST /video-call/schedule. Nil mematikan endpoint itu saja.
+	Schedules VideoCallScheduleRepository
+
+	// Terminals menegakkan Rule 4 di AgentSignalingURL. Nil melewatkannya.
+	Terminals TerminalGate
+
+	// Escalations menyimpan hasil NEED_REVIEW. Nil membuat NEED_REVIEW ditolak.
+	Escalations VideoCallEscalationRepository
 
 	// ICEServers berasal dari environment (STUN_URLS, TURN_URLS, ...). Kredensial
 	// TURN milik penyedia dan berganti secara berkala, jadi tidak boleh ditanam
@@ -120,6 +159,10 @@ func NewVideoCallService(cfg VideoCallServiceConfig) *VideoCallService {
 		iceServers: cfg.ICEServers,
 		clock:      clock,
 		notifier:   cfg.Notifier,
+		schedules:  cfg.Schedules,
+
+		terminals:   cfg.Terminals,
+		escalations: cfg.Escalations,
 	}
 }
 
@@ -135,6 +178,24 @@ func (s *VideoCallService) JoinQueue(ctx context.Context, req JoinQueueRequest, 
 			Status:  422,
 			Code:    "ONBOARDING_INVALID_STEP",
 			Message: fmt.Sprintf("Langkah saat ini %s, bukan VIDEO_CALL.", session.CurrentStep),
+		}
+	}
+
+	// 1b. Eskalasi terbuka menahan nasabah dari antrean.
+	//
+	// Tanpa penjaga ini, nasabah NEED_REVIEW akan mengantre lagi dan dilayani Tier 1 —
+	// yang akan menghasilkan keputusan yang sama, karena yang membuat perkaranya
+	// dieskalasi bukan petugasnya melainkan perkaranya. Eskalasinya jadi hiasan.
+	//
+	// Diperiksa SEBELUM jam operasional: nasabah yang sedang ditinjau tidak perlu diberi
+	// tahu soal jam layanan, ia perlu diberi tahu bahwa perkaranya sedang ditangani.
+	if s.escalations != nil {
+		esc, escErr := s.escalations.FindOpenBySessionID(ctx, req.SessionID)
+		if escErr != nil {
+			return nil, fmt.Errorf("check open escalation: %w", escErr)
+		}
+		if esc != nil {
+			return nil, apperr.VideoCallUnderReview
 		}
 	}
 
@@ -398,11 +459,41 @@ func (s *VideoCallService) SubmitResult(ctx context.Context, req SubmitVideoCall
 
 	// 2. Validate result
 	result := VideoCallResult(req.Result)
-	if result != VCResultApproved && result != VCResultRejected {
+	if !ValidVideoCallResult(result) {
 		return nil, apperr.ValidationError
 	}
 	if agent.EmployeeID == "" {
 		return nil, apperr.ValidationError
+	}
+
+	// Penolakan WAJIB beralasan, dan alasannya ber-enum (§38 dokumen alur): alasan
+	// penolakan verifikasi identitas akan dilaporkan dan dihitung, dan teks bebas
+	// membuat tiga ejaan dari hal yang sama menjadi tiga kategori.
+	if result == VCResultRejected {
+		if !ValidRejectionReason(RejectionReason(req.RejectionReason)) {
+			return nil, apperr.ValidationError
+		}
+	}
+
+	// Eskalasi WAJIB beralasan dan bertujuan. Antrean kosong berarti Tier 2 — itu
+	// default yang disebut dokumen alur, bukan tebakan.
+	escalationQueue := strings.TrimSpace(req.EscalationQueue)
+	if result == VCResultNeedReview {
+		if s.escalations == nil {
+			// Menolak, bukan menyimpan hasilnya tanpa eskalasi: NEED_REVIEW tanpa baris
+			// eskalasi akan membuat sesi menggantung tanpa jalan keluar — lebih buruk
+			// daripada menolak permintaannya.
+			return nil, apperr.ProviderNotConfigured
+		}
+		if strings.TrimSpace(req.Notes) == "" {
+			return nil, apperr.ValidationError
+		}
+		if escalationQueue == "" {
+			escalationQueue = EscalationTier2
+		}
+		if !ValidEscalationQueue(escalationQueue) {
+			return nil, apperr.ValidationError
+		}
 	}
 
 	// 3. Replay guard. A result that has already been recorded is returned as
@@ -523,32 +614,73 @@ func (s *VideoCallService) SubmitResult(ctx context.Context, req SubmitVideoCall
 		}
 	}
 
-	// Nasabah diberi tahu panggilannya berakhir. Tanpa ini satu-satunya petunjuk yang dia
-	// punya adalah socket yang tiba-tiba sunyi, dan langkah berikutnya baru terlihat kalau
-	// aplikasinya kebetulan menanyakan sesi lagi.
-	s.notifyNasabah(req.SessionID, SignalMessage{
+	// NEED_REVIEW: perkaranya dicatat sebagai eskalasi, dan nasabah TETAP di VIDEO_CALL.
+	//
+	// Baris inilah yang menahannya supaya tidak mengantre lagi — lihat penjaga di
+	// JoinQueue. Ditulis SEBELUM `call_ended` dikirim: kalau gagal, petugas harus tahu
+	// dari response, bukan setelah nasabah sudah diberi tahu panggilannya berakhir.
+	var escalation *VideoCallEscalation
+	if result == VCResultNeedReview {
+		escalation = &VideoCallEscalation{
+			EscalationID:    "esc_" + uuid.New().String()[:16],
+			SessionID:       req.SessionID,
+			QueueID:         req.QueueID,
+			EscalationQueue: escalationQueue,
+			Status:          "PENDING",
+			Reason:          strings.TrimSpace(req.Notes),
+			RaisedByAgent:   agent.EmployeeID,
+			RaisedAt:        s.clock(),
+		}
+		if err := s.escalations.Create(ctx, escalation); err != nil {
+			return nil, err
+		}
+	}
+
+	// Kedua sisi diberi tahu panggilannya berakhir. Tanpa ini satu-satunya petunjuk yang
+	// mereka punya adalah socket yang tiba-tiba sunyi, dan langkah berikutnya baru
+	// terlihat kalau aplikasinya kebetulan menanyakan sesi lagi.
+	//
+	// Petugas ikut diberi tahu meski dialah yang baru saja menyubmit: `call_ended` adalah
+	// penanda sah untuk membongkar PeerConnection, dan aplikasi desktop tidak perlu
+	// menebak apakah hasilnya sudah tercatat dari response HTTP yang mungkin ia lewatkan.
+	ended := SignalMessage{
 		Type:            SignalCallEnded,
 		SessionID:       req.SessionID,
 		QueueID:         req.QueueID,
 		Result:          req.Result,
 		AgentName:       agentDisplayName(vc, agent),
 		DurationSeconds: req.CallDurationSeconds,
-	})
+	}
+	s.notifyNasabah(req.SessionID, ended)
+	s.notifyAgent(req.SessionID, ended)
 	s.broadcastQueuePositions(ctx)
 
 	// Audit
-	s.writeAudit(ctx, req.SessionID, AuditVideoCallEnded, "agent:"+agent.EmployeeID, map[string]any{
+	auditDetails := map[string]any{
 		"queue_id":           req.QueueID,
 		"result":             req.Result,
 		"ktp_shown_live":     req.KTPShownLive,
 		"identity_confirmed": req.IdentityConfirmed,
 		"duration_seconds":   req.CallDurationSeconds,
-	}, ipAddress, userAgent)
+	}
+	// Alasan penolakan masuk jejak audit, bukan hanya kolom panggilan: pemeriksaan pola
+	// penolakan per petugas dibaca dari jejak, dan tanpa ini ia harus menggabungkan dua
+	// tabel untuk pertanyaan yang paling sering diajukan.
+	if result == VCResultRejected {
+		auditDetails["rejection_reason"] = req.RejectionReason
+	}
+	if escalation != nil {
+		auditDetails["escalation_id"] = escalation.EscalationID
+		auditDetails["escalation_queue"] = escalation.EscalationQueue
+	}
+	s.writeAudit(ctx, req.SessionID, AuditVideoCallEnded, "agent:"+agent.EmployeeID,
+		auditDetails, ipAddress, userAgent)
 
 	return &SubmitVideoCallResultResponse{
 		SessionID:   req.SessionID,
 		Result:      req.Result,
 		CurrentStep: nextStep,
+		Escalation:  escalation,
 	}, nil
 }
 
@@ -574,6 +706,24 @@ func (s *VideoCallService) buildSignalingURL(sessionID, queueID string, role str
 func (s *VideoCallService) AgentSignalingURL(ctx context.Context, queueID string, agent AgentInfo, ipAddress, userAgent string) (*AgentSignalingResponse, error) {
 	if agent.EmployeeID == "" {
 		return nil, apperr.ValidationError
+	}
+
+	// Rule 4, dan ini SATU-SATUNYA tempatnya ditegakkan.
+	//
+	// Diperiksa SEBELUM apa pun yang lain, termasuk sebelum membaca barisnya: petugas
+	// yang terminalnya belum aktif tidak boleh bisa mengetahui queue_id mana yang sah
+	// dari selisih pesan error.
+	//
+	// Sebelum gerbang ini ada, seluruh layar kesiapan hanyalah animasi — server tidak
+	// tahu apa pun tentang terminal, jadi petugas yang menyunting state klien tetap bisa
+	// mengambil panggilan.
+	if s.terminals != nil {
+		if agent.TerminalID == "" {
+			return nil, apperr.TerminalNotOnline
+		}
+		if err := s.terminals.AssertOnline(ctx, agent.TerminalID, agent.EmployeeID); err != nil {
+			return nil, err
+		}
 	}
 
 	vc, err := s.videoCalls.FindByQueueID(ctx, queueID)
@@ -765,6 +915,13 @@ func (s *VideoCallService) notifyNasabah(sessionID string, msg SignalMessage) {
 	s.notifier.SendToNasabah(sessionID, msg)
 }
 
+func (s *VideoCallService) notifyAgent(sessionID string, msg SignalMessage) {
+	if s.notifier == nil {
+		return
+	}
+	s.notifier.SendToAgent(sessionID, msg)
+}
+
 // agentDisplayName memilih nama yang paling berarti untuk `call_ended`.
 //
 // Rekaman panggilan menang atas identitas pelapor: nama itulah yang sudah dilihat nasabah
@@ -823,6 +980,16 @@ func (s *VideoCallService) releaseCall(ctx context.Context, vc *VideoCall, reaso
 		"reason":   reason,
 		"agent":    vc.AgentEmployeeID,
 	}, "", "")
+
+	// Panggilan yang dilepas BUKAN panggilan yang diselesaikan petugas: nasabahnya
+	// membatalkan sesi, atau barisnya basi. Kalau petugas sedang di dalamnya, dia harus
+	// tahu — dan hanya dari sini, karena tidak ada response HTTP yang akan memberitahunya.
+	s.notifyAgent(vc.SessionID, SignalMessage{
+		Type:      SignalCallEnded,
+		SessionID: vc.SessionID,
+		QueueID:   vc.QueueID,
+		Reason:    reason,
+	})
 }
 
 // CancelForSession membatalkan panggilan hidup milik sebuah sesi. Memenuhi
@@ -909,10 +1076,176 @@ func (s *VideoCallService) isWithinOperatingHours() bool {
 	return hour >= 6 && hour < 22
 }
 
+// DefaultOperatingHours adalah jam layanan video call, 06:00-22:00 WIB.
+//
+// Diekspor supaya handler jadwal bisa menyertakannya di response tanpa menanamkan
+// jamnya sendiri — dua tempat yang menuliskan "06:00" akan berbeda pada perubahan
+// pertama.
+func DefaultOperatingHours() OperatingHours {
+	return defaultOperatingHours()
+}
+
 func defaultOperatingHours() OperatingHours {
 	return OperatingHours{
 		Start:    "06:00",
 		End:      "22:00",
 		Timezone: "Asia/Jakarta",
 	}
+}
+
+// --- Penjadwalan ulang video call ---
+
+// Batas penjadwalan.
+const (
+	// scheduleMaxAhead: 7 hari. Jadwal yang lebih jauh hampir selalu terlupakan, dan
+	// sesi onboarding-nya sendiri kedaluwarsa dalam 24 jam — jadwal bulan depan adalah
+	// janji untuk sesi yang sudah tidak ada.
+	scheduleMaxAhead = 7 * 24 * time.Hour
+
+	// scheduleMinAhead: 15 menit. Menjadwalkan "satu menit dari sekarang" adalah cara
+	// berbelit untuk mengantre, dan tidak memberi waktu siapa pun bersiap.
+	scheduleMinAhead = 15 * time.Minute
+
+	operatingStartHour = 6
+	operatingEndHour   = 22
+)
+
+// ScheduleVideoCall mencatat janji video call untuk sebuah sesi.
+//
+// Ada karena tombol "Jadwalkan Panggilan Nanti" di aplikasi Android selama ini dimatikan:
+// tidak ada endpoint yang melayaninya, jadi nasabah yang membuka rekening di luar jam
+// operasional tidak punya pilihan selain menunggu atau pergi.
+//
+// Menjadwalkan TIDAK mengeluarkan nasabah dari antrean dan tidak memasukkannya. Ia janji,
+// bukan tempat — nasabah tetap harus memanggil /video-call/queue saat waktunya datang.
+// Membuat jadwal yang otomatis mengantre menuntut penjadwal sisi server yang belum ada,
+// dan antrean yang terisi tanpa ada nasabah di socketnya akan dilayani petugas ke ruang
+// kosong.
+func (s *VideoCallService) ScheduleVideoCall(ctx context.Context, req ScheduleVideoCallRequest, ipAddress, userAgent string) (*ScheduleVideoCallResponse, error) {
+	if req.SessionID == "" || req.ScheduledAt == "" {
+		return nil, apperr.ValidationError
+	}
+	if s.schedules == nil {
+		return nil, apperr.ProviderNotConfigured
+	}
+
+	// RFC 3339 dengan offset wajib. Waktu tanpa offset bisa berarti dua jam berbeda, dan
+	// yang salah tafsir adalah janji dengan nasabah.
+	scheduledAt, err := time.Parse(time.RFC3339, req.ScheduledAt)
+	if err != nil {
+		return nil, apperr.ValidationError
+	}
+
+	session, err := s.resolveSession(ctx, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	if session.IsExpired() {
+		return nil, apperr.OnboardingSessionExpired
+	}
+
+	// Hanya sesi yang memang sedang di langkah VIDEO_CALL. Menjadwalkan dari langkah
+	// lain menghasilkan janji yang tidak bisa ditepati: nasabah belum lulus biometrik,
+	// atau sudah lewat panggilannya.
+	if session.CurrentStep != StepVideoCall {
+		return nil, apperr.OnboardingIncomplete
+	}
+
+	if err := s.validateScheduleTime(scheduledAt); err != nil {
+		return nil, err
+	}
+
+	sch := &VideoCallSchedule{
+		ID:          uuid.New(),
+		ScheduleID:  "vcs_" + uuid.New().String()[:16],
+		SessionID:   req.SessionID,
+		ScheduledAt: scheduledAt.UTC(),
+		Status:      VCScheduleScheduled,
+		CreatedAt:   s.clock(),
+	}
+
+	// Jadwal ganda ditahan unique index di database, bukan SELECT lebih dulu: dua
+	// permintaan bersamaan akan sama-sama melihat "belum ada jadwal".
+	if err := s.schedules.Create(ctx, sch); err != nil {
+		return nil, err
+	}
+
+	s.writeAudit(ctx, req.SessionID, AuditVideoCallScheduled, "nasabah", map[string]any{
+		"schedule_id":  sch.ScheduleID,
+		"scheduled_at": sch.ScheduledAt,
+	}, ipAddress, userAgent)
+
+	return &ScheduleVideoCallResponse{
+		ScheduleID:     sch.ScheduleID,
+		SessionID:      sch.SessionID,
+		ScheduledAt:    sch.ScheduledAt,
+		Status:         string(sch.Status),
+		OperatingHours: defaultOperatingHours(),
+	}, nil
+}
+
+// CancelVideoCallSchedule membatalkan jadwal aktif sebuah sesi.
+func (s *VideoCallService) CancelVideoCallSchedule(ctx context.Context, sessionID, ipAddress, userAgent string) error {
+	if sessionID == "" {
+		return apperr.ValidationError
+	}
+	if s.schedules == nil {
+		return apperr.ProviderNotConfigured
+	}
+
+	// Sesi tetap diverifikasi: tanpa ini, session_id siapa pun bisa dibatalkan oleh
+	// siapa pun yang menebaknya.
+	if _, err := s.resolveSession(ctx, sessionID); err != nil {
+		return err
+	}
+
+	cancelled, err := s.schedules.CancelBySessionID(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if !cancelled {
+		return apperr.VideoCallScheduleNotFound
+	}
+
+	s.writeAudit(ctx, sessionID, AuditVideoCallScheduleCancelled, "nasabah", nil, ipAddress, userAgent)
+	return nil
+}
+
+// GetVideoCallSchedule mengembalikan jadwal aktif sebuah sesi, atau nil kalau tidak ada.
+func (s *VideoCallService) GetVideoCallSchedule(ctx context.Context, sessionID string) (*VideoCallSchedule, error) {
+	if s.schedules == nil {
+		return nil, nil
+	}
+	return s.schedules.FindActiveBySessionID(ctx, sessionID)
+}
+
+// validateScheduleTime memeriksa waktu yang diminta terhadap jam operasional dan batas.
+//
+// Jamnya dihitung dalam zona Asia/Jakarta, BUKAN zona yang dikirim client dan bukan zona
+// server: "pukul 08:00" di layar nasabah berarti 08:00 WIB, dan jadwal yang divalidasi
+// di UTC akan menerima pukul 03:00 WIB sebagai sah.
+func (s *VideoCallService) validateScheduleTime(at time.Time) error {
+	now := s.clock()
+
+	if at.Before(now.Add(scheduleMinAhead)) {
+		return apperr.VideoCallScheduleInvalid
+	}
+	if at.After(now.Add(scheduleMaxAhead)) {
+		return apperr.VideoCallScheduleInvalid
+	}
+
+	loc, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		// Tanpa basis data zona waktu, jam operasional tidak bisa diperiksa. Menolak,
+		// bukan meluluskan: jadwal di pukul tiga pagi lebih buruk daripada tombol yang
+		// menjawab "coba lagi".
+		slog.Error("load Asia/Jakarta failed; rejecting schedule", "error", err)
+		return apperr.VideoCallScheduleInvalid
+	}
+
+	wib := at.In(loc)
+	if wib.Hour() < operatingStartHour || wib.Hour() >= operatingEndHour {
+		return apperr.VideoCallScheduleInvalid
+	}
+	return nil
 }

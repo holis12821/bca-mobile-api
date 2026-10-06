@@ -469,26 +469,43 @@ func seedCSAgents(ctx context.Context, pool *pgxpool.Pool, hash func(string) str
 		return
 	}
 
-	const (
-		employeeID = "CS-1042"
-		name       = "Sarah Adisti"
-		devAPIKey  = "dev-agent-key"
-	)
+	// Dua petugas dengan cakupan berbeda, bukan satu yang memegang keduanya: pemisahan
+	// kewenangan yang tidak pernah diuji terpisah akan terlihat berfungsi sampai orang
+	// pertama yang hanya punya satu scope mencobanya.
+	agents := []struct {
+		employeeID string
+		name       string
+		apiKey     string
+		scopes     []string
+	}{
+		{"CS-1042", "Sarah Adisti", "dev-agent-key", []string{"VIDEO_CALL"}},
+		{"OPS-2001", "Budi Hartono", "dev-cardadmin-key", []string{"CARD_ADMIN"}},
 
-	_, err := pool.Exec(ctx, `
-		INSERT INTO cs_agents (employee_id, name, api_key_hash, is_active)
-		VALUES ($1, $2, $3, true)
-		ON CONFLICT (employee_id) DO UPDATE
-		SET name = EXCLUDED.name,
-		    api_key_hash = EXCLUDED.api_key_hash,
-		    is_active = true,
-		    updated_at = now()`,
-		employeeID, name, hash(devAPIKey),
-	)
-	if err != nil {
-		log.Fatalf("seed cs_agents: %v", err)
+		// Penyelia memegang beberapa cakupan sekaligus. Ada di seed supaya jalur
+		// multi-scope ikut terlatih: petugas satu-cakupan tidak pernah membuktikan
+		// bahwa pemeriksaannya benar untuk yang memegang lebih dari satu.
+		{"SPV-3001", "Rina Kusuma", "dev-spv-key",
+			[]string{"VIDEO_CALL", "CUSTOMER_PII", "TICKET"}},
 	}
-	log.Printf("cs agent: %s (%s), X-Agent-API-Key: %s", employeeID, name, devAPIKey)
+
+	for _, a := range agents {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO cs_agents (employee_id, name, api_key_hash, scopes, is_active)
+			VALUES ($1, $2, $3, $4, true)
+			ON CONFLICT (employee_id) DO UPDATE
+			SET name = EXCLUDED.name,
+			    api_key_hash = EXCLUDED.api_key_hash,
+			    scopes = EXCLUDED.scopes,
+			    is_active = true,
+			    updated_at = now()`,
+			a.employeeID, a.name, hash(a.apiKey), a.scopes,
+		)
+		if err != nil {
+			log.Fatalf("seed cs_agents: %v", err)
+		}
+		log.Printf("cs agent: %s (%s), scopes=%v, X-Agent-API-Key: %s",
+			a.employeeID, a.name, a.scopes, a.apiKey)
+	}
 }
 
 // tierOf memetakan tier kosong ke REGULER. Kolom users.tier NOT NULL, dan

@@ -29,6 +29,11 @@ type SessionRepository interface {
 	// CountActiveByDevice counts non-deleted, non-expired sessions for a device
 	// created within the given window.
 	CountActiveByDevice(ctx context.Context, deviceID string, since time.Time) (int, error)
+
+	// ListForCS mengembalikan sesi untuk layar pemantauan petugas, terurut
+	// created_at DESC, id DESC. Mengembalikan limit+1 baris supaya pemanggil bisa
+	// menghitung has_more tanpa COUNT terpisah.
+	ListForCS(ctx context.Context, filter ListCSSessionsFilter) ([]*Session, error)
 }
 
 // SessionCache defines onboarding session caching in Redis.
@@ -79,6 +84,37 @@ type OCRRateLimiter interface {
 	// CheckOCRAttempt checks and increments the OCR attempt counter.
 	// Returns true if the request is allowed.
 	CheckOCRAttempt(ctx context.Context, sessionID string) (allowed bool, err error)
+}
+
+// VideoCallEscalationRepository menyimpan perkara yang dieskalasi dari NEED_REVIEW.
+type VideoCallEscalationRepository interface {
+	// Create menyisipkan eskalasi baru.
+	//
+	// Mengembalikan apperr.VideoCallEscalationExists kalau sesi itu sudah punya eskalasi
+	// terbuka — dijawab dari pelanggaran unique index, bukan SELECT lebih dulu.
+	Create(ctx context.Context, esc *VideoCallEscalation) error
+
+	// FindOpenBySessionID mengembalikan eskalasi yang masih PENDING atau IN_REVIEW,
+	// atau nil, nil. Dibaca penjaga JoinQueue pada setiap percobaan antre.
+	FindOpenBySessionID(ctx context.Context, sessionID string) (*VideoCallEscalation, error)
+}
+
+// VideoCallScheduleRepository menyimpan janji video call.
+type VideoCallScheduleRepository interface {
+	// Create menyisipkan jadwal baru.
+	//
+	// Mengembalikan apperr.VideoCallAlreadyScheduled kalau sesi itu sudah punya jadwal
+	// aktif — dijawab dari pelanggaran unique index, BUKAN dari SELECT lebih dulu: dua
+	// permintaan bersamaan akan sama-sama lolos pemeriksaan itu, dan yang menahannya
+	// hanya index.
+	Create(ctx context.Context, sch *VideoCallSchedule) error
+
+	// FindActiveBySessionID mengembalikan jadwal aktif sebuah sesi, atau nil, nil.
+	FindActiveBySessionID(ctx context.Context, sessionID string) (*VideoCallSchedule, error)
+
+	// CancelBySessionID membatalkan jadwal aktif sebuah sesi.
+	// Mengembalikan false kalau tidak ada yang dibatalkan.
+	CancelBySessionID(ctx context.Context, sessionID string) (bool, error)
 }
 
 // PersonalDataRepository persists onboarding personal data.

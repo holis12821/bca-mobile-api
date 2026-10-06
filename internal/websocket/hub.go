@@ -175,6 +175,20 @@ func (h *Hub) SendToNasabah(sessionID string, msg onboarding.SignalMessage) {
 	h.SendToSession(sessionID, RoleNasabah, msg)
 }
 
+// SendToAgent mengirim pesan ke sisi petugas sebuah sesi.
+//
+// Ada karena `call_ended` dulu hanya dikirim ke nasabah: petugas yang nasabahnya menutup
+// panggilan lebih dulu tidak melihat apa pun selain socket yang tiba-tiba sunyi, dan
+// aplikasi desktop tidak punya cara membedakan panggilan yang selesai dari jaringan yang
+// putus. Dua keadaan itu menuntut tindakan yang berbeda dari petugas.
+//
+// Berpasangan dengan [Hub.SendToNasabah] dan dipenuhi secara struktural oleh antarmuka
+// di lapisan domain, dengan alasan yang sama: `onboarding` tidak boleh meng-import paket
+// ini.
+func (h *Hub) SendToAgent(sessionID string, msg onboarding.SignalMessage) {
+	h.SendToSession(sessionID, RoleAgent, msg)
+}
+
 // HasRole melaporkan apakah sisi [role] sebuah sesi sedang tersambung.
 //
 // Dipakai untuk memutuskan apakah `agent_assigned` perlu ditahan: nasabah yang belum

@@ -191,6 +191,49 @@ Di Postman, set `base_url` ke `https://<host>/v1`.
 | POST | `/v1/registration/upload-document` | **Deprecated** — use `/v1/onboarding/*` |
 | POST | `/v1/registration/complete` | **Deprecated** — use `/v1/onboarding/*` |
 
+### Operator / CS endpoints (`/internal/v1`)
+
+Behind three guards: `X-Internal-API-Key` (which system), `X-Agent-Employee-ID` +
+`X-Agent-API-Key` (which agent, Argon2id against `cs_agents`), and the agent's
+`scopes` (what they may do). Full contract in `docs/01-API-SPECIFICATION.md` §11;
+client-side guidance in `.claude/skills/cs-desktop-api-integration/SKILL.md`.
+
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/internal/v1/onboarding/sessions` | `VIDEO_CALL` | Onboarding sessions for the CS monitoring screen — **carries no PII** |
+| GET | `/internal/v1/onboarding/sessions/{session_id}` | `CUSTOMER_PII` | One session plus masked personal data; writes `CS_SESSION_VIEWED` to the audit trail |
+| GET | `/internal/v1/customers?q=` | `CUSTOMER_PII` | Find a customer by **exact** account number or phone. No name search, no partial match |
+| GET | `/internal/v1/customers/{user_id}` | `CUSTOMER_PII` | Customer profile (masked; **no balance**); writes `cs_access_logs` |
+| POST,GET | `/internal/v1/tickets` | `TICKET` | Create / list service tickets |
+| GET,PATCH | `/internal/v1/tickets/{ticket_number}` | `TICKET` | Ticket detail / update. Addressed by `TKT-YYYYMMDD-NNNNNN`, not UUID |
+| POST | `/internal/v1/tickets/{ticket_number}/notes` | `TICKET` | Add a follow-up note |
+| GET,PUT | `/internal/v1/cards`, `/cards/{card_type}`, `/products/{product_type}/cards/{card_type}` | `CARD_ADMIN` | Paspor card catalogue admin |
+
+> **Breaking change:** `/internal/v1/cards` used to accept `X-Internal-API-Key`
+> alone. It now also requires the two agent headers, and the agent's row in
+> `cs_agents` must carry the `CARD_ADMIN` scope. Callers sending only the system
+> key get `403`.
+
+Customer-facing video call rescheduling (serves the Android "Jadwalkan Panggilan
+Nanti" button, which was disabled until these existed):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/onboarding/video-call/schedule` | Book a slot. `scheduled_at` must carry a timezone offset; 06:00–22:00 WIB, 15 min–7 days ahead |
+| GET | `/v1/onboarding/video-call/schedule?session_id=` | Active booking, or `schedule: null` — **not 404** |
+| DELETE | `/v1/onboarding/video-call/schedule?session_id=` | Cancel, so the customer can rebook |
+
+Booking does **not** put the customer in the queue. It is a promise, not a place —
+they still call `/video-call/queue` when the time comes.
+
+Development agent credentials (`make seed`, gated on `APP_ENV=development`):
+
+| `X-Agent-Employee-ID` | `X-Agent-API-Key` | Scopes |
+|---|---|---|
+| `CS-1042` | `dev-agent-key` | `VIDEO_CALL` |
+| `OPS-2001` | `dev-cardadmin-key` | `CARD_ADMIN` |
+| `SPV-3001` | `dev-spv-key` | `VIDEO_CALL`, `CUSTOMER_PII`, `TICKET` |
+
 `/v1/registration/*` and `/v1/onboarding/*` describe the same feature with two
 contracts. `/v1/onboarding/*` is the one the Android app implements and the one
 that is maintained; the registration family still works for older builds and

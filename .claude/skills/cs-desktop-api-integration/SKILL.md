@@ -1,6 +1,6 @@
 ---
 name: cs-desktop-api-integration
-description: Integrasi API untuk aplikasi desktop petugas CS Halo BCA — tujuh endpoint sisi CS (`GET /v1/onboarding/video-call/queued`, `POST /video-call/agent-token`, `GET /video-call/signal`, `POST /video-call/result`, `GET /sessions/{id}/audit`, `GET /monitoring`, `/internal/v1/cards`), autentikasi dua lapis `X-Internal-API-Key` + `X-Agent-Employee-ID`/`X-Agent-API-Key`, WebSocket signaling dari sudut pandang agent, WebRTC sisi answerer, dan submit hasil verifikasi e-KYC. Gunakan saat membangun atau men-debug aplikasi desktop/klien CS yang memakai API ini, merancang autentikasi petugas CS, menyambungkan antrean video call ke layar petugas, atau menjawab "endpoint CS apa yang tersedia hari ini". Trigger juga pada "aplikasi desktop CS", "petugas CS", "Halo BCA desktop", "X-Agent-API-Key", "X-Agent-Employee-ID", "cs_agents", "INTERNAL_API_KEY", "agent-token", "video-call/queued", "signaling_url", "ice_servers", "call_duration_seconds", "recording_id", "AGENT_AUTH_UNAVAILABLE", "VIDEO_CALL_NOT_ACTIVE", dan "antrean petugas". JANGAN dipakai untuk mengubah server video call itu sendiri — service, hub, atau migrasi (itu `buka-rekening-video-call-backend`), OCR/biometrik/kredensial/submit (itu `buka-rekening-backend`), OTP onboarding (itu `buka-rekening-otp`), katalog kartu sisi nasabah (itu `buka-rekening-kartu`), atau sisi WebRTC Android nasabah (project `BcaMobile`).
+description: Integrasi API untuk aplikasi desktop petugas CS Halo BCA — empat belas endpoint sisi operator: video call e-KYC (`video-call/queued`, `agent-token`, `signal`, `result`), pemantauan sesi onboarding (`GET /internal/v1/onboarding/sessions` dan `/sessions/{id}` berisi PII tersamar), pencarian & profil nasabah (`/internal/v1/customers`), tiket layanan (`/internal/v1/tickets`), administrasi katalog kartu, serta penjadwalan ulang video call sisi nasabah. Autentikasi tiga lapis: `X-Internal-API-Key` (sistem), `X-Agent-Employee-ID` + `X-Agent-API-Key` (petugas, Argon2id ke `cs_agents`), dan cakupan `cs_agents.scopes` — `VIDEO_CALL`, `CUSTOMER_PII`, `CARD_ADMIN`, `TICKET`. Juga memuat protokol WebSocket signaling dari sudut pandang agent, WebRTC sisi answerer, kebijakan penyamaran PII, dan jejak akses `cs_access_logs`. Gunakan saat membangun atau men-debug aplikasi desktop/klien CS yang memakai API ini, merancang kewenangan petugas CS, menyambungkan antrean atau pemantauan sesi ke layar petugas, atau menjawab "endpoint CS apa yang tersedia hari ini". Trigger juga pada "aplikasi desktop CS", "petugas CS", "Halo BCA desktop", "X-Agent-API-Key", "X-Agent-Employee-ID", "cs_agents", "scopes petugas", "CUSTOMER_PII", "CARD_ADMIN", "INTERNAL_API_KEY", "agent-token", "video-call/queued", "signaling_url", "ice_servers", "nik_masked", "cs_access_logs", "pencarian nasabah", "profil nasabah untuk CS", "tiket layanan", "ticket_number", "TICKET_INVALID_TRANSITION", "jadwalkan panggilan nanti", "VIDEO_CALL_SCHEDULE_INVALID", "AGENT_AUTH_UNAVAILABLE", "VIDEO_CALL_NOT_ACTIVE", dan "antrean petugas". JANGAN dipakai untuk mengubah server video call itu sendiri — service, hub, atau migrasi (itu `buka-rekening-video-call-backend`), OCR/biometrik/kredensial/submit (itu `buka-rekening-backend`), OTP onboarding (itu `buka-rekening-otp`), katalog kartu sisi nasabah (itu `buka-rekening-kartu`), atau sisi WebRTC Android nasabah (project `BcaMobile`).
 ---
 
 # Integrasi API — Aplikasi Desktop Petugas CS Halo BCA
@@ -80,7 +80,7 @@ Dibandingkan constant-time (`subtle.ConstantTimeCompare`). `INTERNAL_API_KEY`
 kosong **menolak semua permintaan**, bukan menerima header kosong; dan
 `config.Validate` menolak start proses produksi tanpa kunci itu.
 
-**Lapis 2 — petugas (`middleware.AgentAuth`), hanya di dua endpoint yang
+**Lapis 2 — petugas (`middleware.AgentAuth`), di setiap jalur operator yang
 mengatribusikan tindakan ke orang:**
 
 ```
@@ -94,6 +94,28 @@ PHC yang sama dengan `users.pin_hash`. Hanya baris `is_active = true` yang
 dicari; mencabut hak petugas = set `is_active = false`, bukan hapus baris, supaya
 panggilan lama tetap punya rujukan namanya.
 
+**Lapis 3 — cakupan (`cs_agents.scopes`), menentukan boleh melakukan APA:**
+
+| Cakupan | Membuka |
+|---|---|
+| `VIDEO_CALL` | ambil panggilan, submit hasil, antrean, daftar sesi onboarding |
+| `CUSTOMER_PII` | detail sesi berisi data pribadi, pencarian & profil nasabah |
+| `CARD_ADMIN` | administrasi katalog kartu Paspor |
+| `TICKET` | tiket layanan |
+
+Cakupannya diminta di titik pasang rute, bukan dibaca di handler, jadi sebuah endpoint
+operator tidak bisa terpasang tanpa menyatakan kewenangan yang dituntutnya.
+
+`CUSTOMER_PII` **dipisah** dari `VIDEO_CALL` meski aplikasi desktop yang sama memakai
+keduanya: melayani panggilan menampilkan nasabah yang *sedang* bicara, sementara membuka
+data pribadi menjangkau nasabah mana pun yang pernah mendaftar.
+
+Satu petugas boleh memegang beberapa cakupan. Penyelia biasanya memegang `VIDEO_CALL`,
+`CUSTOMER_PII`, dan `TICKET` sekaligus; petugas panggilan biasa hanya `VIDEO_CALL`.
+Aplikasi desktop **tidak bisa menanyakan cakupannya** — ia mengetahuinya dari endpoint
+mana yang dijawab `403`, jadi sembunyikan menu yang ditolak, jangan tampilkan tombol yang
+pasti gagal.
+
 Yang harus dipahami sebelum merancang autentikasi aplikasi desktop:
 
 1. **Identitas petugas sekarang diverifikasi.** `agent_employee_id` dan
@@ -105,21 +127,26 @@ Yang harus dipahami sebelum merancang autentikasi aplikasi desktop:
 2. **Urutan penjaganya bukan selera.** `AgentAuth` dipasang **setelah**
    `InternalAPIKey` karena verifikasi Argon2 mahal (64 MB × 4 thread) dan tidak
    boleh bisa dipicu lalu lintas yang belum membuktikan dirinya sebagai sistem CS.
-3. **`INTERNAL_API_KEY` masih satu kunci bersama untuk seluruh `/internal/v1`** —
-   termasuk administrasi katalog kartu. Cakupan kewenangan terpisah untuk video
-   call vs administrasi katalog **belum ada** (§5).
+3. **`INTERNAL_API_KEY` masih satu kunci bersama**, tapi ia tidak lagi menentukan
+   kewenangan: yang membuka jalur tertentu adalah cakupan petugasnya. Kunci sistem hanya
+   menjawab "sistem mana yang memanggil".
 4. **Penjaga ini tidak fail-open.** Postgres yang tersendat dijawab
    `503 AGENT_AUTH_UNAVAILABLE`, bukan diluluskan: jalur yang menentukan siapa
    bertanggung jawab atas sebuah verifikasi tidak boleh pernah fail-open.
    `lookup` yang nil (perakitan rute salah) menolak semuanya.
 
-**Kredensial petugas untuk development.** `make seed` menanam satu petugas,
-**digerbangi `APP_ENV=development`**:
+**Kredensial petugas untuk development.** `make seed` menanam tiga petugas dengan
+cakupan berbeda, **digerbangi `APP_ENV=development`**:
 
-```
-X-Agent-Employee-ID: CS-1042
-X-Agent-API-Key:     dev-agent-key     (nama: Sarah Adisti)
-```
+| `X-Agent-Employee-ID` | `X-Agent-API-Key` | Nama | Cakupan |
+|---|---|---|---|
+| `CS-1042` | `dev-agent-key` | Sarah Adisti | `VIDEO_CALL` |
+| `OPS-2001` | `dev-cardadmin-key` | Budi Hartono | `CARD_ADMIN` |
+| `SPV-3001` | `dev-spv-key` | Rina Kusuma | `VIDEO_CALL`, `CUSTOMER_PII`, `TICKET` |
+
+Tiga, bukan satu yang memegang semuanya: pemisahan kewenangan yang tidak pernah diuji
+terpisah akan terlihat berfungsi sampai orang pertama yang hanya punya satu scope
+mencobanya.
 
 Di luar development, baris `cs_agents` dibuat oleh yang mengoperasikan integrasi
 CS dengan kunci acak, lewat jalur yang sama dengan pendistribusian
@@ -156,23 +183,34 @@ backend — tampilkan di keadaan gagal.
 
 ## 2. Endpoint yang tersedia hari ini
 
-Tujuh, dan hanya tujuh.
-
 | # | Method | Path | Penjaga | Guna |
 |---|---|---|---|---|
 | 1 | GET | `/v1/onboarding/video-call/queued` | internal key | Daftar antrean yang menunggu |
-| 2 | POST | `/v1/onboarding/video-call/agent-token` | internal key **+ agent** | Ambil panggilan, dapat `signaling_url` |
+| 2 | POST | `/v1/onboarding/video-call/agent-token` | + agent `VIDEO_CALL` | Ambil panggilan, dapat `signaling_url` |
 | 3 | GET | `/v1/onboarding/video-call/signal?token=` | token sekali pakai | WebSocket signaling (role agent) |
-| 4 | POST | `/v1/onboarding/video-call/result` | internal key **+ agent** | Submit hasil verifikasi |
+| 4 | POST | `/v1/onboarding/video-call/result` | + agent `VIDEO_CALL` | Submit hasil verifikasi |
 | 5 | GET | `/v1/onboarding/sessions/{session_id}/audit` | internal key | Jejak audit satu sesi |
 | 6 | GET | `/v1/onboarding/monitoring` | internal key | Hitungan sesi, panjang antrean, peringatan |
-| 7 | GET/PUT | `/internal/v1/cards`, `/cards/{card_type}`, `/products/{product_type}/cards/{card_type}` | internal key | Administrasi katalog kartu |
+| 7 | GET/PUT | `/internal/v1/cards`, `/cards/{card_type}`, `/products/{product_type}/cards/{card_type}` | + agent `CARD_ADMIN` | Administrasi katalog kartu |
+| 8 | GET | `/internal/v1/onboarding/sessions` | + agent `VIDEO_CALL` | Daftar sesi onboarding (tanpa PII) |
+| 9 | GET | `/internal/v1/onboarding/sessions/{session_id}` | + agent `CUSTOMER_PII` | Detail sesi + data pribadi tersamar |
+| 10 | GET | `/internal/v1/customers?q=` | + agent `CUSTOMER_PII` | Cari nasabah (cocok persis) |
+| 11 | GET | `/internal/v1/customers/{user_id}` | + agent `CUSTOMER_PII` | Profil nasabah |
+| 12 | POST/GET | `/internal/v1/tickets` | + agent `TICKET` | Buat / daftar tiket |
+| 13 | GET/PATCH | `/internal/v1/tickets/{ticket_number}` | + agent `TICKET` | Detail / ubah tiket |
+| 14 | POST | `/internal/v1/tickets/{ticket_number}/notes` | + agent `TICKET` | Catatan tindak lanjut |
 
-Nomor 3 **tidak** memakai header apa pun — penjaganya token sekali pakai di
-query string. Nomor 1, 5, dan 6 sengaja **hanya** berpenjaga kunci sistem:
-melihat antrean, jejak audit, dan kesehatan sistem adalah tindakan
-sistem/pengawas, tidak ada yang diatribusikan ke seseorang. Nomor 2 dan 4 jelas
-tindakan seseorang, jadi butuh kedua lapis.
+Nomor 3 **tidak** memakai header apa pun — penjaganya token sekali pakai di query string.
+Nomor 1, 5, dan 6 sengaja **hanya** berpenjaga kunci sistem: melihat antrean, jejak audit,
+dan kesehatan sistem adalah tindakan sistem/pengawas, tidak ada yang diatribusikan ke
+seseorang. Sisanya jelas tindakan seseorang.
+
+**Dua prefix, dan bedanya nyata.** Endpoint CS yang lebih tua ada di `/v1/onboarding/*`
+dan ikut terkena rate limit, body limit, serta CORS jalur nasabah. Yang lebih baru ada di
+`/internal/v1/*` dan tidak. Endpoint CS berikutnya menyusul ke `/internal/v1`.
+
+Nomor 8–14 dirinci di `docs/01-API-SPECIFICATION.md` §11; di bawah hanya yang berkaitan
+langsung dengan satu panggilan video.
 
 ### 2.1 `GET /video-call/queued`
 
@@ -288,9 +326,20 @@ Satu amplop JSON untuk semua, bidang yang tidak relevan dihilangkan.
 | `ice_candidate` | `candidate{…}` | Kandidat dari nasabah |
 | `media_control` | `action` | Nasabah membisukan diri / ganti kamera |
 
-Tiga jenis pesan — `queue_update`, `agent_assigned`, `call_ended` — hanya
-dikirim ke **nasabah**, tidak ke petugas (`SignalingNotifier` hanya punya
-`SendToNasabah`). Abaikan kalau muncul.
+Dua jenis pesan — `queue_update` dan `agent_assigned` — hanya dikirim ke **nasabah**.
+Abaikan kalau muncul.
+
+**`call_ended` sekarang sampai ke petugas juga**, dan aplikasi desktop harus
+menanganinya — itu penanda sah untuk membongkar `PeerConnection`, tanpa perlu menebak dari
+response HTTP yang mungkin terlewat:
+
+| Bidang | Arti |
+|---|---|
+| `result` terisi (`APPROVED`/`REJECTED`) | Hasil submit, termasuk submit petugas itu sendiri |
+| `reason` terisi, `result` kosong | Panggilan **dilepas**: nasabah membatalkan sesinya, atau barisnya basi |
+
+Bedakan keduanya di UI: yang pertama berarti isi hasil verifikasi sudah tercatat, yang
+kedua berarti kembali ke antrean karena lawan bicaranya sudah tidak ada.
 
 `type` yang tidak dikenal **dicatat lalu diabaikan**, jangan memutus socket:
 server dan client berevolusi terpisah, dan satu pesan asing tidak boleh
@@ -445,6 +494,7 @@ bukan oleh pesan dari petugas.
 |---|---|---|
 | `X-Internal-API-Key` salah atau kosong | `403 FORBIDDEN` | Kembali ke layar masuk, sebut bahwa kunci sistemnya yang ditolak |
 | Kredensial petugas salah, atau petugas `is_active = false` | `403 FORBIDDEN` | Minta petugas masuk ulang; kalau berulang, barisnya di `cs_agents` yang perlu diperiksa |
+| Cakupan petugas kurang untuk jalur itu | `403 FORBIDDEN` | **Tidak terbedakan dari kredensial salah di response.** Sembunyikan menu yang pernah ditolak, jangan coba lagi. Yang perlu diperbaiki: `scopes` di barisnya |
 | Header petugas tidak dikirim di `agent-token`/`result` | `403 FORBIDDEN` | Bug aplikasi — kedua header wajib di dua endpoint itu |
 | Postgres tersendat saat verifikasi petugas | `503 AGENT_AUTH_UNAVAILABLE` | Boleh dicoba lagi dengan backoff. Ini masalah infrastruktur, bukan kredensial |
 | Panggilan sudah diambil petugas lain | `422 VIDEO_CALL_NOT_ACTIVE` | Muat ulang antrean, **jangan** coba lagi |
@@ -470,24 +520,24 @@ menebak kunci mana yang sudah benar. Aplikasi desktop harus mengandalkan
 
 ## 5. Yang belum ada di backend
 
-Daftar pekerjaan backend yang dibutuhkan tiap layar yang belum punya API. Tanpa
-ini, layar 8 dan 9 di berkas desain tidak bisa dibangun.
+Daftar ini **sudah banyak berkurang**. Yang masih kosong:
 
 | Kebutuhan | Endpoint yang belum ada | Catatan |
 |---|---|---|
-| Autentikasi petugas berbasis direktori pegawai | `POST /internal/v1/auth/*` | Kredensial per petugas **sudah ada** (`cs_agents` + Argon2), tapi masih kunci statis yang didistribusikan manual. OIDC ke direktori pegawai, rotasi, dan sesi bertenggat belum ada |
-| Cakupan kewenangan terpisah | — | `INTERNAL_API_KEY` masih membuka video call **dan** administrasi katalog dengan satu kunci |
-| Daftar sesi onboarding | `GET /internal/v1/onboarding/sessions` | `/monitoring` hanya memberi hitungan |
-| Detail sesi untuk CS | `GET /internal/v1/onboarding/sessions/{id}` | Endpoint nasabah yang ada **tidak** memuat PII, dan itu memang disengaja |
-| Pencarian nasabah | `GET /internal/v1/customers?q=` | Untuk layar 8 |
-| Profil nasabah untuk CS | `GET /internal/v1/customers/{id}` | Butuh keputusan privasi: bidang mana tersamar, mana bisa dibuka, dan pencatatan aksesnya |
-| Tiket layanan | `/internal/v1/tickets/*` | Untuk layar 9. Tabel dan domainnya belum ada |
-| Penjadwalan ulang video call | `POST /v1/onboarding/video-call/schedule` | Tombol "Jadwalkan Panggilan Nanti" di aplikasi Android **sudah dimatikan** karena ini |
-| `call_ended` ke sisi petugas | — | `SignalingNotifier` hanya punya `SendToNasabah`. Nasabah yang menutup panggilan lebih dulu tidak terlihat di aplikasi desktop selain socket yang tertutup |
+| Autentikasi berbasis direktori pegawai | `POST /internal/v1/auth/*` | Kredensial per petugas **sudah ada** (`cs_agents` + Argon2id + cakupan), tapi kuncinya masih statis dan didistribusikan manual. OIDC, rotasi kunci, dan sesi bertenggat belum ada |
+| Manajemen petugas lewat API | `/internal/v1/agents/*` | Menambah petugas atau mengubah cakupannya sekarang lewat SQL langsung. Tidak menghalangi aplikasi desktop, tapi menghalangi serah terima operasional |
+| `call_ended` ke sisi petugas saat nasabah menutup socket | — | `call_ended` **sudah** dikirim ke dua sisi saat hasil disubmit dan saat panggilan dilepas (sesi dibatalkan / baris basi). Yang belum: nasabah yang socketnya putus begitu saja — belum ada pemicu yang mengubah itu jadi peristiwa |
+| Penjadwalan yang otomatis mengantre | — | `POST /v1/onboarding/video-call/schedule` **sudah ada**, tapi ia janji, bukan tempat: nasabah tetap memanggil `/video-call/queue` saat waktunya. Mengantre otomatis menuntut penjadwal sisi server, dan antrean yang terisi tanpa nasabah di socketnya akan dilayani petugas ke ruang kosong |
+| Daftar jadwal untuk sisi CS | `GET /internal/v1/onboarding/schedules` | Tabelnya sudah ada beserta indeks `idx_vc_schedules_upcoming` ("siapa yang dijadwalkan dalam satu jam ke depan"), tapi belum ada endpoint yang membacanya |
 
-Dua yang paling layak dikerjakan lebih dulu, karena keduanya memperbaiki
-kekurangan yang **sudah terasa** hari ini: cakupan kewenangan terpisah, dan
-`call_ended` ke kedua sisi.
+**Sudah selesai** (dulu ada di daftar ini):
+
+- Cakupan kewenangan terpisah — §1.2
+- `GET /internal/v1/onboarding/sessions` dan `/sessions/{id}` dengan PII tersamar
+- Pencarian nasabah dan profilnya — `/internal/v1/customers*`
+- Tiket layanan — `/internal/v1/tickets*`
+- Penjadwalan ulang video call — tombol "Jadwalkan Panggilan Nanti" **bisa dinyalakan**
+- `call_ended` ke sisi petugas pada submit dan pelepasan panggilan
 
 ---
 
@@ -503,7 +553,11 @@ beredar tidak dipakai:
 | Body `agent-token` memuat `agent_employee_id` + `agent_name` | Body hanya `{ "queue_id": … }` |
 | "`agent_name` secara teknis opsional, isi saja" | Nama datang dari baris `cs_agents`, tidak bisa dikarang pemanggil |
 | "Kunci salah atau kosong → `401`" | `403 FORBIDDEN` (kedua lapis), dan `503 AGENT_AUTH_UNAVAILABLE` saat Postgres tersendat |
-| §5: "Autentikasi per petugas — belum ada" | Sudah ada sebagian; yang belum adalah OIDC/rotasi dan cakupan kewenangan terpisah |
+| §5: "Autentikasi per petugas — belum ada" | Sudah ada; yang belum tinggal OIDC/rotasi kunci |
+| §5: "Cakupan kewenangan terpisah — belum ada" | Sudah ada: `cs_agents.scopes`, empat cakupan |
+| §5: daftar sesi, detail sesi, pencarian & profil nasabah, tiket, penjadwalan ulang | Semuanya **sudah ada** — lihat §2 nomor 8–14 dan `docs/01-API-SPECIFICATION.md` §11–12 |
+| "`call_ended` hanya dikirim ke nasabah" | Sudah dikirim ke **dua sisi** saat submit hasil dan saat panggilan dilepas |
+| "`/internal/v1/cards` dijaga kunci yang sama sehingga ikut terbuka" | Sekarang menuntut petugas ber-scope `CARD_ADMIN`. **Pemanggil lama yang hanya mengirim `X-Internal-API-Key` dijawab `403`** |
 
 ---
 
@@ -516,8 +570,11 @@ beredar tidak dipakai:
 | Alamat per lingkungan | `docs/10-BASE-URL-DAN-ENDPOINT.md` (§2 alamat, §3e signaling, §4 integrasi Android) |
 | Arsitektur video call sisi backend | `.claude/skills/buka-rekening-video-call-backend/SKILL.md` |
 | Sisi nasabah (Android) | project `BcaMobile` → `.claude/skills/buka-rekening-video-call/SKILL.md` |
-| Penjaga auth | `internal/middleware/internal_api_key.go`, `migrations/000026_cs_agents.up.sql` |
+| Penjaga auth & cakupan | `internal/middleware/internal_api_key.go`, `migrations/000026_cs_agents.up.sql`, `migrations/000027_cs_agent_scopes.up.sql` |
 | Seed petugas development | `scripts/seed/main.go` → `seedCSAgents` |
+| Kontrak endpoint operator | `docs/01-API-SPECIFICATION.md` §11 (operator/CS) dan §12 (penjadwalan ulang) |
+| Jejak akses petugas | `migrations/000029_cs_access_logs.up.sql`, `internal/domain/cs/` |
+| Tiket layanan | `migrations/000030_service_tickets.up.sql`, `internal/domain/ticket/` |
 
 Skill `buka-rekening-video-call-backend` adalah rujukan paling dalam untuk
 perilaku server — model Hub/Room, siklus status, dan jebakan di repo ini. Baca

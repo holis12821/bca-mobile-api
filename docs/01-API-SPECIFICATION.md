@@ -1746,6 +1746,264 @@ bisa diperbaiki tanpa rilis.
 
 ---
 
+## 11. Endpoint Operator / CS (`/internal/v1`)
+
+Jalur petugas Halo BCA, bukan jalur nasabah. Di bawah `/internal/v1`, **bukan** `/v1`:
+rate limit, body limit, dan CORS jalur nasabah tidak berlaku untuk jalur operator.
+
+Rujukan paling dalam untuk sisi klien ada di
+`.claude/skills/cs-desktop-api-integration/SKILL.md`.
+
+### Autentikasi — tiga lapis
+
+```
+X-Internal-API-Key: <INTERNAL_API_KEY>     # sistem mana yang memanggil
+X-Agent-Employee-ID: CS-1042               # petugas mana yang bertindak
+X-Agent-API-Key: <kunci petugas>           # buktinya (Argon2id ke tabel cs_agents)
+```
+
+Kunci petugas diverifikasi ke `cs_agents`, dan **cakupan** (`scopes`) menentukan boleh
+melakukan apa. Cakupannya diminta di titik pasang rute, jadi sebuah endpoint operator
+tidak bisa terpasang tanpa menyatakan kewenangan yang dituntutnya.
+
+| Cakupan | Membuka |
+|---|---|
+| `VIDEO_CALL` | ambil panggilan, submit hasil, antrean, daftar sesi onboarding |
+| `CUSTOMER_PII` | detail sesi berisi data pribadi, pencarian & profil nasabah |
+| `CARD_ADMIN` | administrasi katalog kartu Paspor |
+| `TICKET` | tiket layanan |
+
+`CUSTOMER_PII` **dipisah** dari `VIDEO_CALL` meski aplikasi desktop yang sama memakai
+keduanya: melayani panggilan menampilkan nasabah yang *sedang* bicara, sementara membuka
+data pribadi menjangkau nasabah mana pun yang pernah mendaftar.
+
+Kunci sistem salah **dan** kewenangan kurang keduanya dijawab `403 FORBIDDEN` dengan
+pesan identik — disengaja, supaya penyerang tidak bisa menebak kunci mana yang sudah
+benar. Pakai `meta.request_id` dan log server untuk membedakannya.
+
+### `GET /internal/v1/onboarding/sessions`
+
+Scope `VIDEO_CALL`. Daftar sesi onboarding untuk layar pemantauan. **Tidak memuat PII** —
+tidak ada nama, NIK, nomor HP, maupun `device_id`.
+
+Query: `step`, `stalled_for_seconds`, `include_expired` (default `false`), `limit`
+(1–100, default 20), `cursor`.
+
+```json
+{
+  "status": "success",
+  "data": {
+    "sessions": [
+      { "session_id": "onb_9f8e7d6c5b4a", "product_type": "TAHAPAN_BCA",
+        "current_step": "BIOMETRIC", "card_type": "GPN",
+        "steps_completed": { "tnc_accepted": true, "ocr_verified": true },
+        "created_at": "2026-10-05T11:30:00+07:00",
+        "updated_at": "2026-10-05T11:32:00+07:00",
+        "expires_at": "2026-10-06T11:30:00+07:00",
+        "expired": false, "stalled_seconds": 2479 }
+    ]
+  },
+  "pagination": { "cursor": "eyJj…", "has_more": true, "limit": 20 }
+}
+```
+
+- `stalled_seconds` adalah lama sesi diam di langkahnya sekarang. Inilah angka yang
+  dicari petugas: sesi yang tidak bergerak 40 menit di `BIOMETRIC` adalah nasabah yang
+  kemungkinan besar sedang gagal.
+- `expired` dihitung di aplikasi; tidak ada proses yang menandai sesi kedaluwarsa.
+- `step` yang tidak dikenal dijawab `400 VALIDATION_ERROR`, bukan daftar kosong.
+
+### `GET /internal/v1/onboarding/sessions/{session_id}`
+
+Scope **`CUSTOMER_PII`**. Satu sesi berikut data pribadinya yang sudah disamarkan. Setiap
+pemanggilan yang berhasil menulis `CS_SESSION_VIEWED` ke jejak audit sesi.
+
+```json
+{
+  "session_id": "onb_9f8e…", "current_step": "REVIEW", "expired": false,
+  "stalled_seconds": 1269074,
+  "personal_data": {
+    "nama_lengkap": "MUHAMMAD ARDAN PRAYOGI",
+    "nik_masked": "3174**********01",
+    "tempat_lahir": "Jakarta", "tanggal_lahir": "1995-04-21",
+    "jenis_kelamin": "LAKI_LAKI",
+    "alamat_ktp": { "alamat_lengkap": "…", "kelurahan": "…", "provinsi": "…" },
+    "pekerjaan": "KARYAWAN_SWASTA", "penghasilan_per_bulan": "10_20_JUTA",
+    "nomor_hp_masked": "0812***1575", "email_masked": "e******9@example.com"
+  },
+  "video_call": { "queue_id": "q_…", "status": "COMPLETED", "result": "APPROVED" }
+}
+```
+
+**Kebijakan penyamaran**, dan alasannya:
+
+| Field | Perlakuan | Kenapa |
+|---|---|---|
+| `nama_lengkap` | **utuh** | Mencocokkan orang dengan namanya adalah inti pekerjaan petugas |
+| `nik_masked` | 4 depan + 2 belakang | Pengenal terkuat dan berlaku seumur hidup; petugas membacanya dari kartu fisik saat panggilan, bukan dari layar ini |
+| `nomor_hp_masked`, `email_masked` | disamarkan | Cukup mencocokkan apa yang nasabah sebutkan, tidak cukup menghubunginya di luar jalur resmi |
+| alamat, lahir, pekerjaan, penghasilan | utuh | Dibutuhkan verifikasi dan tidak bisa dipakai menyamar sebagai nasabah |
+
+`personal_data: null` berarti nasabah belum sampai langkah `PERSONAL_DATA` — keadaan
+normal, bukan kegagalan.
+
+### `GET /internal/v1/customers?q=`
+
+Scope `CUSTOMER_PII`. Pencarian nasabah **cocok persis**: nomor rekening (10 digit) atau
+nomor HP. Tidak ada pencarian nama dan tidak ada pencocokan sebagian — pencocokan
+sebagian mengubah endpoint ini menjadi alat ekspor daftar nasabah.
+
+```json
+{ "status": "success",
+  "data": { "count": 1,
+            "customers": [ { "user_id": "95dd…", "full_name": "MUHAMMAD ARDAN PRAYOGI",
+                             "tier": "REGULER", "status": "ACTIVE",
+                             "phone_masked": "0812***1575" } ] } }
+```
+
+- Nomor HP diterima dalam bentuk apa pun: `08123421575`, `+628123421575`,
+  `628123421575`, `0812-342-1575`.
+- Tidak ditemukan dijawab **`200` dengan daftar kosong, bukan `404`**: 404 memberi tahu
+  pemanggil bahwa kata kuncinya bukan nomor terdaftar, dan itu bisa dipakai menyapu ruang
+  nomor rekening satu per satu.
+- `q` yang bukan nomor rekening maupun nomor HP dijawab `400 VALIDATION_ERROR`.
+- Setiap pencarian menulis `cs_access_logs` — **termasuk yang tidak menemukan apa pun**,
+  karena pola pencarian yang gagal justru yang paling perlu terlihat saat memeriksa
+  penyalahgunaan. Yang dicatat hanya **jenis** kata kuncinya (`ACCOUNT_NUMBER` / `PHONE`),
+  bukan nilainya.
+
+### `GET /internal/v1/customers/{user_id}`
+
+Scope `CUSTOMER_PII`. Profil nasabah untuk petugas. Menulis `CUSTOMER_VIEWED` ke
+`cs_access_logs`.
+
+```json
+{
+  "user_id": "95dd…", "full_name": "MUHAMMAD ARDAN PRAYOGI", "display_name": "Muhammad",
+  "nik_masked": "3174**********01", "phone_masked": "0812***1575",
+  "email_masked": "e******9@example.com",
+  "tier": "REGULER", "status": "ACTIVE",
+  "biometric_enabled": false, "push_notification_enabled": true,
+  "last_login_at": "2026-09-20T19:08:12+07:00", "created_at": "2026-09-20T19:07:50+07:00",
+  "accounts": [
+    { "account_number_masked": "****4654", "account_type": "TAHAPAN",
+      "account_label": "Tahapan BCA", "currency": "IDR",
+      "is_primary": true, "status": "ACTIVE", "opened_at": "…" }
+  ]
+}
+```
+
+**SALDO TIDAK ADA DI SINI, dan itu keputusan sadar.** Nasabah bisa melihat saldonya
+sendiri di aplikasi; petugas tidak butuh angkanya untuk menyelesaikan keluhan; dan daftar
+saldo seluruh nasabah adalah hal paling berharga yang bisa diambil dari kredensial petugas
+yang bocor. Kalau suatu saat memang dibutuhkan, ia endpoint tersendiri dengan cakupan
+tersendiri — bukan field tambahan di sini.
+
+`locked_until` terisi hanya saat akun sedang terkunci karena PIN salah berulang; itu
+jawaban langsung untuk "kenapa saya tidak bisa masuk".
+
+### Tiket layanan — `/internal/v1/tickets`
+
+Scope `TICKET`. Seluruhnya ditulis petugas; tidak ada endpoint nasabah yang menyentuhnya.
+
+Dialamatkan lewat **`ticket_number`** (`TKT-20261005-000123`), bukan UUID — itu yang
+tampil di layar petugas dan yang disebutkan nasabah lewat telepon. Pola yang sama dengan
+`session_id` onboarding dan `queue_id` video call.
+
+| Method | Path | Guna |
+|---|---|---|
+| POST | `/tickets` | Buat tiket |
+| GET | `/tickets` | Daftar (filter `status`, `category`, `assigned_to`, `user_id`; cursor) |
+| GET | `/tickets/{ticket_number}` | Detail berikut catatan |
+| PATCH | `/tickets/{ticket_number}` | Ubah status / prioritas / kategori / penugasan |
+| POST | `/tickets/{ticket_number}/notes` | Tambah catatan tindak lanjut |
+
+```json
+POST /internal/v1/tickets
+{ "subject": "Transfer gagal tapi saldo terpotong",
+  "category": "TRANSAKSI", "priority": "URGENT",
+  "user_id": "95dd…", "session_id": "onb_…", "description": "…" }
+```
+
+```json
+{ "ticket_number": "TKT-20261005-000002", "category": "TRANSAKSI",
+  "priority": "URGENT", "status": "OPEN",
+  "subject": "Transfer gagal tapi saldo terpotong",
+  "created_by_agent": "SPV-3001", "created_at": "…", "updated_at": "…" }
+```
+
+- `created_by_agent` dan `author` catatan datang dari **kredensial**, bukan dari body.
+  Tidak ada field body yang bisa mengakuinya.
+- `category`: `KARTU`, `TRANSAKSI`, `AKUN`, `BUKA_REKENING`, `APLIKASI`, `LAINNYA`
+  (default `LAINNYA`). `priority`: `LOW`, `NORMAL`, `HIGH`, `URGENT` (default `NORMAL`).
+- `user_id` dan `session_id` **keduanya opsional dan boleh terisi sekaligus**: penelepon
+  yang belum punya rekening hanya punya `session_id`, nasabah lama hanya punya `user_id`,
+  dan yang gagal di tengah pembukaan rekening punya dua-duanya.
+- `assigned_to=me` pada daftar diterjemahkan server dari kredensial — client tidak perlu
+  tahu `employee_id`-nya sendiri.
+- `PATCH` memakai pointer: field yang **tidak dikirim** dibiarkan apa adanya, sementara
+  `"assigned_to_agent": ""` berarti melepas penugasan.
+- `RESOLVED` mengisi `resolved_at`; `CLOSED` mengisi keduanya. Tiket yang sempat
+  `RESOLVED` lalu ditutup **mempertahankan** `resolved_at` yang pertama.
+- `CLOSED` adalah akhir: membukanya kembali dijawab `422 TICKET_INVALID_TRANSITION`.
+  Keluhan yang muncul lagi layak jadi tiket baru.
+
+### `GET /internal/v1/cards` — administrasi katalog
+
+Scope **`CARD_ADMIN`**. Sebelumnya kunci sistem saja sudah cukup, yang berarti setiap
+petugas video call bisa mengubah biaya dan limit kartu untuk seluruh nasabah. Lihat
+`docs/08-PILIH-KARTU-API-SPEC.md` §3 untuk kontraknya.
+
+> **Perubahan yang memutus client lama:** pemanggil `/internal/v1/cards` yang hanya
+> mengirim `X-Internal-API-Key` sekarang dijawab `403`. Tambahkan kedua header petugas,
+> dan pastikan barisnya di `cs_agents` punya scope `CARD_ADMIN`.
+
+---
+
+## 12. Penjadwalan ulang video call (sisi nasabah)
+
+Melayani tombol **"Jadwalkan Panggilan Nanti"** di aplikasi Android, yang selama ini
+dimatikan karena tidak ada endpoint yang menerimanya.
+
+Endpoint **nasabah**, bukan CS: penjaganya `X-Device-ID` lewat `deviceOwnsSession`, sama
+dengan `/video-call/queue`.
+
+### `POST /v1/onboarding/video-call/schedule`
+
+```json
+{ "session_id": "onb_9f8e…", "scheduled_at": "2026-10-06T14:00:00+07:00" }
+```
+
+```json
+{ "schedule_id": "vcs_28312175-c0cc-4a", "session_id": "onb_9f8e…",
+  "scheduled_at": "2026-10-06T07:00:00Z", "status": "SCHEDULED",
+  "operating_hours": { "start": "06:00", "end": "22:00", "timezone": "Asia/Jakarta" } }
+```
+
+- `scheduled_at` **wajib membawa offset zona** (RFC 3339). Tanpa offset dijawab
+  `400 VALIDATION_ERROR`: "14:00" bisa berarti dua jam berbeda, dan yang salah tafsir
+  adalah janji dengan nasabah.
+- Jam divalidasi dalam **Asia/Jakarta**, bukan UTC maupun zona server.
+- Batas: minimal 15 menit dari sekarang, maksimal 7 hari ke depan, dan di dalam
+  06:00–22:00 WIB. Di luar itu `422 VIDEO_CALL_SCHEDULE_INVALID`.
+- Hanya sesi yang sedang di langkah `VIDEO_CALL`. Dari langkah lain dijawab
+  `422 ONBOARDING_INCOMPLETE`.
+- **Satu jadwal aktif per sesi.** Yang kedua dijawab `422 VIDEO_CALL_ALREADY_SCHEDULED`.
+- **Menjadwalkan TIDAK memasukkan nasabah ke antrean.** Ia janji, bukan tempat — nasabah
+  tetap memanggil `/video-call/queue` saat waktunya datang.
+
+### `GET /v1/onboarding/video-call/schedule?session_id=`
+
+`200` dengan `schedule: null` kalau tidak ada jadwal aktif — **bukan `404`**. "Belum
+menjadwalkan" adalah keadaan normal bagi hampir semua sesi.
+
+### `DELETE /v1/onboarding/video-call/schedule?session_id=`
+
+Membatalkan jadwal aktif, lalu nasabah boleh menjadwalkan ulang. Tanpa jadwal aktif
+dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
+
+---
+
 ## Error Code Reference
 
 | Code | HTTP | Description |
@@ -1787,4 +2045,10 @@ bisa diperbaiki tanpa rilis.
 | `MAINTENANCE_MODE` | 503 | Sedang maintenance |
 | `IDEMPOTENCY_CONFLICT` | 409 | Transaksi sudah diproses |
 | `VALIDATION_ERROR` | 400 | Input tidak valid |
+| `FORBIDDEN` | 403 | Jalur `/internal/v1`: kunci sistem salah, kredensial petugas salah, atau cakupan kewenangannya kurang. Ketiganya dijawab sama — bedakan lewat `meta.request_id` dan log server |
+| `AGENT_AUTH_UNAVAILABLE` | 503 | Verifikasi petugas tidak bisa dilakukan (Postgres tersendat). Bukan penolakan — boleh dicoba lagi dengan backoff |
+| `TICKET_INVALID_TRANSITION` | 422 | Tiket `CLOSED` tidak bisa dibuka kembali |
+| `VIDEO_CALL_ALREADY_SCHEDULED` | 422 | Sesi sudah punya jadwal video call aktif. Batalkan dulu untuk menjadwalkan ulang |
+| `VIDEO_CALL_SCHEDULE_INVALID` | 422 | Waktu di luar 06:00–22:00 WIB, kurang dari 15 menit dari sekarang, atau lebih dari 7 hari ke depan |
+| `VIDEO_CALL_SCHEDULE_NOT_FOUND` | 404 | Tidak ada jadwal aktif yang bisa dibatalkan |
 | `INTERNAL_ERROR` | 500 | Kesalahan internal server |

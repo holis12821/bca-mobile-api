@@ -667,23 +667,76 @@ func (a *AuditService) Log(ctx context.Context, entry AuditEntry) {
 // Workers (started at init): for range a.ch { insert to DB, on error log to slog }
 ```
 
-### 9b. Endpoint internal: dua penjaga, dua pertanyaan
+### 9b. Endpoint internal: tiga penjaga, tiga pertanyaan
 
 `actor` di audit trail hanya berarti kalau yang menulisnya terbukti. Endpoint internal CS
-karena itu punya dua penjaga yang menjawab pertanyaan berbeda:
+karena itu punya penjaga berlapis yang menjawab pertanyaan berbeda:
 
-| Header | Pertanyaan | Middleware |
+| Header / mekanisme | Pertanyaan | Middleware |
 |---|---|---|
 | `X-Internal-API-Key` | sistem mana yang memanggil | `middleware.InternalAPIKey` |
 | `X-Agent-Employee-ID` + `X-Agent-API-Key` | petugas mana yang bertindak | `middleware.AgentAuth` → `cs_agents` |
+| `cs_agents.scopes` | boleh melakukan **apa** | `middleware.AgentAuth(lookup, scope)` |
 
 Penjaga kedua dipasang **sesudah** yang pertama, dan urutannya bukan selera: verifikasi
 Argon2id itu mahal (64 MB × 4 thread), jadi ia tidak boleh bisa dipicu lalu lintas yang
 belum membuktikan dirinya sebagai sistem CS.
 
-Yang menuntut keduanya hanya tindakan yang diatribusikan ke orang —
-`POST /onboarding/video-call/agent-token` dan `POST /onboarding/video-call/result`. Melihat
-antrean, jejak audit, dan `GET /onboarding/monitoring` adalah tindakan sistem/pengawas.
+Melihat antrean, jejak audit, dan `GET /onboarding/monitoring` adalah tindakan
+sistem/pengawas — cukup penjaga pertama. Semua jalur operator lain menuntut petugas yang
+terbukti **beserta cakupannya**.
+
+#### Cakupan kewenangan — dan kenapa satu kunci tidak cukup
+
+Cakupan diminta di **titik pasang rute**, bukan dibaca di handler, supaya sebuah endpoint
+operator tidak bisa terpasang tanpa menyatakan kewenangan yang dituntutnya. `requiredScope`
+kosong ditolak dengan alasan yang sama: itu berarti rute salah rakit, dan kesalahan
+perakitan di jalur operator tidak boleh gagal terbuka.
+
+| Cakupan | Membuka |
+|---|---|
+| `VIDEO_CALL` | `agent-token`, `result`, antrean, `GET /internal/v1/onboarding/sessions` |
+| `CUSTOMER_PII` | `GET /internal/v1/onboarding/sessions/{id}`, `/internal/v1/customers*` |
+| `CARD_ADMIN` | `/internal/v1/cards*` |
+| `TICKET` | `/internal/v1/tickets*` |
+
+Sebelum cakupan ada, satu `INTERNAL_API_KEY` membuka **seluruh** `/internal/v1`: petugas
+yang tugasnya melayani panggilan video juga bisa mengubah biaya dan limit kartu Paspor
+untuk seluruh nasabah, dan menaikkan `catalog_version` yang memaksa setiap aplikasi
+nasabah memuat ulang katalognya. Kewenangan itu tidak pernah diberikan kepadanya.
+
+`CUSTOMER_PII` **dipisah** dari `VIDEO_CALL` meski aplikasi desktop yang sama memakai
+keduanya: melayani panggilan menampilkan nasabah yang *sedang* bicara, sementara membuka
+data pribadi menjangkau nasabah mana pun yang pernah mendaftar. Dua kewenangan yang berbeda
+ukurannya.
+
+Kredensial salah dan cakupan kurang dijawab **`403 FORBIDDEN` dengan pesan identik** —
+disengaja, supaya penyerang tidak bisa menebak kunci mana yang sudah benar. Yang
+membedakannya hanya log server, dan keduanya dicatat terpisah di sana: penolakan kredensial
+kemungkinan serangan, cakupan kurang hampir selalu baris `cs_agents` yang perlu diperbaiki.
+
+#### Minimisasi data di jalur operator
+
+Penjaga saja tidak cukup; yang dikirim juga dibatasi.
+
+| Jalur | Yang **tidak** dikirim | Alasan |
+|---|---|---|
+| `GET /onboarding/video-call/queued` | PII apa pun | petugas memilih panggilan berdasarkan urutan, bukan siapa nasabahnya |
+| `GET /internal/v1/onboarding/sessions` | nama, NIK, nomor HP, `device_id` | daftar ini terbuka sepanjang hari; memaparkan seluruh pendaftar untuk membaca satu |
+| detail sesi & profil nasabah | NIK, HP, email **utuh** | disamarkan; cukup mencocokkan apa yang nasabah sebutkan, tidak cukup menyamar sebagai dia |
+| `GET /internal/v1/customers/{id}` | **saldo** | nasabah bisa melihatnya sendiri; daftar saldo seluruh nasabah adalah hal paling berharga yang bisa diambil dari kredensial petugas yang bocor |
+| `cs_access_logs` | **nilai** kata kunci pencarian | menyimpannya akan menumpuk nomor rekening dan nomor HP di tabel log yang tidak terenkripsi dan jarang ditinjau — memindahkan kebocoran, bukan mencatatnya |
+
+Pembukaan PII dicatat tersendiri: `CS_SESSION_VIEWED` di `onboarding_audit_logs` untuk
+sesi onboarding, dan `cs_access_logs` untuk nasabah yang sudah punya rekening. Keduanya
+**tidak** dicatat saat subjeknya tidak ada — menelusuri `session_id` atau uuid acak bukan
+pembukaan data siapa pun, dan mencatatnya akan memenuhi jejak dengan peristiwa yang tidak
+pernah terjadi. `cs_access_logs` append-only di tingkat skema: jejak akses yang bisa
+disunting oleh pemiliknya bukan jejak.
+
+Kegagalan menulis jejak **tidak** menggagalkan permintaan — datanya sudah terbaca petugas
+saat itu juga, dan menolak responsnya setelah itu tidak menarik kembali apa pun. Yang
+penting kegagalannya berbunyi di log, bukan hilang.
 
 Sebelum ini `agent_employee_id` dan `agent_name` adalah **field body** yang dipercaya apa
 adanya. Dengan satu `INTERNAL_API_KEY` yang sama untuk seluruh integrasi CS, siapa pun yang

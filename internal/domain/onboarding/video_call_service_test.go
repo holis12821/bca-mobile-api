@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 )
 
@@ -248,21 +249,42 @@ func testClockWIB() func() time.Time {
 // SendToNasabah di luar relai `instruction`, dan tidak ada test yang menangkapnya.
 type mockNotifier struct {
 	sent map[string][]SignalMessage
+
+	// toAgent dipisah dari sent, bukan digabung dengan penanda sisi: `call_ended` yang
+	// seharusnya sampai ke petugas tapi hanya sampai ke nasabah adalah persis bug yang
+	// test ini ada untuk menangkapnya, dan satu slice gabungan menyembunyikannya.
+	toAgent map[string][]SignalMessage
 }
 
 func newMockNotifier() *mockNotifier {
-	return &mockNotifier{sent: make(map[string][]SignalMessage)}
+	return &mockNotifier{
+		sent:    make(map[string][]SignalMessage),
+		toAgent: make(map[string][]SignalMessage),
+	}
 }
 
 func (m *mockNotifier) SendToNasabah(sessionID string, msg SignalMessage) {
 	m.sent[sessionID] = append(m.sent[sessionID], msg)
 }
 
+func (m *mockNotifier) SendToAgent(sessionID string, msg SignalMessage) {
+	m.toAgent[sessionID] = append(m.toAgent[sessionID], msg)
+}
+
 // first mengembalikan pesan pertama bertipe [msgType] untuk sesi itu, atau nil.
 func (m *mockNotifier) first(sessionID, msgType string) *SignalMessage {
-	for i := range m.sent[sessionID] {
-		if m.sent[sessionID][i].Type == msgType {
-			return &m.sent[sessionID][i]
+	return firstOfType(m.sent[sessionID], msgType)
+}
+
+// firstToAgent adalah pasangan [mockNotifier.first] untuk sisi petugas.
+func (m *mockNotifier) firstToAgent(sessionID, msgType string) *SignalMessage {
+	return firstOfType(m.toAgent[sessionID], msgType)
+}
+
+func firstOfType(msgs []SignalMessage, msgType string) *SignalMessage {
+	for i := range msgs {
+		if msgs[i].Type == msgType {
+			return &msgs[i]
 		}
 	}
 	return nil
@@ -1285,5 +1307,347 @@ func TestListQueuedDropsOrphanMembers(t *testing.T) {
 	}
 	if _, ok := queueCache.members["q_orphan"]; ok {
 		t.Error("anggota yatim masih di sorted set")
+	}
+}
+
+// `call_ended` harus sampai ke KEDUA sisi.
+//
+// Dulu hanya nasabah yang menerimanya, dan akibatnya baru terasa di aplikasi desktop:
+// satu-satunya tanda panggilan berakhir adalah socket yang berhenti bicara — tidak
+// terbedakan dari jaringan petugas sendiri yang putus.
+func TestSubmitResultNotifiesBothSides(t *testing.T) {
+	svc, sessionRepo, cache, _, _, notifier := setupVCServiceWithNotifier()
+	ctx := context.Background()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	joinResp, err := svc.JoinQueue(ctx, JoinQueueRequest{SessionID: sessionID}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("join queue: %v", err)
+	}
+	pickUpCall(t, svc, joinResp.QueueID, AgentInfo{EmployeeID: "CS-1042", Name: "Sarah Adisti"})
+
+	if _, err := svc.SubmitResult(ctx, SubmitVideoCallResultRequest{
+		SessionID:           sessionID,
+		QueueID:             joinResp.QueueID,
+		Result:              string(VCResultApproved),
+		CallDurationSeconds: 195,
+	}, testAgent, "127.0.0.1", "test"); err != nil {
+		t.Fatalf("submit result: %v", err)
+	}
+
+	toAgent := notifier.firstToAgent(sessionID, SignalCallEnded)
+	if toAgent == nil {
+		t.Fatal("call_ended tidak sampai ke petugas; aplikasi desktop tidak punya penanda sah untuk membongkar PeerConnection")
+	}
+	if toAgent.Result != string(VCResultApproved) {
+		t.Fatalf("result ke petugas = %q", toAgent.Result)
+	}
+	if toAgent.DurationSeconds != 195 {
+		t.Fatalf("duration_seconds ke petugas = %d", toAgent.DurationSeconds)
+	}
+
+	// Sisi nasabah tidak boleh ikut hilang saat sisi petugas ditambahkan.
+	if notifier.first(sessionID, SignalCallEnded) == nil {
+		t.Fatal("call_ended ke nasabah hilang")
+	}
+}
+
+// Nasabah yang membatalkan sesinya meninggalkan petugas di dalam panggilan yang sudah
+// tidak punya lawan bicara. Hanya signaling yang bisa memberitahunya — tidak ada response
+// HTTP yang sedang ditunggu aplikasi desktop di saat itu.
+func TestCancelForSessionNotifiesAgent(t *testing.T) {
+	svc, sessionRepo, cache, _, _, notifier := setupVCServiceWithNotifier()
+	ctx := context.Background()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	joinResp, err := svc.JoinQueue(ctx, JoinQueueRequest{SessionID: sessionID}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("join queue: %v", err)
+	}
+	pickUpCall(t, svc, joinResp.QueueID, AgentInfo{EmployeeID: "CS-1042", Name: "Sarah Adisti"})
+
+	if err := svc.CancelForSession(ctx, sessionID); err != nil {
+		t.Fatalf("cancel for session: %v", err)
+	}
+
+	msg := notifier.firstToAgent(sessionID, SignalCallEnded)
+	if msg == nil {
+		t.Fatal("petugas tidak diberi tahu panggilannya dibatalkan nasabah")
+	}
+	// `reason` membedakannya dari panggilan yang petugas selesaikan sendiri: yang satu
+	// menuntut kembali ke antrean, yang satu lagi menuntut mengisi hasil verifikasi.
+	if msg.Reason == "" {
+		t.Fatal("call_ended ke petugas tanpa reason; tidak terbedakan dari hasil submit")
+	}
+	if msg.Result != "" {
+		t.Fatalf("pembatalan tidak punya result, tapi terisi %q", msg.Result)
+	}
+}
+
+// --- Penjadwalan ulang video call ---
+
+// mockScheduleRepo meniru onboarding_video_call_schedules, TERMASUK unique index yang
+// hanya mengizinkan satu jadwal aktif per sesi.
+//
+// Index-nya ditegakkan di sini juga: tanpa itu, service yang lupa mengandalkan database
+// untuk menahan jadwal ganda akan lulus test dan baru gagal di produksi.
+type mockScheduleRepo struct {
+	byID  map[string]*VideoCallSchedule
+	err   error
+	calls int
+}
+
+func newMockScheduleRepo() *mockScheduleRepo {
+	return &mockScheduleRepo{byID: make(map[string]*VideoCallSchedule)}
+}
+
+func (m *mockScheduleRepo) Create(_ context.Context, sch *VideoCallSchedule) error {
+	m.calls++
+	if m.err != nil {
+		return m.err
+	}
+	for _, existing := range m.byID {
+		if existing.SessionID == sch.SessionID && existing.Status == VCScheduleScheduled {
+			return apperr.VideoCallAlreadyScheduled
+		}
+	}
+	copied := *sch
+	m.byID[sch.ScheduleID] = &copied
+	return nil
+}
+
+func (m *mockScheduleRepo) FindActiveBySessionID(_ context.Context, sessionID string) (*VideoCallSchedule, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	for _, s := range m.byID {
+		if s.SessionID == sessionID && s.Status == VCScheduleScheduled {
+			copied := *s
+			return &copied, nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *mockScheduleRepo) CancelBySessionID(_ context.Context, sessionID string) (bool, error) {
+	if m.err != nil {
+		return false, m.err
+	}
+	for _, s := range m.byID {
+		if s.SessionID == sessionID && s.Status == VCScheduleScheduled {
+			s.Status = VCScheduleCancelled
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// setupScheduleService memaku jam ke Senin 2026-10-05 10:00 WIB — di dalam jam
+// operasional, supaya test tidak lulus atau gagal tergantung kapan ia dijalankan.
+func setupScheduleService() (*VideoCallService, *mockSessionRepo, *mockSessionCache, *mockScheduleRepo, time.Time) {
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	now := time.Date(2026, 10, 5, 10, 0, 0, 0, loc)
+
+	sessionRepo := newMockSessionRepo()
+	cache := newMockSessionCache()
+	schedules := newMockScheduleRepo()
+
+	svc := NewVideoCallService(VideoCallServiceConfig{
+		Sessions:         sessionRepo,
+		Cache:            cache,
+		VideoCalls:       newMockVideoCallRepo(),
+		QueueCache:       newMockQueueCache(),
+		JWTManager:       testJWTManager(),
+		Audit:            &mockAuditRepo{},
+		Schedules:        schedules,
+		SignalingBaseURL: "wss://test",
+		Clock:            func() time.Time { return now },
+	})
+	return svc, sessionRepo, cache, schedules, now
+}
+
+// scheduleAt membentuk waktu WIB pada hari yang sama dengan jam yang dipaku.
+func scheduleAt(now time.Time, hour int) string {
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	wib := now.In(loc)
+	return time.Date(wib.Year(), wib.Month(), wib.Day(), hour, 0, 0, 0, loc).Format(time.RFC3339)
+}
+
+func TestScheduleVideoCall_Success(t *testing.T) {
+	svc, sessionRepo, cache, _, now := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	resp, err := svc.ScheduleVideoCall(context.Background(), ScheduleVideoCallRequest{
+		SessionID:   sessionID,
+		ScheduledAt: scheduleAt(now, 14),
+	}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+	if resp.ScheduleID == "" {
+		t.Fatal("schedule_id kosong")
+	}
+	if resp.Status != string(VCScheduleScheduled) {
+		t.Fatalf("status = %q", resp.Status)
+	}
+	// Jam operasional disertakan supaya client tidak menanamkan jamnya sendiri.
+	if resp.OperatingHours.Start != "06:00" || resp.OperatingHours.End != "22:00" {
+		t.Fatalf("operating_hours = %+v", resp.OperatingHours)
+	}
+}
+
+// Jam divalidasi dalam zona Asia/Jakarta, bukan UTC. 03:00 WIB adalah di luar jam
+// layanan meski 20:00 UTC hari sebelumnya terdengar wajar.
+func TestScheduleVideoCall_RejectsOutsideOperatingHoursWIB(t *testing.T) {
+	svc, sessionRepo, cache, _, now := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	for _, hour := range []int{3, 5, 22, 23} {
+		_, err := svc.ScheduleVideoCall(context.Background(), ScheduleVideoCallRequest{
+			SessionID:   sessionID,
+			ScheduledAt: scheduleAt(now, hour),
+		}, "", "")
+		if err == nil {
+			t.Errorf("pukul %02d:00 WIB diterima; di luar 06:00-22:00", hour)
+			continue
+		}
+		if apperr.From(err).Code != "VIDEO_CALL_SCHEDULE_INVALID" {
+			t.Errorf("pukul %02d:00 → code %q", hour, apperr.From(err).Code)
+		}
+	}
+}
+
+func TestScheduleVideoCall_RejectsTooSoonAndTooFar(t *testing.T) {
+	svc, sessionRepo, cache, _, now := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	cases := map[string]time.Time{
+		"di masa lalu":      now.Add(-time.Hour),
+		"lima menit lagi":   now.Add(5 * time.Minute),
+		"delapan hari lagi": now.Add(8 * 24 * time.Hour),
+	}
+	for name, at := range cases {
+		_, err := svc.ScheduleVideoCall(context.Background(), ScheduleVideoCallRequest{
+			SessionID:   sessionID,
+			ScheduledAt: at.Format(time.RFC3339),
+		}, "", "")
+		if err == nil {
+			t.Errorf("%s diterima", name)
+		}
+	}
+}
+
+// Waktu tanpa offset zona bisa berarti dua jam berbeda, dan yang salah tafsir adalah
+// janji dengan nasabah.
+func TestScheduleVideoCall_RejectsTimeWithoutOffset(t *testing.T) {
+	svc, sessionRepo, cache, _, _ := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	for _, raw := range []string{"2026-10-06 14:00:00", "2026-10-06T14:00:00", "besok sore"} {
+		_, err := svc.ScheduleVideoCall(context.Background(), ScheduleVideoCallRequest{
+			SessionID:   sessionID,
+			ScheduledAt: raw,
+		}, "", "")
+		if err == nil {
+			t.Errorf("%q diterima tanpa offset zona", raw)
+		}
+	}
+}
+
+// Satu jadwal aktif per sesi. Yang menahannya unique index, bukan pemeriksaan aplikasi.
+func TestScheduleVideoCall_RejectsSecondActiveSchedule(t *testing.T) {
+	svc, sessionRepo, cache, _, now := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	req := ScheduleVideoCallRequest{SessionID: sessionID, ScheduledAt: scheduleAt(now, 14)}
+	if _, err := svc.ScheduleVideoCall(context.Background(), req, "", ""); err != nil {
+		t.Fatalf("jadwal pertama: %v", err)
+	}
+
+	req.ScheduledAt = scheduleAt(now, 16)
+	_, err := svc.ScheduleVideoCall(context.Background(), req, "", "")
+	if err == nil {
+		t.Fatal("jadwal kedua diterima; nasabah tidak akan tahu mana yang berlaku")
+	}
+	if apperr.From(err).Code != "VIDEO_CALL_ALREADY_SCHEDULED" {
+		t.Fatalf("code = %q", apperr.From(err).Code)
+	}
+}
+
+// Membatalkan lalu menjadwalkan ulang HARUS bisa — itu sebabnya index-nya partial.
+func TestScheduleVideoCall_CanRescheduleAfterCancel(t *testing.T) {
+	svc, sessionRepo, cache, _, now := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	req := ScheduleVideoCallRequest{SessionID: sessionID, ScheduledAt: scheduleAt(now, 14)}
+	if _, err := svc.ScheduleVideoCall(context.Background(), req, "", ""); err != nil {
+		t.Fatalf("jadwal pertama: %v", err)
+	}
+	if err := svc.CancelVideoCallSchedule(context.Background(), sessionID, "", ""); err != nil {
+		t.Fatalf("batal: %v", err)
+	}
+
+	req.ScheduledAt = scheduleAt(now, 16)
+	if _, err := svc.ScheduleVideoCall(context.Background(), req, "", ""); err != nil {
+		t.Fatalf("jadwal ulang ditolak: %v", err)
+	}
+}
+
+func TestCancelVideoCallSchedule_WithoutScheduleIs404(t *testing.T) {
+	svc, sessionRepo, cache, _, _ := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	err := svc.CancelVideoCallSchedule(context.Background(), sessionID, "", "")
+	if apperr.From(err).Code != "VIDEO_CALL_SCHEDULE_NOT_FOUND" {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// Jadwal hanya masuk akal untuk sesi yang memang sedang di langkah VIDEO_CALL.
+func TestScheduleVideoCall_RejectsWrongStep(t *testing.T) {
+	svc, sessionRepo, cache, _, now := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	sessionRepo.sessions[sessionID].CurrentStep = StepBiometric
+	cache.data[sessionID].CurrentStep = StepBiometric
+
+	_, err := svc.ScheduleVideoCall(context.Background(), ScheduleVideoCallRequest{
+		SessionID:   sessionID,
+		ScheduledAt: scheduleAt(now, 14),
+	}, "", "")
+	if err == nil {
+		t.Fatal("sesi di BIOMETRIC bisa menjadwalkan video call")
+	}
+}
+
+// Tanpa repo jadwal, endpoint ini 503 — dan SISA jalur video call tidak terpengaruh.
+func TestScheduleVideoCall_WithoutRepoIsUnavailable(t *testing.T) {
+	svc, sessionRepo, cache, _, _, _ := setupVCServiceWithNotifier()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	_, err := svc.ScheduleVideoCall(context.Background(), ScheduleVideoCallRequest{
+		SessionID:   sessionID,
+		ScheduledAt: time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+	}, "", "")
+	if apperr.From(err).Status != 503 {
+		t.Fatalf("err = %v, mau 503", err)
+	}
+
+	// Mengantre tetap jalan.
+	if _, err := svc.JoinQueue(context.Background(), JoinQueueRequest{SessionID: sessionID}, "", ""); err != nil {
+		t.Fatalf("antrean ikut mati: %v", err)
+	}
+}
+
+func TestGetVideoCallSchedule_ReturnsNilWhenNone(t *testing.T) {
+	svc, sessionRepo, cache, _, _ := setupScheduleService()
+	sessionID := createVCTestSession(sessionRepo, cache)
+
+	got, err := svc.GetVideoCallSchedule(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("got = %+v, mau nil", got)
 	}
 }

@@ -44,6 +44,24 @@ func MaskEmail(email string) string {
 	return string(local[0]) + strings.Repeat("*", len(local)-2) + string(local[len(local)-1]) + domain
 }
 
+// MaskNIK menyisakan 4 digit depan dan 2 belakang: 3171**********34.
+//
+// Empat depan adalah kode wilayah — berguna memastikan asal nasabah tanpa
+// mengidentifikasinya. Dua belakang cukup membedakan dua NIK yang mirip saat petugas
+// mencocokkan dengan dokumen di tangannya.
+//
+// Di sini, bukan di paket yang memakainya, karena DUA jalur membutuhkannya: detail sesi
+// onboarding sisi CS dan profil nasabah sisi CS. Dua salinan kebijakan penyamaran NIK
+// adalah dua tempat yang harus diubah bersamaan, dan yang kedua akan terlewat.
+func MaskNIK(nik string) string {
+	const head, tail = 4, 2
+
+	if len(nik) <= head+tail {
+		return strings.Repeat("*", len(nik))
+	}
+	return nik[:head] + strings.Repeat("*", len(nik)-head-tail) + nik[len(nik)-tail:]
+}
+
 // MaskAccountNumber renders the last four digits: ****4567.
 func MaskAccountNumber(accountNumber string) string {
 	if accountNumber == "" {

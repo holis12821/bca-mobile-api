@@ -17,10 +17,12 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/domain/auth"
 	"github.com/holis12821/bca-mobile-api/internal/domain/card"
 	"github.com/holis12821/bca-mobile-api/internal/domain/content"
+	"github.com/holis12821/bca-mobile-api/internal/domain/cs"
 	"github.com/holis12821/bca-mobile-api/internal/domain/ewallet"
 	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
 	"github.com/holis12821/bca-mobile-api/internal/domain/qris"
 	"github.com/holis12821/bca-mobile-api/internal/domain/registration"
+	"github.com/holis12821/bca-mobile-api/internal/domain/ticket"
 	"github.com/holis12821/bca-mobile-api/internal/domain/transaction"
 	"github.com/holis12821/bca-mobile-api/internal/handler"
 	"github.com/holis12821/bca-mobile-api/internal/middleware"
@@ -457,6 +459,7 @@ func New(deps Deps) (http.Handler, error) {
 		Sessions:         onboardingSessionRepo,
 		Cache:            onboardingCache,
 		VideoCalls:       onboardingVideoCallRepo,
+		Schedules:        postgres.NewOnboardingVideoCallScheduleRepo(deps.DB),
 		QueueCache:       videoCallQueueCache,
 		JWTManager:       deps.JWTManager,
 		Audit:            onboardingAuditRepo,
@@ -591,6 +594,13 @@ func New(deps Deps) (http.Handler, error) {
 		Audit:      onboardingAuditRepo,
 		QueueCache: videoCallQueueCache,
 		Metrics:    cardMetrics,
+
+		// Hanya dipakai detail sesi sisi CS. piiAES yang sama dengan PersonalDataService:
+		// data yang dienkripsi satu kunci tidak bisa dibuka kunci lain, dan dua sumber
+		// kunci untuk kolom yang sama adalah cara termudah menghasilkan 500 permanen.
+		PersonalData: onboardingPersonalDataRepo,
+		VideoCalls:   onboardingVideoCallRepo,
+		AES:          piiAES,
 	})
 
 	// The signaling token is single-use; the store is what remembers a spent
@@ -602,6 +612,49 @@ func New(deps Deps) (http.Handler, error) {
 	signalingH := handler.NewSignalingHandler(
 		sigHub, deps.JWTManager, signalingTokens, videoCallService, corsOrigins(deps.Config),
 	)
+
+	// Layanan nasabah untuk petugas CS (pencarian + profil).
+	//
+	// deps.PIIKey, bukan piiAES: kolom PII di tabel users ditulis pgp_sym_encrypt di
+	// sisi Postgres, sementara piiAES adalah cipher Go yang dipakai tabel onboarding.
+	// Repository-nya yang mengubah kunci itu ke bentuk hex — lihat NewCSCustomerRepo.
+	//
+	// lookupHasher yang SAMA dengan jalur pendaftaran: phone_hash yang dihitung dengan
+	// kunci HMAC berbeda tidak akan pernah cocok dengan baris mana pun.
+	csService := cs.NewService(cs.ServiceConfig{
+		Customers: postgres.NewCSCustomerRepo(deps.DB, deps.PIIKey),
+		Access:    postgres.NewCSAccessLogRepo(deps.DB),
+		Hasher:    lookupHasher,
+	})
+	csH := handler.NewCSHandler(csService)
+
+	// Terminal, sesi petugas, dan jejak audit CS. Satu paket domain `cs`, konteks sama:
+	// semuanya tentang apa yang dilakukan PETUGAS, bukan tentang nasabah.
+	csTerminalRepo := postgres.NewCSTerminalRepo(deps.DB)
+	csSessionRepo := postgres.NewCSAgentSessionRepo(deps.DB)
+	csAuditRepo := postgres.NewCSAuditEventRepo(deps.DB)
+
+	csSessionService := cs.NewAgentSessionService(cs.AgentSessionServiceConfig{
+		Creds:     postgres.NewCSAgentCredentialRepo(deps.DB),
+		Sessions:  csSessionRepo,
+		Terminals: csTerminalRepo,
+		Audit:     csAuditRepo,
+		Hasher:    crypto.NewPasswordHasher(),
+	})
+
+	csTerminalService := cs.NewTerminalService(cs.TerminalServiceConfig{
+		Terminals:   csTerminalRepo,
+		Supervisors: postgres.NewCSSupervisorRepo(deps.DB),
+		Sessions:    csSessionRepo,
+		Audit:       csAuditRepo,
+	})
+
+	csAuthH := handler.NewCSAuthHandler(csSessionService)
+	csTerminalH := handler.NewCSTerminalHandler(csTerminalService)
+
+	ticketH := handler.NewTicketHandler(ticket.NewService(ticket.ServiceConfig{
+		Repo: postgres.NewTicketRepo(deps.DB),
+	}))
 
 	cardH := handler.NewCardHandler(cardService, clientCfg.ProductUnderMaintenance)
 	cardAdminH := handler.NewCardAdminHandler(
@@ -740,6 +793,12 @@ func New(deps Deps) (http.Handler, error) {
 				r.Post("/biometric", onboardingH.ProcessBiometric)
 				r.Post("/video-call/queue", onboardingH.JoinVideoCallQueue)
 				r.Get("/video-call/signal", signalingH.HandleSignaling)
+
+				// Penjadwalan ulang. Di grup nasabah ber-rate-limit yang sama dengan
+				// /video-call/queue, dan penjaganya deviceOwnsSession — bukan jalur CS.
+				r.Post("/video-call/schedule", onboardingH.ScheduleVideoCall)
+				r.Get("/video-call/schedule", onboardingH.GetVideoCallSchedule)
+				r.Delete("/video-call/schedule", onboardingH.CancelVideoCallSchedule)
 				r.Get("/credentials/public-key", onboardingH.GetEncryptionPublicKey)
 				r.Post("/credentials", onboardingH.SetCredentials)
 				r.Post("/submit", onboardingH.Submit)
@@ -770,7 +829,7 @@ func New(deps Deps) (http.Handler, error) {
 				// (AgentAuth). Urutannya bukan selera: Argon2 di AgentAuth mahal, dan
 				// tidak boleh bisa dipicu lalu lintas yang belum lolos penjaga pertama.
 				r.Group(func(r chi.Router) {
-					r.Use(middleware.AgentAuth(csAgentLookup))
+					r.Use(middleware.AgentAuth(csAgentLookup, middleware.ScopeVideoCall))
 					r.Post("/video-call/agent-token", onboardingH.IssueAgentSignalingToken)
 					r.Post("/video-call/result", onboardingH.SubmitVideoCallResult)
 				})
@@ -875,6 +934,12 @@ func New(deps Deps) (http.Handler, error) {
 	// akan membuat satu operator yang menulis katalog berbagi jatah laju dengan
 	// nasabah. Penjaganya X-Internal-API-Key, middleware yang sama dengan
 	// endpoint CS onboarding — dan tanpa INTERNAL_API_KEY, semuanya menolak.
+	//
+	// Menulis katalog juga menuntut petugas ber-scope CARD_ADMIN. Sebelumnya kunci
+	// sistem saja sudah cukup, yang berarti setiap petugas video call — yang memegang
+	// kunci itu untuk tugasnya sendiri — bisa mengubah biaya dan limit kartu untuk
+	// SELURUH nasabah, dan menaikkan catalog_version yang memaksa setiap aplikasi
+	// memuat ulang katalognya. Kewenangan itu tidak pernah diberikan kepada mereka.
 	r.Route("/internal/v1", func(r chi.Router) {
 		internalAPIKey := ""
 		if deps.Config != nil {
@@ -882,9 +947,120 @@ func New(deps Deps) (http.Handler, error) {
 		}
 		r.Use(middleware.InternalAPIKey(internalAPIKey))
 
-		r.Get("/cards", cardAdminH.ListCards)
-		r.Put("/cards/{card_type}", cardAdminH.UpdateCard)
-		r.Put("/products/{product_type}/cards/{card_type}", cardAdminH.UpdateProductCard)
+		// Katalog kartu: CARD_ADMIN.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.AgentAuth(csAgentLookup, middleware.ScopeCardAdmin))
+
+			r.Get("/cards", cardAdminH.ListCards)
+			r.Put("/cards/{card_type}", cardAdminH.UpdateCard)
+			r.Put("/products/{product_type}/cards/{card_type}", cardAdminH.UpdateProductCard)
+		})
+
+		// Identitas dan sesi petugas.
+		//
+		// Tiga penjaga berbeda di satu grup, dan bedanya disengaja:
+		//   login     → kunci sistem saja. Di sinilah petugas MEMBUKTIKAN dirinya;
+		//               menuntut kredensial petugas akan membuatnya harus sudah masuk
+		//               untuk bisa masuk.
+		//   me, password → AgentIdentity (kunci API petugas). `me` justru yang MEMBERI
+		//               TAHU cakupan, jadi menuntut cakupan di sana memutar balik; dan
+		//               `password` adalah jalur penyetelan PERTAMA, jadi pemanggilnya
+		//               belum bisa punya sesi.
+		//   logout    → AgentSession. Yang ditutup adalah sesi yang tokennya dikirim,
+		//               bukan sesi yang disebut di body.
+		r.Route("/auth", func(r chi.Router) {
+			r.Post("/login", csAuthH.Login)
+
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.AgentIdentity(csAgentLookup))
+				r.Get("/me", csAuthH.Me)
+				r.Post("/password", csAuthH.SetPassword)
+			})
+
+			r.With(middleware.AgentSession(csSessionService)).
+				Post("/logout", csAuthH.Logout)
+		})
+
+		// Supervisor: daftar untuk layar SCR-006, dan otorisasi dual-control.
+		r.Route("/supervisors", func(r chi.Router) {
+			// Daftar supervisor dibuka SEBELUM otorisasi, jadi ia hanya butuh sesi —
+			// bukan gerbang yang justru akan dilaluinya.
+			r.With(middleware.AgentSession(csSessionService)).
+				Get("/", csTerminalH.ListSupervisors)
+			r.With(middleware.AgentSession(csSessionService)).
+				Post("/authorize", csTerminalH.AuthorizeSupervisor)
+		})
+
+		// Terminal dan tiga gerbang kesiapan (Rule 3).
+		//
+		// Endpoint gerbang TIDAK memakai {terminal_id} di path: terminalnya ditentukan
+		// SESI. Petugas tidak bisa menyatakan kesiapan atas loket yang bukan tempat ia
+		// masuk, dan tidak bisa menanyakan kesiapan loket orang lain.
+		r.Route("/terminals", func(r chi.Router) {
+			// Pendaftaran terminal: butuh pendaftar yang bisa disebut namanya di audit.
+			r.With(middleware.AgentIdentity(csAgentLookup)).
+				Post("/", csTerminalH.RegisterTerminal)
+
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.AgentSession(csSessionService))
+
+				r.Get("/readiness", csTerminalH.Readiness)
+				r.Post("/healthcheck", csTerminalH.Healthcheck)
+				r.Post("/pii-ack", csTerminalH.AcknowledgePII)
+				r.Post("/activate", csTerminalH.Activate)
+				r.Post("/deactivate", csTerminalH.Deactivate)
+			})
+
+			// Didaftarkan TERAKHIR: chi mencocokkan pola statis lebih dulu, tapi
+			// menaruhnya di atas akan membuat /readiness terbaca sebagai terminal_id
+			// oleh siapa pun yang membaca berkas ini.
+			r.Get("/{terminal_id}", csTerminalH.GetTerminal)
+		})
+
+		// Nasabah yang sudah punya rekening: pencarian dan profil.
+		//
+		// CUSTOMER_PII untuk keduanya, termasuk pencariannya — hasil pencarian sudah
+		// memuat nama dan nomor HP tersamar, jadi ia pembukaan data juga, bukan sekadar
+		// pencarian. Setiap permintaan di sini menulis baris cs_access_logs.
+		r.Route("/customers", func(r chi.Router) {
+			r.Use(middleware.AgentAuth(csAgentLookup, middleware.ScopeCustomerPII))
+
+			r.Get("/", csH.SearchCustomers)
+			r.Get("/{user_id}", csH.GetCustomerProfile)
+		})
+
+		// Tiket layanan.
+		//
+		// TICKET, bukan CUSTOMER_PII: tiket memuat keluhan nasabah, bukan NIK dan
+		// alamatnya, dan petugas yang menangani tiket tidak otomatis perlu membuka data
+		// pribadi. Tiket yang merujuk nasabah hanya menyimpan user_id — yang mau tahu
+		// siapa dia memanggil /customers/{id} dengan cakupan yang berbeda, dan panggilan
+		// itu tercatat tersendiri.
+		r.Route("/tickets", func(r chi.Router) {
+			r.Use(middleware.AgentAuth(csAgentLookup, middleware.ScopeTicket))
+
+			r.Post("/", ticketH.CreateTicket)
+			r.Get("/", ticketH.ListTickets)
+			r.Get("/{ticket_number}", ticketH.GetTicket)
+			r.Patch("/{ticket_number}", ticketH.UpdateTicket)
+			r.Post("/{ticket_number}/notes", ticketH.AddNote)
+		})
+
+		// Pemantauan sesi onboarding.
+		//
+		// Di /internal/v1, bukan menumpang /v1/onboarding seperti endpoint CS yang lebih
+		// tua: GET /v1/onboarding/sessions/{session_id} sudah menjadi milik nasabah, dan
+		// yang lebih penting, jalur operator tidak semestinya berbagi rate limit, body
+		// limit, dan CORS dengan jalur nasabah. Endpoint CS berikutnya menyusul ke sini.
+		r.Route("/onboarding", func(r chi.Router) {
+			// Daftar sesi tidak memuat PII, jadi cukup kewenangan petugas panggilan.
+			r.With(middleware.AgentAuth(csAgentLookup, middleware.ScopeVideoCall)).
+				Get("/sessions", onboardingH.ListSessionsForCS)
+
+			// Detailnya memuat data pribadi, dan itu kewenangan tersendiri.
+			r.With(middleware.AgentAuth(csAgentLookup, middleware.ScopeCustomerPII)).
+				Get("/sessions/{session_id}", onboardingH.GetSessionDetailForCS)
+		})
 	})
 
 	// Not found — consistent envelope

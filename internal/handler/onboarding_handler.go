@@ -8,14 +8,17 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
 	"github.com/holis12821/bca-mobile-api/internal/middleware"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/pagination"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/response"
 )
 
@@ -747,4 +750,205 @@ func (h *OnboardingHandler) handleErr(w http.ResponseWriter, r *http.Request, ms
 		)
 	}
 	response.Err(w, r, appErr)
+}
+
+// --- Pemantauan sesi sisi CS ---
+
+// ListSessionsForCS handles GET /internal/v1/onboarding/sessions
+//
+// Internal, ber-scope VIDEO_CALL. Tidak memuat PII: daftar ini terbuka sepanjang hari
+// di layar petugas, dan data pribadi hanya relevan untuk sesi yang sedang ditangani.
+func (h *OnboardingHandler) ListSessionsForCS(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	filter := onboarding.ListCSSessionsFilter{
+		IncludeExpired: q.Get("include_expired") == "true",
+	}
+
+	if raw := q.Get("step"); raw != "" {
+		step := onboarding.Step(raw)
+		// Langkah tak dikenal ditolak, bukan dibiarkan menghasilkan daftar kosong:
+		// nol baris karena salah ketik tidak bisa dibedakan dari nol baris karena
+		// memang tidak ada yang di langkah itu.
+		if !onboarding.ValidStep(step) {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		filter.Step = step
+	}
+
+	if raw := q.Get("stalled_for_seconds"); raw != "" {
+		secs, err := strconv.Atoi(raw)
+		if err != nil || secs < 0 {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		filter.StalledFor = time.Duration(secs) * time.Second
+	}
+
+	limit := 20
+	if raw := q.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 100 {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		limit = parsed
+	}
+	filter.Limit = limit
+
+	if raw := q.Get("cursor"); raw != "" {
+		decoded, err := pagination.DecodeHistoryCursor(raw)
+		if err != nil {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, decoded.CreatedAt)
+		if err != nil {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		id, err := uuid.Parse(decoded.ID)
+		if err != nil {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		filter.Cursor = &onboarding.CSSessionCursor{CreatedAt: createdAt, ID: id}
+	}
+
+	items, hasMore, next, err := h.monitoringService.ListSessions(r.Context(), filter)
+	if err != nil {
+		h.handleErr(w, r, "list sessions for cs failed", err)
+		return
+	}
+
+	nextCursor := ""
+	if next != nil {
+		nextCursor = pagination.HistoryCursor{
+			CreatedAt: next.CreatedAt.Format(time.RFC3339Nano),
+			ID:        next.ID.String(),
+		}.Encode()
+	}
+
+	response.SuccessWithPagination(w, r, http.StatusOK, map[string]any{
+		"sessions": items,
+	}, response.Pagination{
+		Cursor:  nextCursor,
+		HasMore: hasMore,
+		Limit:   limit,
+	})
+}
+
+// GetSessionDetailForCS handles GET /internal/v1/onboarding/sessions/{session_id}
+//
+// Internal, ber-scope CUSTOMER_PII — bukan VIDEO_CALL. Melayani panggilan menampilkan
+// nasabah yang SEDANG bicara; endpoint ini menjangkau siapa pun yang pernah mendaftar,
+// dan itu kewenangan yang berbeda ukurannya.
+//
+// Setiap pemanggilan yang berhasil menulis CS_SESSION_VIEWED ke jejak audit sesi.
+func (h *OnboardingHandler) GetSessionDetailForCS(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	agent, ok := authenticatedAgent(w, r)
+	if !ok {
+		return
+	}
+
+	detail, err := h.monitoringService.GetSessionDetail(
+		r.Context(), sessionID, "agent:"+agent.EmployeeID, extractIP(r), r.UserAgent(),
+	)
+	if err != nil {
+		h.handleErr(w, r, "get session detail for cs failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, detail)
+}
+
+// --- Penjadwalan ulang video call (sisi nasabah) ---
+
+// ScheduleVideoCall handles POST /v1/onboarding/video-call/schedule
+//
+// Endpoint NASABAH, bukan CS: penjaganya deviceOwnsSession, sama dengan
+// /video-call/queue. Tanpa itu, session_id siapa pun yang tertebak bisa dijadwalkan
+// oleh siapa pun.
+//
+// Melayani tombol "Jadwalkan Panggilan Nanti" yang sampai sekarang dimatikan di aplikasi
+// Android karena tidak ada endpoint yang menerimanya.
+func (h *OnboardingHandler) ScheduleVideoCall(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.ScheduleVideoCallRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if req.SessionID == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	if !h.deviceOwnsSession(w, r, req.SessionID) {
+		return
+	}
+
+	resp, err := h.videoCallService.ScheduleVideoCall(r.Context(), req, extractIP(r), r.UserAgent())
+	if err != nil {
+		h.handleErr(w, r, "schedule video call failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusCreated, resp)
+}
+
+// GetVideoCallSchedule handles GET /v1/onboarding/video-call/schedule?session_id=
+//
+// Mengembalikan 200 dengan schedule null kalau tidak ada jadwal aktif, bukan 404: "belum
+// menjadwalkan" adalah keadaan normal bagi hampir semua sesi, dan 404 memaksa client
+// memperlakukan keadaan normal itu sebagai kegagalan.
+func (h *OnboardingHandler) GetVideoCallSchedule(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("session_id")
+	if sessionID == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	if !h.deviceOwnsSession(w, r, sessionID) {
+		return
+	}
+
+	sch, err := h.videoCallService.GetVideoCallSchedule(r.Context(), sessionID)
+	if err != nil {
+		h.handleErr(w, r, "get video call schedule failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, map[string]any{
+		"schedule":        sch,
+		"operating_hours": onboarding.DefaultOperatingHours(),
+	})
+}
+
+// CancelVideoCallSchedule handles DELETE /v1/onboarding/video-call/schedule?session_id=
+func (h *OnboardingHandler) CancelVideoCallSchedule(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("session_id")
+	if sessionID == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	if !h.deviceOwnsSession(w, r, sessionID) {
+		return
+	}
+
+	if err := h.videoCallService.CancelVideoCallSchedule(
+		r.Context(), sessionID, extractIP(r), r.UserAgent(),
+	); err != nil {
+		h.handleErr(w, r, "cancel video call schedule failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, map[string]any{"cancelled": true})
 }

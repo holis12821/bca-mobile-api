@@ -52,6 +52,8 @@ untuk pekerjaan mendalam:
 | `profil-saya-kartu-api` | kartu milik nasabah, `tier`, konten Pusat Bantuan & Kontak CS |
 | `push-notification-api` | `POST /account/device/push-token`, `internal/pkg/notify` + `push`, filter `type` notifikasi, transport FCM |
 | `twilio-sms-otp` | setup & integrasi provider SMS: kredensial Twilio, `SMS_*`, `internal/pkg/sms`, normalisasi E.164, menelusuri OTP yang tidak sampai |
+| `cs-desktop-api-integration` | kontrak 14 endpoint CS yang **sudah terbit** — auth tiga lapis, cakupan petugas, signaling, penyamaran PII |
+| `cs-desktop-workflow-backend` | **analisis selisih** untuk alur desktop CS 19 layar: identitas petugas, siklus hidup terminal, gerbang kesiapan, KPI, `NEED_REVIEW` — apa yang belum ada dan kontraknya |
 
 File ini hanya memuat yang **tidak** ada di skill: workflow harian, jebakan
 nyata di repo ini, dan aturan di atas.

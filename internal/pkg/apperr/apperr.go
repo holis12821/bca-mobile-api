@@ -189,6 +189,77 @@ var (
 	OnboardingIncomplete         = Error{http.StatusUnprocessableEntity, "ONBOARDING_INCOMPLETE", "Belum semua langkah selesai.", nil}
 )
 
+// --- Petugas & terminal CS ---
+
+var (
+	// 401, bukan 403: kredensial login yang salah berbeda dari kewenangan yang kurang.
+	// Jalur header petugas tetap 403 — di sana penyerang tidak boleh bisa membedakan
+	// kunci sistem salah dari kunci petugas salah.
+	AgentCredentialInvalid = Error{http.StatusUnauthorized, "AGENT_CREDENTIAL_INVALID", "NPP atau kata sandi salah.", nil}
+
+	// Petugas yang belum pernah menyetel kata sandi tidak sedang salah mengetik —
+	// menjawabnya "kata sandi salah" akan membuatnya mencoba lagi selamanya.
+	AgentPasswordNotSet = Error{http.StatusUnprocessableEntity, "AGENT_PASSWORD_NOT_SET", "Kata sandi belum disetel. Hubungi supervisor untuk penyetelan awal.", nil}
+
+	AgentLocked = Error{http.StatusLocked, "AGENT_LOCKED", "Akun terkunci sementara karena terlalu banyak percobaan gagal.", nil}
+
+	AgentPasswordWeak = Error{http.StatusUnprocessableEntity, "AGENT_PASSWORD_WEAK", "Kata sandi minimal 12 karakter.", nil}
+
+	AgentSessionInvalid = Error{http.StatusUnauthorized, "AGENT_SESSION_INVALID", "Sesi tidak berlaku. Silakan masuk kembali.", nil}
+
+	AgentSessionNotFound = Error{http.StatusNotFound, "AGENT_SESSION_NOT_FOUND", "Tidak ada sesi aktif.", nil}
+
+	TerminalNotFound = Error{http.StatusNotFound, "TERMINAL_NOT_FOUND", "Terminal tidak terdaftar.", nil}
+
+	TerminalAlreadyRegistered = Error{http.StatusConflict, "TERMINAL_ALREADY_REGISTERED", "Terminal dengan ID itu sudah terdaftar.", nil}
+
+	// Rule 3: aktivasi menuntut ketiga gerbang lolos dan belum kedaluwarsa.
+	TerminalNotReady = Error{http.StatusUnprocessableEntity, "TERMINAL_NOT_READY", "Terminal belum siap. Selesaikan otorisasi supervisor, healthcheck perangkat, dan pakta integritas.", nil}
+
+	// Rule 4: hanya petugas di terminal ONLINE yang boleh mengambil antrean.
+	TerminalNotOnline = Error{http.StatusUnprocessableEntity, "TERMINAL_NOT_ONLINE", "Terminal belum aktif. Selesaikan kesiapan terminal lebih dulu.", nil}
+
+	TerminalAgentBusy = Error{http.StatusConflict, "TERMINAL_AGENT_BUSY", "Anda masih aktif di terminal lain. Tutup giliran di sana lebih dulu.", nil}
+
+	// Petugas yang sudah memegang panggilan tidak boleh mengambil yang kedua.
+	AgentCallInProgress = Error{http.StatusConflict, "AGENT_CALL_IN_PROGRESS", "Anda masih menangani panggilan lain.", nil}
+
+	SupervisorNotFound = Error{http.StatusNotFound, "SUPERVISOR_NOT_FOUND", "Supervisor tidak ditemukan.", nil}
+
+	SupervisorTokenInvalid = Error{http.StatusUnauthorized, "SUPERVISOR_TOKEN_INVALID", "Token otorisasi supervisor tidak sah.", nil}
+
+	// HRIS adalah sistem luar. 503, bukan 404: 404 akan terbaca sebagai "NPP tidak
+	// terdaftar" dan membuat pegawai mengira dirinya salah ketik.
+	HRISUnavailable = Error{http.StatusServiceUnavailable, "HRIS_UNAVAILABLE", "Direktori pegawai sedang tidak tersedia.", nil}
+
+	// Tiga jawaban berbeda yang tidak boleh disatukan: ditemukan & aktif, ditemukan
+	// tapi nonaktif, tidak ditemukan. Menyamakan dua yang terakhir membuat pegawai yang
+	// statusnya dicabut mengira ia salah ketik.
+	EmployeeNotFound = Error{http.StatusNotFound, "EMPLOYEE_NOT_FOUND", "NPP tidak ditemukan di direktori pegawai.", nil}
+
+	EmployeeInactive = Error{http.StatusUnprocessableEntity, "EMPLOYEE_INACTIVE", "Status kepegawaian NPP ini tidak aktif.", nil}
+
+	AgentAlreadyRegistered = Error{http.StatusConflict, "AGENT_ALREADY_REGISTERED", "NPP ini sudah terdaftar sebagai petugas.", nil}
+)
+
+// --- 422 (eskalasi verifikasi) ---
+
+var (
+	// Nasabah NEED_REVIEW tetap di langkah VIDEO_CALL, tapi tidak boleh mengantre lagi:
+	// Tier 1 akan melayaninya dan menghasilkan keputusan yang sama.
+	VideoCallUnderReview = Error{http.StatusUnprocessableEntity, "VIDEO_CALL_UNDER_REVIEW", "Verifikasi Anda sedang ditinjau petugas. Mohon tunggu, kami akan menghubungi Anda.", nil}
+
+	VideoCallEscalationExists = Error{http.StatusConflict, "VIDEO_CALL_ESCALATION_EXISTS", "Sesi ini sudah dalam peninjauan.", nil}
+)
+
+// --- 422 (penjadwalan video call) ---
+
+var (
+	VideoCallAlreadyScheduled = Error{http.StatusUnprocessableEntity, "VIDEO_CALL_ALREADY_SCHEDULED", "Anda sudah punya jadwal video call. Batalkan dulu untuk menjadwalkan ulang.", nil}
+	VideoCallScheduleInvalid  = Error{http.StatusUnprocessableEntity, "VIDEO_CALL_SCHEDULE_INVALID", "Waktu yang dipilih tidak tersedia. Pilih jam 06:00-22:00 WIB, maksimal 7 hari ke depan.", nil}
+	VideoCallScheduleNotFound = Error{http.StatusNotFound, "VIDEO_CALL_SCHEDULE_NOT_FOUND", "Tidak ada jadwal video call yang bisa dibatalkan.", nil}
+)
+
 // --- 422 (OCR) ---
 
 var (

@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
 )
 
@@ -195,6 +198,107 @@ func (r *OnboardingSessionRepo) CountActiveByDevice(ctx context.Context, deviceI
 		return 0, fmt.Errorf("count active sessions: %w", err)
 	}
 	return count, nil
+}
+
+// ListForCS mengembalikan sesi untuk layar pemantauan petugas.
+//
+// Keyset, bukan OFFSET: daftar ini diurut created_at DESC dan sesi baru masuk terus
+// sepanjang hari, jadi OFFSET akan membuat halaman kedua melewatkan baris yang bergeser.
+// Pola dan alasannya sama dengan mutasi rekening.
+//
+// Mengembalikan limit+1 baris. Pemanggilnya memotong kelebihannya dan memakai
+// keberadaannya sebagai has_more — satu query, bukan query plus COUNT yang jawabannya
+// sudah basi sebelum terkirim.
+func (r *OnboardingSessionRepo) ListForCS(ctx context.Context, filter onboarding.ListCSSessionsFilter) ([]*onboarding.Session, error) {
+	// Argumen dirakit berurutan supaya nomor placeholder tidak pernah dihitung manual —
+	// salah satu penyebab paling sering query filter opsional yang menunjuk kolom salah.
+	args := []any{}
+	where := []string{"deleted_at IS NULL"}
+
+	add := func(clause string, vals ...any) {
+		for i := range vals {
+			args = append(args, vals[i])
+			clause = strings.Replace(clause, "?", fmt.Sprintf("$%d", len(args)), 1)
+		}
+		where = append(where, clause)
+	}
+
+	if filter.Step != "" {
+		add("current_step = ?", string(filter.Step))
+	}
+	if !filter.IncludeExpired {
+		add("expires_at > ?", time.Now().UTC())
+	}
+	if filter.StalledFor > 0 {
+		add("updated_at <= ?", time.Now().UTC().Add(-filter.StalledFor))
+	}
+	if filter.Cursor != nil {
+		// Baris dengan created_at sama dibedakan id, supaya tidak ada yang terlewat
+		// maupun muncul dua kali di batas halaman.
+		add("(created_at, id) < (?, ?)", filter.Cursor.CreatedAt, filter.Cursor.ID)
+	}
+
+	args = append(args, filter.Limit+1)
+
+	query := fmt.Sprintf(`
+		SELECT id, session_id, device_id, product_type, current_step, tnc_version,
+		       steps_completed, created_at, updated_at, expires_at, deleted_at,
+		       card_type, card_selected_at, card_catalog_version
+		FROM onboarding_sessions
+		WHERE %s
+		ORDER BY created_at DESC, id DESC
+		LIMIT $%d`, strings.Join(where, " AND "), len(args))
+
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions for cs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*onboarding.Session
+	for rows.Next() {
+		var sess onboarding.Session
+		var pt, step string
+		var stepsJSON []byte
+		var cardType, cardCatalogVersion, tncVersion *string
+
+		// tnc_version lewat *string, bukan langsung ke field string-nya: kolomnya
+		// nullable, dan satu baris NULL di tengah daftar akan menggagalkan SELURUH
+		// permintaan dengan "cannot scan NULL into *string". Sesi yang dibuat lewat API
+		// selalu mengisinya, jadi kegagalannya hanya muncul pada baris lama atau baris
+		// yang ditulis di luar jalur biasa — tepat baris yang paling perlu dilihat
+		// petugas saat sesuatu tidak beres.
+		if err := rows.Scan(
+			&sess.ID, &sess.SessionID, &sess.DeviceID,
+			&pt, &step, &tncVersion,
+			&stepsJSON,
+			&sess.CreatedAt, &sess.UpdatedAt, &sess.ExpiresAt, &sess.DeletedAt,
+			&cardType, &sess.CardSelectedAt, &cardCatalogVersion,
+		); err != nil {
+			return nil, fmt.Errorf("scan session for cs: %w", err)
+		}
+
+		sess.ProductType = onboarding.ProductType(pt)
+		sess.CurrentStep = onboarding.Step(step)
+		if tncVersion != nil {
+			sess.TNCVersion = *tncVersion
+		}
+		if cardType != nil {
+			sess.CardType = *cardType
+		}
+		if cardCatalogVersion != nil {
+			sess.CardCatalogVersion = *cardCatalogVersion
+		}
+		if err := json.Unmarshal(stepsJSON, &sess.StepsCompleted); err != nil {
+			return nil, fmt.Errorf("unmarshal steps: %w", err)
+		}
+
+		out = append(out, &sess)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate sessions for cs: %w", err)
+	}
+	return out, nil
 }
 
 // OnboardingAuditRepo handles append-only audit log inserts.
@@ -741,38 +845,43 @@ func NewCSAgentRepo(pool *pgxpool.Pool) *CSAgentRepo {
 // (`employeeID`) dan membuktikannya dengan `apiKey`. Pola yang sama dipakai login nasabah;
 // yang berbeda hanya dari mana identitasnya datang.
 //
-// Tiga keadaan dibedakan dengan sengaja: (name, true, nil) berhasil, ("", false, nil)
-// kredensial salah atau petugas tidak aktif, dan ("", false, err) kegagalan infrastruktur.
-// Pemanggilnya TIDAK boleh memperlakukan yang ketiga sebagai penolakan — Postgres yang
-// tersendat bukan bukti bahwa petugasnya tidak berwenang.
-func (r *CSAgentRepo) AuthenticateAgent(ctx context.Context, employeeID, apiKey string) (string, bool, error) {
+// Tiga keadaan dibedakan dengan sengaja: (name, scopes, true, nil) berhasil,
+// ("", nil, false, nil) kredensial salah atau petugas tidak aktif, dan
+// ("", nil, false, err) kegagalan infrastruktur. Pemanggilnya TIDAK boleh memperlakukan
+// yang ketiga sebagai penolakan — Postgres yang tersendat bukan bukti bahwa petugasnya
+// tidak berwenang.
+//
+// Cakupan ikut dikembalikan, bukan ditanya terpisah: kewenangan yang dibaca dari baris
+// yang berbeda dengan yang mengautentikasi membuka celah waktu antara keduanya.
+func (r *CSAgentRepo) AuthenticateAgent(ctx context.Context, employeeID, apiKey string) (string, []string, bool, error) {
 	if employeeID == "" || apiKey == "" {
-		return "", false, nil
+		return "", nil, false, nil
 	}
 
 	var name, hash string
+	var scopes []string
 	err := r.pool.QueryRow(ctx,
-		`SELECT name, api_key_hash FROM cs_agents WHERE employee_id = $1 AND is_active`,
+		`SELECT name, api_key_hash, scopes FROM cs_agents WHERE employee_id = $1 AND is_active`,
 		employeeID,
-	).Scan(&name, &hash)
+	).Scan(&name, &hash, &scopes)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Petugas tidak dikenal. Argon2 sengaja tidak dijalankan di sini: jalur ini
 			// hanya terbuka bagi pemanggil yang sudah lolos X-Internal-API-Key, jadi
 			// tidak ada penyerang anonim yang bisa mengukur selisih waktunya.
-			return "", false, nil
+			return "", nil, false, nil
 		}
-		return "", false, fmt.Errorf("find cs agent: %w", err)
+		return "", nil, false, fmt.Errorf("find cs agent: %w", err)
 	}
 
 	ok, err := crypto.VerifyPassword(ctx, apiKey, hash)
 	if err != nil {
-		return "", false, fmt.Errorf("verify cs agent key: %w", err)
+		return "", nil, false, fmt.Errorf("verify cs agent key: %w", err)
 	}
 	if !ok {
-		return "", false, nil
+		return "", nil, false, nil
 	}
-	return name, true, nil
+	return name, scopes, true, nil
 }
 
 // OnboardingCredentialRepo persists hashed credentials for onboarding.
@@ -846,4 +955,72 @@ func parseBirthDate(v string) (*time.Time, error) {
 		return nil, fmt.Errorf("tanggal_lahir %q is not an ISO date: %w", v, err)
 	}
 	return &t, nil
+}
+
+// OnboardingVideoCallScheduleRepo menyimpan janji video call.
+type OnboardingVideoCallScheduleRepo struct {
+	pool *pgxpool.Pool
+}
+
+func NewOnboardingVideoCallScheduleRepo(pool *pgxpool.Pool) *OnboardingVideoCallScheduleRepo {
+	return &OnboardingVideoCallScheduleRepo{pool: pool}
+}
+
+// Create menyisipkan jadwal baru.
+//
+// Jadwal ganda dijawab dari PELANGGARAN UNIQUE INDEX (23505), bukan dari SELECT lebih
+// dulu: idx_vc_schedules_one_active hanya mengizinkan satu baris SCHEDULED per sesi, dan
+// dua permintaan bersamaan akan sama-sama melihat "belum ada jadwal" kalau diperiksa di
+// aplikasi. Yang benar-benar menahannya adalah index.
+func (r *OnboardingVideoCallScheduleRepo) Create(ctx context.Context, sch *onboarding.VideoCallSchedule) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO onboarding_video_call_schedules
+			(id, schedule_id, session_id, scheduled_at, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5::video_call_schedule_status, $6, $6)`,
+		sch.ID, sch.ScheduleID, sch.SessionID, sch.ScheduledAt,
+		string(sch.Status), sch.CreatedAt,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return apperr.VideoCallAlreadyScheduled
+		}
+		return fmt.Errorf("insert video call schedule: %w", err)
+	}
+	return nil
+}
+
+func (r *OnboardingVideoCallScheduleRepo) FindActiveBySessionID(ctx context.Context, sessionID string) (*onboarding.VideoCallSchedule, error) {
+	var sch onboarding.VideoCallSchedule
+	var status string
+
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, schedule_id, session_id, scheduled_at, status, created_at
+		FROM onboarding_video_call_schedules
+		WHERE session_id = $1 AND status = 'SCHEDULED'`, sessionID,
+	).Scan(&sch.ID, &sch.ScheduleID, &sch.SessionID, &sch.ScheduledAt, &status, &sch.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find active video call schedule: %w", err)
+	}
+
+	sch.Status = onboarding.VideoCallScheduleStatus(status)
+	return &sch, nil
+}
+
+// CancelBySessionID membatalkan jadwal aktif. Nol baris bukan error — pemanggilnya yang
+// memutuskan apakah itu berarti 404.
+func (r *OnboardingVideoCallScheduleRepo) CancelBySessionID(ctx context.Context, sessionID string) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE onboarding_video_call_schedules
+		SET status = 'CANCELLED', updated_at = $2
+		WHERE session_id = $1 AND status = 'SCHEDULED'`,
+		sessionID, time.Now().UTC(),
+	)
+	if err != nil {
+		return false, fmt.Errorf("cancel video call schedule: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }

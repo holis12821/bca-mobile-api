@@ -77,6 +77,15 @@ var skippableSteps = map[Step]bool{
 	StepCardSelection: true,
 }
 
+// ValidStep melaporkan apakah s adalah salah satu langkah yang dikenal.
+//
+// Ada supaya handler bisa menolak filter `?step=FOO` sebagai VALIDATION_ERROR, bukan
+// meneruskannya ke query yang akan menjawab daftar kosong — daftar kosong tidak bisa
+// dibedakan dari "memang tidak ada sesi di langkah itu".
+func ValidStep(s Step) bool {
+	return stepIndex(s) >= 0
+}
+
 func stepIndex(s Step) int {
 	for i, candidate := range stepOrder {
 		if candidate == s {
@@ -327,6 +336,18 @@ const (
 	// yang dilihat nasabah untuk keperluan sengketa, sementara baris ini
 	// membuat pilihan kartu ikut terlihat di lini masa audit sesi.
 	AuditCardSelected AuditEventType = "CARD_SELECTED"
+
+	// CS_SESSION_VIEWED dicatat setiap kali petugas membuka data pribadi sebuah sesi.
+	//
+	// Membaca PII adalah tindakan yang harus bisa dipertanggungjawabkan, sama seperti
+	// memutuskan hasil verifikasi. Tanpa baris ini, satu-satunya jejak bahwa seseorang
+	// membuka NIK dan alamat nasabah adalah log aplikasi yang tidak kekal dan tidak
+	// terikat ke sesinya.
+	AuditCSSessionViewed AuditEventType = "CS_SESSION_VIEWED"
+
+	// Penjadwalan ulang video call oleh nasabah.
+	AuditVideoCallScheduled         AuditEventType = "VIDEO_CALL_SCHEDULED"
+	AuditVideoCallScheduleCancelled AuditEventType = "VIDEO_CALL_SCHEDULE_CANCELLED"
 )
 
 // AuditLog represents an onboarding audit entry.
@@ -355,6 +376,110 @@ type GetAuditTrailResponse struct {
 	SessionID string             `json:"session_id"`
 	Events    []AuditLogResponse `json:"events"`
 	Count     int                `json:"count"`
+}
+
+// --- Pemantauan sesi sisi CS ---
+
+// CSSessionSummary adalah satu baris di daftar pemantauan sesi onboarding.
+//
+// TIDAK memuat PII, dan itu sengaja: daftar ini dibuka sepanjang hari di layar petugas,
+// sementara data pribadi hanya relevan untuk satu sesi yang sedang ditangani. Memasukkan
+// nama atau NIK ke sini berarti memaparkan seluruh pendaftar hari itu untuk membaca satu.
+// Yang butuh PII memanggil detailnya, dan panggilan itu tercatat.
+type CSSessionSummary struct {
+	SessionID      string         `json:"session_id"`
+	ProductType    ProductType    `json:"product_type"`
+	CurrentStep    Step           `json:"current_step"`
+	CardType       string         `json:"card_type,omitempty"`
+	StepsCompleted StepsCompleted `json:"steps_completed"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+	ExpiresAt      time.Time      `json:"expires_at"`
+
+	// Expired dihitung di aplikasi, bukan dibaca dari kolom: tidak ada proses yang
+	// menandai sesi kedaluwarsa saat waktunya lewat, jadi satu-satunya kebenaran adalah
+	// perbandingan expires_at dengan sekarang.
+	Expired bool `json:"expired"`
+
+	// StalledSeconds adalah lama sesi diam di langkahnya sekarang. Inilah angka yang
+	// dicari petugas: sesi yang tidak bergerak 40 menit di BIOMETRIC adalah nasabah yang
+	// kemungkinan besar sedang gagal, bukan nasabah yang sedang santai.
+	StalledSeconds int `json:"stalled_seconds"`
+}
+
+// ListCSSessionsFilter menyaring daftar sesi untuk petugas.
+type ListCSSessionsFilter struct {
+	// Step kosong berarti semua langkah.
+	Step Step
+
+	// StalledFor > 0 hanya memuat sesi yang tidak bergerak selama itu.
+	StalledFor time.Duration
+
+	// IncludeExpired default false: sesi kedaluwarsa tidak bisa ditindaklanjuti siapa
+	// pun, dan menampilkannya secara default membuat daftar penuh baris mati.
+	IncludeExpired bool
+
+	Limit  int
+	Cursor *CSSessionCursor
+}
+
+// CSSessionCursor memegang nilai keyset untuk ORDER BY created_at DESC, id DESC.
+type CSSessionCursor struct {
+	CreatedAt time.Time
+	ID        uuid.UUID
+}
+
+// CSSessionDetail adalah satu sesi berikut data pribadinya, untuk petugas ber-scope
+// CUSTOMER_PII.
+//
+// Kebijakan penyamaran ada di [MaskedPersonalData] — satu tempat, supaya mengubahnya
+// tidak menuntut menelusuri setiap field.
+type CSSessionDetail struct {
+	CSSessionSummary
+
+	// PersonalData nil kalau nasabah belum sampai langkah PERSONAL_DATA. Itu keadaan
+	// normal, bukan kegagalan: sesi yang baru lewat OCR memang belum punya apa pun.
+	PersonalData *MaskedPersonalData `json:"personal_data"`
+
+	VideoCall *CSSessionVideoCall `json:"video_call,omitempty"`
+}
+
+// MaskedPersonalData adalah data pribadi sesi dengan penyamaran yang berlaku.
+//
+// KEBIJAKAN, dan alasannya:
+//   - nama_lengkap UTUH — inti pekerjaan petugas adalah mencocokkan orang dengan namanya;
+//     menyamarkannya membuat endpoint ini tidak berguna.
+//   - nik DISAMARKAN jadi 4 depan + 2 belakang. NIK adalah pengenal terkuat yang ada di
+//     sini dan berlaku seumur hidup. Petugas yang benar-benar perlu membacanya melakukannya
+//     saat panggilan, dari kartu fisik yang ditunjukkan nasabah — bukan dari layar ini.
+//   - nomor_hp dan email DISAMARKAN. Cukup untuk memastikan "ini nomor yang Anda daftarkan",
+//     tidak cukup untuk menghubungi nasabah di luar jalur resmi.
+//   - alamat, tempat/tanggal lahir, pekerjaan, penghasilan UTUH — dibutuhkan untuk
+//     verifikasi dan tidak bisa dipakai menyamar sebagai nasabah.
+type MaskedPersonalData struct {
+	NamaLengkap         string      `json:"nama_lengkap"`
+	NIKMasked           string      `json:"nik_masked"`
+	TempatLahir         string      `json:"tempat_lahir"`
+	TanggalLahir        string      `json:"tanggal_lahir"`
+	JenisKelamin        string      `json:"jenis_kelamin"`
+	AlamatKTP           AlamatKTP   `json:"alamat_ktp"`
+	AlamatDomisiliSama  bool        `json:"alamat_domisili_sama"`
+	Pekerjaan           Pekerjaan   `json:"pekerjaan"`
+	PenghasilanPerBulan Penghasilan `json:"penghasilan_per_bulan"`
+	SumberDanaUtama     SumberDana  `json:"sumber_dana_utama"`
+	NomorHPMasked       string      `json:"nomor_hp_masked"`
+	EmailMasked         string      `json:"email_masked"`
+}
+
+// CSSessionVideoCall adalah panggilan terakhir sebuah sesi, kalau ada.
+type CSSessionVideoCall struct {
+	QueueID     string          `json:"queue_id"`
+	QueueNumber string          `json:"queue_number"`
+	Status      VideoCallStatus `json:"status"`
+	Result      VideoCallResult `json:"result,omitempty"`
+	AgentName   string          `json:"agent_name,omitempty"`
+	JoinedAt    time.Time       `json:"joined_at"`
+	EndedAt     *time.Time      `json:"ended_at,omitempty"`
 }
 
 // --- Monitoring Types ---
@@ -613,7 +738,76 @@ type VideoCallResult string
 const (
 	VCResultApproved VideoCallResult = "APPROVED"
 	VCResultRejected VideoCallResult = "REJECTED"
+
+	// VCResultNeedReview: petugas tidak bisa memutuskan, perkaranya dieskalasi.
+	//
+	// Nasabah TETAP di langkah VIDEO_CALL — tidak ada nilai baru di enum
+	// onboarding_step, jadi aplikasi Android tidak menemui `current_step` yang tidak
+	// dikenalnya. Yang menahannya supaya tidak mengantre lagi adalah baris eskalasi;
+	// lihat [VideoCallEscalation] dan penjaga di JoinQueue.
+	VCResultNeedReview VideoCallResult = "NEED_REVIEW"
 )
+
+func ValidVideoCallResult(r VideoCallResult) bool {
+	switch r {
+	case VCResultApproved, VCResultRejected, VCResultNeedReview:
+		return true
+	}
+	return false
+}
+
+// RejectionReason adalah alasan penolakan verifikasi, ber-ENUM.
+//
+// Bukan teks bebas: alasan penolakan verifikasi identitas adalah hal yang akan
+// dilaporkan dan dihitung, dan teks bebas membuat "KTP tidak jelas", "ktp blur", dan
+// "dokumen tidak terbaca" menjadi tiga kategori yang berbeda.
+type RejectionReason string
+
+const (
+	RejectIdentityMismatch      RejectionReason = "IDENTITY_MISMATCH"
+	RejectInvalidDocument       RejectionReason = "INVALID_DOCUMENT"
+	RejectFaceMismatch          RejectionReason = "FACE_MISMATCH"
+	RejectSuspiciousActivity    RejectionReason = "SUSPICIOUS_ACTIVITY"
+	RejectIncompleteInformation RejectionReason = "INCOMPLETE_INFORMATION"
+	RejectOther                 RejectionReason = "OTHER"
+)
+
+func ValidRejectionReason(r RejectionReason) bool {
+	switch r {
+	case RejectIdentityMismatch, RejectInvalidDocument, RejectFaceMismatch,
+		RejectSuspiciousActivity, RejectIncompleteInformation, RejectOther:
+		return true
+	}
+	return false
+}
+
+// Antrean eskalasi. Cocok dengan CHECK di migrasi 000038.
+const (
+	EscalationTier2      = "TIER_2_VERIFICATION"
+	EscalationFraud      = "FRAUD_REVIEW"
+	EscalationCompliance = "COMPLIANCE_REVIEW"
+)
+
+func ValidEscalationQueue(q string) bool {
+	switch q {
+	case EscalationTier2, EscalationFraud, EscalationCompliance:
+		return true
+	}
+	return false
+}
+
+// VideoCallEscalation adalah satu perkara yang dieskalasi dari hasil NEED_REVIEW.
+type VideoCallEscalation struct {
+	EscalationID    string     `json:"escalation_id"`
+	SessionID       string     `json:"session_id"`
+	QueueID         string     `json:"queue_id"`
+	EscalationQueue string     `json:"escalation_queue"`
+	Status          string     `json:"status"`
+	Reason          string     `json:"reason"`
+	RaisedByAgent   string     `json:"raised_by_agent"`
+	RaisedAt        time.Time  `json:"raised_at"`
+	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
+}
 
 // VideoCall represents a video call session stored in the DB.
 type VideoCall struct {
@@ -675,6 +869,47 @@ type ICEServer struct {
 	Credential string   `json:"credential,omitempty"`
 }
 
+// --- Penjadwalan ulang video call ---
+
+// VideoCallScheduleStatus mengikuti ENUM di migrasi 000031.
+type VideoCallScheduleStatus string
+
+const (
+	VCScheduleScheduled VideoCallScheduleStatus = "SCHEDULED"
+	VCScheduleCancelled VideoCallScheduleStatus = "CANCELLED"
+	VCScheduleFulfilled VideoCallScheduleStatus = "FULFILLED"
+)
+
+// VideoCallSchedule adalah satu janji video call.
+type VideoCallSchedule struct {
+	ID          uuid.UUID               `json:"-"`
+	ScheduleID  string                  `json:"schedule_id"`
+	SessionID   string                  `json:"session_id"`
+	ScheduledAt time.Time               `json:"scheduled_at"`
+	Status      VideoCallScheduleStatus `json:"status"`
+	CreatedAt   time.Time               `json:"created_at"`
+}
+
+// ScheduleVideoCallRequest adalah body POST /v1/onboarding/video-call/schedule.
+type ScheduleVideoCallRequest struct {
+	SessionID string `json:"session_id"`
+
+	// ScheduledAt wajib membawa offset zona waktu (RFC 3339). Tanpa offset, "08:00"
+	// bisa berarti dua jam berbeda, dan yang salah tafsir adalah janji dengan nasabah.
+	ScheduledAt string `json:"scheduled_at"`
+}
+
+// ScheduleVideoCallResponse dikembalikan setelah jadwal dibuat.
+type ScheduleVideoCallResponse struct {
+	ScheduleID  string    `json:"schedule_id"`
+	SessionID   string    `json:"session_id"`
+	ScheduledAt time.Time `json:"scheduled_at"`
+	Status      string    `json:"status"`
+
+	// OperatingHours disertakan supaya client tidak perlu menanamkan jamnya sendiri.
+	OperatingHours OperatingHours `json:"operating_hours"`
+}
+
 // SubmitVideoCallResultRequest is sent by the CS backend after a call.
 //
 // `agent_employee_id` **tidak** ada di sini lagi. Identitas petugas datang dari kredensial
@@ -691,6 +926,14 @@ type SubmitVideoCallResultRequest struct {
 	Notes               string `json:"notes"`
 	CallDurationSeconds int    `json:"call_duration_seconds"`
 	RecordingID         string `json:"recording_id"`
+
+	// RejectionReason WAJIB saat result REJECTED, dan ber-enum (§38 dokumen alur).
+	// Diabaikan pada hasil lain.
+	RejectionReason string `json:"rejection_reason"`
+
+	// EscalationQueue WAJIB saat result NEED_REVIEW (§39). Kosong berarti
+	// TIER_2_VERIFICATION.
+	EscalationQueue string `json:"escalation_queue"`
 }
 
 // SubmitVideoCallResultResponse is returned after the CS backend submits a result.
@@ -698,6 +941,11 @@ type SubmitVideoCallResultResponse struct {
 	SessionID   string `json:"session_id"`
 	Result      string `json:"result"`
 	CurrentStep Step   `json:"current_step"`
+
+	// Escalation terisi hanya pada NEED_REVIEW. `current_step` tetap VIDEO_CALL di
+	// kasus itu, jadi tanpa field ini aplikasi desktop tidak bisa membedakan eskalasi
+	// dari penolakan — keduanya meninggalkan nasabah di langkah yang sama.
+	Escalation *VideoCallEscalation `json:"escalation,omitempty"`
 }
 
 // Signaling roles. These are the only two sides of a video call, and the role
@@ -796,6 +1044,12 @@ type SignalMessage struct {
 	AgentName       string `json:"agent_name,omitempty"`
 	DurationSeconds int    `json:"duration_seconds,omitempty"`
 
+	// Reason terisi hanya pada `call_ended` yang BUKAN hasil submit petugas —
+	// sesi dibatalkan nasabah, atau panggilannya basi. Membedakannya dari `result`
+	// penting di sisi petugas: panggilan yang hilang di bawah kakinya menuntut
+	// tindakan yang berbeda dari panggilan yang ia selesaikan sendiri.
+	Reason string `json:"reason,omitempty"`
+
 	// Media control
 	Action string `json:"action,omitempty"`
 }
@@ -805,6 +1059,13 @@ type AgentInfo struct {
 	Name       string `json:"name"`
 	EmployeeID string `json:"employee_id"`
 	PhotoURL   string `json:"photo_url,omitempty"`
+
+	// TerminalID adalah loket tempat petugas bertugas, dipakai menegakkan Rule 4
+	// (hanya terminal ONLINE boleh mengambil antrean).
+	//
+	// `json:"-"` dan itu disengaja: AgentInfo ikut terkirim ke NASABAH di dalam pesan
+	// `agent_assigned`, dan id loket petugas bukan hal yang perlu diketahui nasabah.
+	TerminalID string `json:"-"`
 }
 
 // --- Credential Types ---

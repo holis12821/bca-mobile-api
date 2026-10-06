@@ -741,7 +741,14 @@ CREATE TABLE cs_agents (
     api_key_hash TEXT        NOT NULL,
     is_active    BOOLEAN     NOT NULL DEFAULT true,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- migrasi 000027
+    scopes       TEXT[]      NOT NULL DEFAULT ARRAY['VIDEO_CALL']::TEXT[],
+    CONSTRAINT cs_agents_scopes_valid CHECK (
+        cardinality(scopes) > 0
+        AND scopes <@ ARRAY['VIDEO_CALL', 'CARD_ADMIN', 'CUSTOMER_PII', 'TICKET']::TEXT[]
+    )
 );
 
 CREATE INDEX idx_cs_agents_active ON cs_agents (employee_id) WHERE is_active;
@@ -760,6 +767,7 @@ jejaknya harus bisa dipertanggungjawabkan ke orang.
 | `employee_id` | yang dikirim pemanggil di `X-Agent-Employee-ID`; sama lebarnya dengan `onboarding_video_calls.agent_employee_id` |
 | `api_key_hash` | PHC Argon2id, format yang sama dengan `users.pin_hash` |
 | `is_active` | pencabutan hak tanpa menghapus baris — panggilan lama tetap punya rujukan nama petugasnya |
+| `scopes` | cakupan kewenangan (migrasi `000027`). Dibaca bersama baris yang mengautentikasi, bukan ditanya terpisah: kewenangan yang dibaca dari baris berbeda membuka celah waktu antara keduanya |
 
 Hash Argon2 ber-salt **tidak bisa dicari balik**, jadi pemanggil menyebut dirinya lebih
 dulu lewat `X-Agent-Employee-ID` dan membuktikannya dengan `X-Agent-API-Key`: barisnya
@@ -773,6 +781,208 @@ tidak punya gerbang environment sendiri, jadi tanpa gerbang di sana satu kali `m
 yang salah arah akan membuat kunci yang diketahui umum bisa dipakai menandatangani hasil
 verifikasi. Di luar development, barisnya dibuat yang mengoperasikan integrasi CS dengan
 kunci acak, lewat jalur yang sama dengan pendistribusian `INTERNAL_API_KEY`.
+
+### Cakupan kewenangan (migrasi `000027`)
+
+Sebelum kolom `scopes`, satu `INTERNAL_API_KEY` membuka **seluruh** `/internal/v1`:
+petugas yang tugasnya melayani video call e-KYC juga bisa mengubah biaya dan limit kartu
+Paspor untuk seluruh nasabah, dan menaikkan `catalog_version` yang memaksa setiap aplikasi
+memuat ulang katalognya. Kewenangan itu tidak pernah diberikan kepadanya — hanya kebetulan
+tidak dipisahkan.
+
+| Cakupan | Membuka |
+|---|---|
+| `VIDEO_CALL` | ambil panggilan, submit hasil, antrean, daftar sesi onboarding |
+| `CUSTOMER_PII` | detail sesi berisi data pribadi, pencarian & profil nasabah |
+| `CARD_ADMIN` | `PUT /internal/v1/cards/*` |
+| `TICKET` | `/internal/v1/tickets/*` |
+
+`CUSTOMER_PII` **dipisah** dari `VIDEO_CALL` meski aplikasi desktop yang sama memakai
+keduanya: melayani panggilan menampilkan nasabah yang *sedang* bicara, sementara membuka
+data pribadi menjangkau nasabah mana pun yang pernah mendaftar. Dua kewenangan yang berbeda
+ukurannya, dan menggabungkannya berarti setiap petugas panggilan diam-diam memegang yang
+kedua.
+
+Default `ARRAY['VIDEO_CALL']`, bukan keduanya: setiap baris yang sudah ada dibuat untuk
+melayani video call, dan migrasi yang diam-diam memberi kewenangan katalog kepada mereka
+akan melakukan persis hal yang kolom ini ada untuk mencegahnya.
+
+> **Rollback migrasi 000027 MENGHAPUS data kewenangan.** `down` lalu `up` lagi membuat
+> setiap baris kembali ke default `VIDEO_CALL` — petugas ber-scope `CARD_ADMIN` kehilangan
+> kewenangannya dan setiap petugas mendadak memegang `VIDEO_CALL`. Ini bukan teori: terjadi
+> saat migrasi diuji, dan gejalanya adalah `403` yang tampak seperti bug kode. Sebelum
+> rollback di lingkungan yang dipakai:
+> `COPY (SELECT employee_id, scopes FROM cs_agents) TO '/tmp/cs_scopes.csv' CSV;`
+
+---
+
+## Jejak Akses Petugas ke Data Nasabah (migrasi `000029`)
+
+```sql
+CREATE TABLE cs_access_logs (
+    id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_employee_id VARCHAR(32) NOT NULL,
+    action            VARCHAR(48) NOT NULL,   -- CUSTOMER_SEARCH | CUSTOMER_VIEWED
+    subject_user_id   UUID        REFERENCES users (id) ON DELETE SET NULL,
+    query_kind        VARCHAR(24),            -- ACCOUNT_NUMBER | PHONE
+    result_count      INTEGER     NOT NULL DEFAULT 0,
+    ip_address        VARCHAR(45),
+    user_agent        TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_cs_access_logs_agent   ON cs_access_logs (agent_employee_id, created_at DESC);
+CREATE INDEX idx_cs_access_logs_subject ON cs_access_logs (subject_user_id, created_at DESC)
+    WHERE subject_user_id IS NOT NULL;
+
+CREATE TRIGGER trg_cs_access_logs_immutable
+    BEFORE UPDATE OR DELETE ON cs_access_logs
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
+```
+
+Siapa membuka data siapa, kapan, dan dari mana. Terpisah dari `onboarding_audit_logs`, dan
+bukan karena rapi-rapi: jejak itu ber-kunci `session_id` onboarding, sementara nasabah yang
+sudah punya rekening tidak punya sesi onboarding lagi. Pencarian nasabah juga tidak punya
+subjek sampai hasilnya ditemukan.
+
+| Kolom | Catatan |
+|---|---|
+| `subject_user_id` | NULL untuk pencarian yang tidak menemukan apa pun — tidak ada data siapa pun yang terbuka, dan baris dengan subjek palsu akan membuat jejak satu nasabah memuat pencarian yang bukan tentang dia. Diisi hanya kalau hasilnya tepat **satu** orang |
+| `query_kind` | **JENIS** kunci pencarian, BUKAN nilainya |
+| `result_count` | pencarian yang gagal ikut dicatat; pola pencarian yang gagal justru yang paling perlu terlihat saat memeriksa penyalahgunaan |
+
+**`query_kind` tidak menyimpan kata kuncinya, dan itu keputusan yang paling mudah salah di
+tabel seperti ini.** Menyimpannya akan menumpuk nomor rekening dan nomor HP nasabah di tabel
+log yang tidak terenkripsi dan jarang ditinjau — memindahkan kebocoran, bukan mencatatnya.
+
+Migrasi ini juga **mengganti pesan** `prevent_audit_mutation()` menjadi
+`'% is append-only', TG_TABLE_NAME`. Sebelumnya pesannya menyebut `onboarding_audit_logs`
+secara harfiah, jadi penolakan di `cs_access_logs` akan berbunyi dengan nama tabel yang
+salah dan orang yang menelusurinya mencari di tempat yang salah.
+
+---
+
+## Indeks Daftar Sesi CS (migrasi `000028`)
+
+```sql
+CREATE INDEX idx_onboarding_sessions_cs_list
+    ON onboarding_sessions (created_at DESC, id DESC)
+    WHERE deleted_at IS NULL;
+```
+
+`GET /internal/v1/onboarding/sessions` mengurut `created_at DESC, id DESC` dan diambil
+lewat keyset. Tanpa indeks ini rencananya **Seq Scan + Sort atas seluruh
+`onboarding_sessions`** — tabel yang tidak pernah menyusut, karena setiap percobaan
+pendaftaran meninggalkan satu baris selamanya. Dan daftar itu di-polling tiap lima detik
+oleh setiap petugas yang sedang bertugas.
+
+Partial `WHERE deleted_at IS NULL` karena setiap query daftar menyertakan syarat itu.
+
+---
+
+## Tiket Layanan (migrasi `000030`)
+
+```sql
+CREATE TYPE ticket_status   AS ENUM ('OPEN', 'IN_PROGRESS', 'RESOLVED', 'CLOSED');
+CREATE TYPE ticket_priority AS ENUM ('LOW', 'NORMAL', 'HIGH', 'URGENT');
+CREATE TYPE ticket_category AS ENUM ('KARTU','TRANSAKSI','AKUN','BUKA_REKENING','APLIKASI','LAINNYA');
+
+CREATE SEQUENCE service_ticket_number_seq;
+
+CREATE TABLE service_tickets (
+    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticket_number VARCHAR(32) NOT NULL UNIQUE,
+    user_id       UUID        REFERENCES users (id) ON DELETE SET NULL,
+    session_id    VARCHAR(32),
+    category      ticket_category NOT NULL DEFAULT 'LAINNYA',
+    priority      ticket_priority NOT NULL DEFAULT 'NORMAL',
+    status        ticket_status   NOT NULL DEFAULT 'OPEN',
+    subject       VARCHAR(200) NOT NULL,
+    description   TEXT        NOT NULL DEFAULT '',
+    created_by_agent  VARCHAR(32) NOT NULL,
+    assigned_to_agent VARCHAR(32),
+    resolved_at   TIMESTAMPTZ,
+    closed_at     TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT service_tickets_subject_not_blank CHECK (btrim(subject) <> ''),
+    CONSTRAINT service_tickets_resolved_consistent CHECK (
+        (status IN ('RESOLVED', 'CLOSED')) = (resolved_at IS NOT NULL)),
+    CONSTRAINT service_tickets_closed_consistent CHECK (
+        (status = 'CLOSED') = (closed_at IS NOT NULL))
+);
+
+CREATE TABLE service_ticket_notes (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticket_id  UUID        NOT NULL REFERENCES service_tickets (id) ON DELETE CASCADE,
+    author     VARCHAR(32) NOT NULL,
+    body       TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT service_ticket_notes_body_not_blank CHECK (btrim(body) <> '')
+);
+```
+
+**`ticket_number` dirakit di dalam `INSERT`** dari `service_ticket_number_seq`, bukan
+dihitung lebih dulu lalu dikirim: `COUNT(*)+1` akan memberi nomor yang sama kepada dua
+petugas yang membuat tiket bersamaan, dan angka acak menghasilkan nomor yang tidak bisa
+disebutkan lewat telepon. Sequence aman terhadap keduanya dan tidak mundur saat transaksi
+dibatalkan — celah nomor jauh lebih murah daripada tabrakan nomor. Formatnya
+`TKT-YYYYMMDD-000123`, dan **itulah** yang dipakai sebagai kunci di URL, bukan UUID-nya.
+
+**Stempel waktu diikat ke status oleh CHECK.** Tanpa itu, tiket bisa berstatus `RESOLVED`
+tanpa `resolved_at` dan setiap laporan waktu penyelesaian akan diam-diam melewatkannya.
+Konsekuensinya: perubahan status dan stempelnya harus satu `UPDATE`, bukan dua.
+
+**Catatan terpisah dari `description`** supaya riwayat penanganan tidak saling menimpa:
+satu petugas yang menyunting deskripsi akan menghapus apa yang ditulis petugas sebelumnya,
+dan di tiket keluhan itu justru bagian yang paling perlu utuh.
+
+`user_id` dan `session_id` keduanya nullable dan **boleh terisi sekaligus**: penelepon yang
+belum punya rekening hanya punya `session_id`, nasabah lama hanya punya `user_id`, dan orang
+yang gagal di tengah pembukaan rekening lalu menelepon punya dua-duanya. Menuntut salah
+satunya akan menolak tiket yang paling perlu dicatat.
+
+---
+
+## Jadwal Video Call (migrasi `000031`)
+
+```sql
+CREATE TYPE video_call_schedule_status AS ENUM ('SCHEDULED', 'CANCELLED', 'FULFILLED');
+
+CREATE TABLE onboarding_video_call_schedules (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    schedule_id  VARCHAR(40) NOT NULL UNIQUE,
+    session_id   VARCHAR(32) NOT NULL,
+    scheduled_at TIMESTAMPTZ NOT NULL,
+    status       video_call_schedule_status NOT NULL DEFAULT 'SCHEDULED',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX idx_vc_schedules_one_active
+    ON onboarding_video_call_schedules (session_id) WHERE status = 'SCHEDULED';
+
+CREATE INDEX idx_vc_schedules_upcoming
+    ON onboarding_video_call_schedules (scheduled_at) WHERE status = 'SCHEDULED';
+```
+
+Melayani tombol "Jadwalkan Panggilan Nanti" di aplikasi Android, yang selama ini dimatikan
+karena tidak ada endpoint yang menerimanya.
+
+**Tabel tersendiri, bukan kolom di `onboarding_video_calls`:** jadwal ada *sebelum*
+panggilan ada, dan baris `onboarding_video_calls` baru lahir saat nasabah benar-benar masuk
+antrean. Menyimpannya di sana akan menuntut baris panggilan yang statusnya bukan panggilan.
+
+**Partial unique index, bukan `UNIQUE` biasa:** nasabah yang membatalkan lalu menjadwalkan
+ulang harus bisa, dan riwayat pembatalannya tetap ada. Tanpa index itu, menekan tombol dua
+kali menghasilkan dua jadwal dan nasabah tidak tahu mana yang berlaku. Jadwal ganda
+dijawab dari **pelanggaran index** (SQLSTATE 23505), bukan dari `SELECT` lebih dulu: dua
+permintaan bersamaan akan sama-sama melihat "belum ada jadwal".
+
+`scheduled_at` disimpan UTC; validasi jam operasional 06:00–22:00 dilakukan di aplikasi
+dalam zona `Asia/Jakarta` — seperti batas harian transaksi, dan dengan alasan yang sama:
+jam database bukan jam Jakarta.
 
 ---
 

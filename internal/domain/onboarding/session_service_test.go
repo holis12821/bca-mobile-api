@@ -3,6 +3,7 @@ package onboarding
 import (
 	"context"
 	"errors"
+	"sort"
 	"testing"
 	"time"
 
@@ -73,6 +74,52 @@ func (m *mockSessionRepo) UpdateCard(_ context.Context, sessionID string, upd Se
 
 func (m *mockSessionRepo) CountActiveByDevice(_ context.Context, deviceID string, _ time.Time) (int, error) {
 	return m.counts[deviceID], nil
+}
+
+// ListForCS meniru keyset Postgres, termasuk mengembalikan limit+1 baris.
+//
+// Diurut dan disaring sungguhan, bukan mengembalikan seluruh map: paginasi yang
+// mock-nya tidak pernah memotong apa pun adalah paginasi yang tidak pernah diuji.
+func (m *mockSessionRepo) ListForCS(_ context.Context, f ListCSSessionsFilter) ([]*Session, error) {
+	now := time.Now()
+
+	var out []*Session
+	for _, s := range m.sessions {
+		if s.DeletedAt != nil {
+			continue
+		}
+		if f.Step != "" && s.CurrentStep != f.Step {
+			continue
+		}
+		if !f.IncludeExpired && !s.ExpiresAt.After(now) {
+			continue
+		}
+		if f.StalledFor > 0 && s.UpdatedAt.After(now.Add(-f.StalledFor)) {
+			continue
+		}
+		if f.Cursor != nil {
+			// (created_at, id) < (cursor.created_at, cursor.id)
+			if s.CreatedAt.After(f.Cursor.CreatedAt) {
+				continue
+			}
+			if s.CreatedAt.Equal(f.Cursor.CreatedAt) && s.ID.String() >= f.Cursor.ID.String() {
+				continue
+			}
+		}
+		out = append(out, s)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID.String() > out[j].ID.String()
+	})
+
+	if f.Limit > 0 && len(out) > f.Limit+1 {
+		out = out[:f.Limit+1]
+	}
+	return out, nil
 }
 
 type mockSessionCache struct {
