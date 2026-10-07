@@ -2077,6 +2077,244 @@ Response `200 OK`: `{ "terminal_id": "WKS-SMG-0842", "status": "OFFLINE" }`
 **Tanpa menutup sesi:** petugas yang istirahat menonaktifkan loketnya tanpa mengakhiri
 gilirannya. Yang pulang memanggil `auth/logout`, yang melakukan keduanya.
 
+### `GET /internal/v1/hris/employees/{employee_id}`
+
+Header: kunci sistem + kedua header petugas. Tidak menuntut cakupan — mendaftarkan
+petugas adalah pekerjaan supervisor/teknisi, dan tidak satu pun dari empat cakupan yang
+ada menggambarkannya.
+
+Melayani SCR-001: layar pendaftaran menanyakan NPP lebih dulu dan menampilkan nama yang
+ditemukan untuk dikonfirmasi. Tanpa langkah ini, salah ketik NPP baru terlihat setelah
+petugas terdaftar dengan nama orang lain.
+
+```json
+{
+  "data": {
+    "employee_id": "CS-2099",
+    "name": "Dimas Prakoso",
+    "position": "CS Officer",
+    "branch": "KCU Jakarta Thamrin",
+    "active": true
+  }
+}
+```
+
+**Tiga jawaban yang sengaja dibedakan:**
+
+| Keadaan | Jawaban |
+|---|---|
+| NPP ada, masih bekerja | `200`, `active: true` |
+| NPP ada, status dicabut | `200`, `active: false` — **bukan** error |
+| NPP bukan NPP siapa pun | `404 EMPLOYEE_NOT_FOUND` |
+| Direktori tidak bisa dihubungi | `503 HRIS_UNAVAILABLE` |
+
+Yang kedua bukan error karena layar pendaftaran perlu menampilkan "pegawai ini sudah
+tidak aktif", bukan "NPP tidak ditemukan". Menyamakan keduanya membuat pegawai yang
+statusnya dicabut mengira ia salah ketik, lalu mencobanya berkali-kali.
+
+Yang keempat 503 dan bukan 404 dengan alasan yang sama arahnya: `404` akan terbaca
+sebagai "NPP tidak terdaftar", dan petugas yang mendapatkannya saat HRIS mati akan
+menyimpulkan hal yang salah tentang rekannya. `503` boleh dicoba lagi; `404` tidak.
+
+> **HRIS adalah sistem luar.** Tidak ada tabel pegawai di database ini — menyalinnya
+> akan membuat salinan yang basi tepat ketika seseorang berhenti bekerja. Di
+> `APP_ENV=development` endpoint ini dilayani mock (`cs.MockHRISDirectory`); di
+> environment lain ia menjawab `503 HRIS_UNAVAILABLE` sampai integrasi sungguhan
+> dipasang. Pola yang sama dengan OCR, Dukcapil, biometrik, dan core banking.
+
+### `POST /internal/v1/agents`
+
+Header: kunci sistem + kedua header petugas (pendaftar). Otorisasi dual-control ada di
+**body**, bukan sebagai gerbang sesi: yang perlu ditandatangani adalah pemberian
+kewenangan ini, bukan kesiapan loket si pendaftar.
+
+```json
+{
+  "employee_id": "CS-2099",
+  "scopes": ["VIDEO_CALL", "TICKET"],
+  "supervisor_id": "SPV-0021",
+  "token": "123456"
+}
+```
+
+`api_key` **tidak diterima dari pemanggil** — ia diterbitkan server. Kunci pilihan klien
+adalah kunci yang bisa dipilih lemah, dipakai ulang dari sistem lain, atau sudah pernah
+bocor, dan tidak ada cara memeriksanya dari sini.
+
+Nama, jabatan, dan cabang datang dari **HRIS**, bukan dari body: baris `cs_agents` tidak
+boleh menyebut orang yang berbeda dari yang ada di direktori pegawai.
+
+### Response `201 Created`
+```json
+{
+  "data": {
+    "employee_id": "CS-2099",
+    "name": "Dimas Prakoso",
+    "scopes": ["VIDEO_CALL", "TICKET"],
+    "api_key": "-d5S4855uFTZ8P88Y17-0S1Q_i7Z7Qb5_exWVxlpgkg",
+    "position": "CS Officer",
+    "branch": "KCU Jakarta Thamrin",
+    "registered_by": "OPS-2001",
+    "registered_at": "2026-10-07T04:11:42Z"
+  }
+}
+```
+
+`api_key` **hanya ada di response ini.** Server menyimpan hash Argon2id-nya; tidak ada
+endpoint yang bisa mengembalikannya lagi — sama dengan `session_token` di `auth/login`.
+
+| Keadaan | Jawaban |
+|---|---|
+| NPP sudah terdaftar sebagai petugas | `409 AGENT_ALREADY_REGISTERED` |
+| NPP ada di HRIS tapi statusnya dicabut | `422 EMPLOYEE_INACTIVE` |
+| NPP bukan NPP siapa pun | `404 EMPLOYEE_NOT_FOUND` |
+| Token supervisor salah | `401 SUPERVISOR_TOKEN_INVALID` |
+| Cakupan di luar empat yang ada | `422 SCOPE_UNKNOWN`, `details.scope` menyebut yang mana |
+| Direktori pegawai tidak terpasang | `503 HRIS_UNAVAILABLE` |
+
+Cakupan ganda **dibuang, bukan ditolak**: `["TICKET","TICKET"]` adalah permintaan yang
+maksudnya jelas. Penulisannya dinormalkan ke huruf besar.
+
+Dua peristiwa audit: `AGENT_REGISTERED` saat berhasil, dan `SUPERVISOR_AUTH_FAILED` saat
+tokennya salah. Yang kedua dicatat dengan sengaja — percobaan pemberian kewenangan yang
+ditolak adalah hal yang justru paling perlu terbaca di jejak.
+
+### `GET /internal/v1/cs/dashboard`
+
+Header: kunci sistem + kedua header petugas. Melayani SCR-010.
+
+**Satu permintaan, bukan empat.** Layar ini dimuat setiap petugas membuka beranda, dan
+empat permintaan untuk satu layar adalah empat kali verifikasi Argon2id (64 MB × 4
+thread).
+
+```json
+{
+  "data": {
+    "agent": {
+      "employee_id": "CS-1042",
+      "name": "Sarah Adisti",
+      "scopes": ["VIDEO_CALL"],
+      "shift": "PAGI",
+      "session_started_at": "2026-10-07T11:12:17+07:00"
+    },
+    "today": {
+      "calls_handled": 1,
+      "approved": 0,
+      "rejected": 0,
+      "need_review": 1,
+      "avg_duration_seconds": 240,
+      "sla_percent": null,
+      "csat_percent": null,
+      "shift_target": null
+    },
+    "queue": {
+      "waiting": 3,
+      "longest_wait_seconds": 420,
+      "within_operating_hours": true
+    },
+    "terminal": {
+      "terminal_id": "WKS-SMG-0842",
+      "workstation": "Loket 4",
+      "location": "KCU Semarang",
+      "status": "ONLINE",
+      "can_take_calls": true
+    },
+    "measured": {
+      "calls_handled": true, "approved": true, "rejected": true,
+      "need_review": true, "avg_duration_seconds": true,
+      "queue_waiting": true, "queue_longest_wait": true,
+      "terminal_status": true,
+      "sla_percent": false, "csat_percent": false, "shift_target": false
+    },
+    "generated_at": "2026-10-07T11:12:17+07:00"
+  }
+}
+```
+
+**`sla_percent`, `csat_percent`, dan `shift_target` selalu `null`.** Dokumen alur
+menyebut `SLA 98.4%`, `CSAT 96.8%`, dan `Target Shift 50`; ketiganya angka demo (§75
+dokumen itu). Tidak ada definisi SLA yang disepakati, tidak ada mekanisme pengukuran
+kepuasan nasabah, dan tidak ada target shift yang ditetapkan siapa pun.
+
+Ketiganya tetap ada di kontrak supaya aplikasi desktop tidak perlu berubah bentuk saat
+pengukurnya nanti ada. `measured` menyebutkan mana yang benar-benar terukur — klien yang
+menemukan `false` **menyembunyikan kartunya**, bukan menampilkan `null` sebagai `0%`.
+KPI karangan di layar operasional akan dipakai menilai orang.
+
+Yang **tidak** dilakukan: mengirim `0` sebagai ganti `null`. Nol terbaca sebagai "SLA-nya
+nol", dan itu kebohongan yang berbeda — bukan ketiadaan data.
+
+`terminal` dan `session_started_at` `null` berarti petugasnya belum membuka giliran di
+loket mana pun. Itu keadaan sah: beranda boleh dibuka dengan kunci API sebelum login.
+
+`can_take_calls` adalah **Rule 4 yang sudah dihitung** — hanya terminal `ONLINE` yang
+boleh mengambil antrean. Dikirim server supaya tombol "Ambil Panggilan" tidak perlu
+menyimpulkannya dari string status, dan supaya klien tidak bisa menyimpulkan sebaliknya.
+
+Batas "hari ini" adalah **tengah malam WIB, dihitung aplikasi** — bukan `CURRENT_DATE`.
+Server bisa berjalan di UTC, dan hari kerja petugas berganti tengah malam Jakarta.
+Rentangnya setengah terbuka, jadi panggilan tepat di tengah malam tidak terhitung dua
+kali. Yang dihitung adalah panggilan yang **berakhir** hari ini, bukan yang dimulai:
+panggilan 23:50→00:10 masuk hitungan hari berikutnya.
+
+### `GET /internal/v1/cs/audit-events`
+
+Header: kunci sistem + kedua header petugas. Jejak tindakan petugas dan terminal — dua
+belas peristiwa Rule 7.
+
+Query: `actor`, `event_type`, `terminal_id`, `from`, `to` (RFC 3339), `limit` (1–200,
+default 50), `cursor`.
+
+```json
+{
+  "data": {
+    "events": [
+      {
+        "event_type": "AGENT_REGISTERED",
+        "actor": "agent:OPS-2001",
+        "details": {
+          "employee_id": "CS-2099",
+          "scopes": ["VIDEO_CALL", "TICKET"],
+          "supervisor_id": "SPV-0021",
+          "supervisor_name": "Budi Hartono",
+          "hris_branch": "KCU Jakarta Thamrin"
+        },
+        "ip_address": "10.1.2.3",
+        "created_at": "2026-10-07T11:11:42+07:00"
+      }
+    ]
+  },
+  "pagination": { "cursor": "", "has_more": false, "limit": 50 }
+}
+```
+
+Jenis peristiwa yang tidak dikenal **ditolak** `400 VALIDATION_ERROR`, bukan dibiarkan
+menghasilkan daftar kosong: nol baris karena salah ketik tidak bisa dibedakan dari nol
+baris karena memang belum ada yang terjadi — dan yang kedua adalah kesimpulan
+pemeriksaan. `from` yang lebih akhir dari `to` ditolak dengan alasan yang sama.
+
+Dua belas jenis peristiwanya: `AGENT_REGISTERED`, `AGENT_LOGIN`, `AGENT_LOGIN_FAILED`,
+`AGENT_LOGOUT`, `AGENT_PASSWORD_SET`, `SUPERVISOR_AUTHORIZED`, `SUPERVISOR_AUTH_FAILED`,
+`DEVICE_HEALTHCHECK`, `PII_ACKNOWLEDGED`, `TERMINAL_REGISTERED`, `TERMINAL_ACTIVATED`,
+`TERMINAL_DEACTIVATED`.
+
+Enam tindakan Rule 7 lainnya **tidak** ada di sini, dan itu disengaja: reservasi antrean,
+panggilan dimulai, panggilan berakhir, dan keputusan verifikasi sudah tercatat di
+`onboarding_audit_logs` (ber-kunci `session_id` nasabah, dibaca lewat
+`GET /v1/onboarding/sessions/{id}/audit`), sementara pembukaan PII tercatat di
+`cs_access_logs`. Menuliskannya dua kali akan membuat setiap pemeriksaan harus memutuskan
+sumber mana yang benar.
+
+> **Penjaganya lebih longgar daripada semestinya.** Endpoint ini hanya menuntut kunci
+> sistem + identitas petugas, jadi **setiap petugas terautentikasi bisa membaca jejak
+> rekannya** — padahal ini kewenangan pengawas. Preseden yang diikuti adalah
+> `GET /v1/onboarding/sessions/{id}/audit`, yang juga tidak menuntut cakupan.
+>
+> Penyebabnya batasan nyata: CHECK `cs_agents_scopes_valid` di migrasi 000027 mengunci
+> `cs_agents.scopes` ke empat nilai, jadi cakupan `AUDIT_READ` menuntut migrasi yang
+> mengubah constraint itu. Sampai migrasi itu ada, jangan anggap endpoint ini sebagai
+> pembatas kewenangan.
+
 ### `GET /internal/v1/onboarding/sessions`
 
 Scope `VIDEO_CALL`. Daftar sesi onboarding untuk layar pemantauan. **Tidak memuat PII** —
@@ -2366,4 +2604,8 @@ dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
 | `VIDEO_CALL_ESCALATION_EXISTS` | 409 | Sesi ini sudah dalam peninjauan |
 | `VIDEO_CALL_NOT_ACTIVE` | 422 | Hasil disubmit untuk panggilan yang belum diambil petugas (`QUEUED`) atau sudah `CANCELLED` |
 | `VIDEO_CALL_AGENT_MISMATCH` | 409 | Hasil disubmit oleh petugas yang bukan pengambil panggilannya |
+| `EMPLOYEE_NOT_FOUND` | 404 | NPP tidak ada di direktori pegawai HRIS |
+| `EMPLOYEE_INACTIVE` | 422 | NPP ada di HRIS tapi status kepegawaiannya dicabut — bukan salah ketik |
+| `HRIS_UNAVAILABLE` | 503 | Direktori pegawai tidak bisa dihubungi, atau belum terpasang di environment ini. Bukan penolakan — boleh dicoba lagi |
+| `SCOPE_UNKNOWN` | 422 | Cakupan kewenangan di luar `VIDEO_CALL`/`CARD_ADMIN`/`CUSTOMER_PII`/`TICKET`. `details.scope` menyebut yang mana |
 | `INTERNAL_ERROR` | 500 | Kesalahan internal server |

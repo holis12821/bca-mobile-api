@@ -3321,7 +3321,7 @@
         "queued"
        ]
       },
-      "description": "Pintu masuk sisi CS dan langkah PERTAMA alur petugas: tanpa daftar ini tidak ada cara menemukan queue_id yang dibutuhkan Agent Signaling Token. GET /monitoring hanya mengembalikan queue_length — sebuah angka, tanpa satu pun pengenal panggilan.\n\nUrutan position-nya identik dengan yang dilihat nasabah. Panggilan yang sudah diambil petugas hilang dari daftar. Tidak memuat PII."
+      "description": "Pintu masuk sisi CS dan langkah PERTAMA alur petugas: tanpa daftar ini tidak ada cara menemukan queue_id yang dibutuhkan Agent Signaling Token. GET /monitoring hanya mengembalikan queue_length — sebuah angka, tanpa satu pun pengenal panggilan.\n\nUrutan position-nya identik dengan yang dilihat nasabah. Panggilan yang sudah diambil petugas hilang dari daftar. Tidak memuat PII.\n\nBARU: setiap panggilan membawa `priority` dan `service`. priority DITURUNKAN dari waited_seconds (NORMAL di bawah 10 menit, HIGH pada 10 menit atau lebih), bukan disimpan — tidak ada sumber prioritas di sistem ini, dan kolom yang semua barisnya bernilai sama akan diisi lalu dipercaya. service selalu EKYC_ONBOARDING, satu-satunya layanan yang mengantre di sini."
      },
      "response": []
     },
@@ -3552,6 +3552,363 @@
        ]
       }
      }
+    }
+   ]
+  },
+  {
+   "name": "Internal (CS) — Beranda, Jejak Audit & Pendaftaran",
+   "description": "Empat endpoint sisi operator yang melayani SCR-001 (pendaftaran petugas) dan SCR-010 (beranda).\n\nPenjaganya kunci sistem + kedua header petugas, TANPA cakupan. Mendaftarkan petugas adalah pekerjaan supervisor/teknisi, dan tidak satu pun dari empat cakupan yang ada (VIDEO_CALL, CARD_ADMIN, CUSTOMER_PII, TICKET) menggambarkannya.\n\nCATATAN soal audit-events: penjaganya lebih longgar daripada semestinya — setiap petugas terautentikasi bisa membaca jejak rekannya, padahal ini kewenangan pengawas. CHECK cs_agents_scopes_valid di migrasi 000027 mengunci daftar cakupan ke empat nilai, jadi cakupan AUDIT_READ menuntut migrasi tersendiri.",
+   "item": [
+    {
+     "name": "1. HRIS — NPP aktif",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{card_agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{card_agent_api_key}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/hris/employees/CS-2099",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "hris",
+        "employees",
+        "CS-2099"
+       ]
+      },
+      "description": "HRIS adalah sistem LUAR. Tidak ada tabel pegawai di database ini — menyalinnya akan membuat salinan yang basi tepat ketika seseorang berhenti bekerja.\n\nDi APP_ENV=development dilayani mock (cs.MockHRISDirectory); di environment lain menjawab 503 HRIS_UNAVAILABLE sampai integrasi sungguhan dipasang. Pola yang sama dengan OCR, Dukcapil, biometrik, dan core banking.\n\nMelayani SCR-001: layar pendaftaran menanyakan NPP lebih dulu dan menampilkan nama yang ditemukan untuk dikonfirmasi. Tanpa langkah ini, salah ketik NPP baru terlihat setelah petugas terdaftar dengan nama orang lain."
+     },
+     "response": []
+    },
+    {
+     "name": "2. HRIS — NPP NONAKTIF (200, active:false)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{card_agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{card_agent_api_key}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/hris/employees/CS-0001",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "hris",
+        "employees",
+        "CS-0001"
+       ]
+      },
+      "description": "Pegawai yang statusnya DICABUT menjawab 200 dengan active:false — BUKAN 404.\n\nDibedakan dengan sengaja: layar pendaftaran perlu menampilkan 'pegawai ini sudah tidak aktif', bukan 'NPP tidak ditemukan'. Menyamakan keduanya membuat pegawai yang statusnya dicabut mengira ia salah ketik, lalu mencobanya berkali-kali."
+     },
+     "response": []
+    },
+    {
+     "name": "3. HRIS — NPP tidak ada (404)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{card_agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{card_agent_api_key}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/hris/employees/TIDAK-ADA",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "hris",
+        "employees",
+        "TIDAK-ADA"
+       ]
+      },
+      "description": "404 EMPLOYEE_NOT_FOUND. Bandingkan dengan 503 HRIS_UNAVAILABLE saat direktorinya mati: 404 akan terbaca sebagai 'NPP tidak terdaftar', dan petugas yang mendapatkannya saat HRIS mati akan menyimpulkan hal yang salah tentang rekannya. 503 boleh dicoba lagi; 404 tidak."
+     },
+     "response": []
+    },
+    {
+     "name": "4. Daftarkan petugas",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{card_agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{card_agent_api_key}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"employee_id\": \"CS-2099\",\n  \"scopes\": [\n    \"VIDEO_CALL\",\n    \"TICKET\"\n  ],\n  \"supervisor_id\": \"{{supervisor_id}}\",\n  \"token\": \"123456\"\n}"
+      },
+      "url": {
+       "raw": "{{internal_base_url}}/agents",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "agents"
+       ]
+      },
+      "description": "Otorisasi dual-control ada di BODY, bukan sebagai gerbang sesi: yang perlu ditandatangani adalah pemberian kewenangan ini, bukan kesiapan loket si pendaftar.\n\napi_key TIDAK diterima dari pemanggil — ia diterbitkan server. Kunci pilihan klien adalah kunci yang bisa dipilih lemah, dipakai ulang dari sistem lain, atau sudah pernah bocor, dan tidak ada cara memeriksanya dari sini.\n\nNama, jabatan, dan cabang datang dari HRIS, bukan dari body: baris cs_agents tidak boleh menyebut orang yang berbeda dari yang ada di direktori pegawai.\n\napi_key HANYA ada di response ini. Server menyimpan hash Argon2id-nya.\n\nJawaban yang mungkin: 409 AGENT_ALREADY_REGISTERED, 422 EMPLOYEE_INACTIVE, 404 EMPLOYEE_NOT_FOUND, 401 SUPERVISOR_TOKEN_INVALID, 422 SCOPE_UNKNOWN (details.scope menyebut yang mana), 503 HRIS_UNAVAILABLE."
+     },
+     "response": [],
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "const body = pm.response.json();",
+         "const key = body && body.data && body.data.api_key;",
+         "if (key) {",
+         "    pm.environment.set('new_agent_api_key', key);",
+         "}",
+         "pm.test('api_key diterbitkan server, sekali saja', function () {",
+         "    pm.expect(key, 'api_key').to.be.a('string').and.not.empty;",
+         "});",
+         "pm.test('nama datang dari HRIS, bukan dari body', function () {",
+         "    pm.expect(body.data.name).to.eql('Dimas Prakoso');",
+         "});"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "5. Cakupan tak dikenal (422 SCOPE_UNKNOWN)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{card_agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{card_agent_api_key}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"employee_id\": \"SPV-3001\",\n  \"scopes\": [\n    \"VIDEO_CALL\",\n    \"AUDIT_READ\"\n  ],\n  \"supervisor_id\": \"{{supervisor_id}}\",\n  \"token\": \"123456\"\n}"
+      },
+      "url": {
+       "raw": "{{internal_base_url}}/agents",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "agents"
+       ]
+      },
+      "description": "Penolakannya MENYEBUT cakupan mana yang tidak dikenal di details.scope, dan details.allowed memuat keempat yang sah — sesuatu yang CHECK di skema tidak bisa lakukan.\n\nCakupan ganda sebaliknya DIBUANG, bukan ditolak: [\"TICKET\",\"TICKET\"] adalah permintaan yang maksudnya jelas. Penulisannya dinormalkan ke huruf besar."
+     },
+     "response": []
+    },
+    {
+     "name": "6. Beranda petugas (SCR-010)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{agent_api_key}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/cs/dashboard",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "cs",
+        "dashboard"
+       ]
+      },
+      "description": "SATU permintaan, bukan empat: layar ini dimuat setiap petugas membuka beranda, dan empat permintaan untuk satu layar adalah empat kali verifikasi Argon2id (64 MB x 4 thread).\n\nsla_percent, csat_percent, dan shift_target SELALU null. Dokumen alur menyebut SLA 98.4%, CSAT 96.8%, dan Target Shift 50; ketiganya angka demo (§75). Tidak ada definisi SLA yang disepakati, tidak ada mekanisme pengukuran kepuasan nasabah, dan tidak ada target shift yang ditetapkan siapa pun.\n\nKetiganya tetap ada di kontrak supaya aplikasi desktop tidak perlu berubah bentuk saat pengukurnya nanti ada. `measured` menyebutkan mana yang terukur — klien yang menemukan false MENYEMBUNYIKAN kartunya, bukan menampilkan null sebagai 0%. KPI karangan di layar operasional akan dipakai menilai orang.\n\nterminal dan session_started_at null berarti petugasnya belum membuka giliran di loket mana pun — keadaan sah, beranda boleh dibuka sebelum login.\n\ncan_take_calls adalah Rule 4 yang SUDAH dihitung: hanya terminal ONLINE yang boleh mengambil antrean.\n\nBatas 'hari ini' adalah tengah malam WIB yang dihitung aplikasi, bukan CURRENT_DATE. Yang dihitung adalah panggilan yang BERAKHIR hari ini."
+     },
+     "response": [],
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "const d = pm.response.json().data;",
+         "pm.test('KPI yang tak terukur dikirim null, bukan 0', function () {",
+         "    pm.expect(d.today.sla_percent, 'sla_percent').to.be.null;",
+         "    pm.expect(d.today.csat_percent, 'csat_percent').to.be.null;",
+         "    pm.expect(d.today.shift_target, 'shift_target').to.be.null;",
+         "});",
+         "pm.test('measured menandai ketiganya tidak terukur', function () {",
+         "    pm.expect(d.measured.sla_percent).to.be.false;",
+         "    pm.expect(d.measured.csat_percent).to.be.false;",
+         "    pm.expect(d.measured.shift_target).to.be.false;",
+         "});"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "7. Jejak audit petugas & terminal",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{agent_api_key}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/cs/audit-events?limit=20",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "cs",
+        "audit-events"
+       ],
+       "query": [
+        {
+         "key": "limit",
+         "value": "20"
+        }
+       ]
+      },
+      "description": "Dua belas peristiwa Rule 7: AGENT_REGISTERED, AGENT_LOGIN, AGENT_LOGIN_FAILED, AGENT_LOGOUT, AGENT_PASSWORD_SET, SUPERVISOR_AUTHORIZED, SUPERVISOR_AUTH_FAILED, DEVICE_HEALTHCHECK, PII_ACKNOWLEDGED, TERMINAL_REGISTERED, TERMINAL_ACTIVATED, TERMINAL_DEACTIVATED.\n\nEnam tindakan Rule 7 lainnya TIDAK di sini: reservasi antrean, panggilan dimulai, panggilan berakhir, dan keputusan verifikasi sudah tercatat di onboarding_audit_logs (lewat GET /v1/onboarding/sessions/{id}/audit), sementara pembukaan PII tercatat di cs_access_logs. Menuliskannya dua kali akan membuat setiap pemeriksaan harus memutuskan sumber mana yang benar.\n\nFilter: actor, event_type, terminal_id, from, to (RFC 3339), limit (1-200, default 50), cursor (keyset).\n\nPENJAGANYA LEBIH LONGGAR DARIPADA SEMESTINYA — lihat deskripsi folder."
+     },
+     "response": []
+    },
+    {
+     "name": "8. Jejak audit — jenis peristiwa salah ketik (400)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{agent_api_key}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/cs/audit-events?event_type=AGENT_LOGIN_",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "cs",
+        "audit-events"
+       ],
+       "query": [
+        {
+         "key": "event_type",
+         "value": "AGENT_LOGIN_"
+        }
+       ]
+      },
+      "description": "Jenis peristiwa tak dikenal DITOLAK 400, bukan dibiarkan menghasilkan daftar kosong: nol baris karena salah ketik tidak bisa dibedakan dari nol baris karena memang belum ada yang terjadi — dan yang kedua adalah kesimpulan pemeriksaan.\n\n`from` yang lebih akhir dari `to` ditolak dengan alasan yang sama."
+     },
+     "response": []
     }
    ]
   },

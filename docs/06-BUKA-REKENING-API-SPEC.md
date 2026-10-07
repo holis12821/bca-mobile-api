@@ -801,7 +801,8 @@ Response `200 OK`:
     "calls": [
       { "queue_id": "q_abc123", "queue_number": "A-014",
         "session_id": "onb_9f8e7d6c5b4a", "position": 1,
-        "waited_seconds": 95, "status": "QUEUED" }
+        "waited_seconds": 95, "status": "QUEUED",
+        "priority": "NORMAL", "service": "EKYC_ONBOARDING" }
     ],
     "operating_hours": { "start": "06:00", "end": "22:00", "timezone": "Asia/Jakarta" },
     "within_operating_hours": true
@@ -820,6 +821,25 @@ Response `200 OK`:
   petugas dan nasabah tidak lebih besar daripada jumlah panggilan yang benar-benar ada.
 - `within_operating_hours: false` berarti antrean tidak menerima yang baru; yang sudah
   mengantre tetap boleh dilayani.
+
+**`priority` DITURUNKAN dari `waited_seconds`, bukan disimpan.** `NORMAL` di bawah 10
+menit, `HIGH` pada 10 menit atau lebih (ambangnya inklusif).
+
+Tidak ada sumber prioritas di sistem ini: tidak ada tier nasabah yang ikut ke sesi
+onboarding, dan nasabah yang belum punya rekening belum punya tier apa pun. Kolom
+tersimpan berarti kolom yang semua barisnya bernilai sama — dan kolom yang ada akan
+diisi, lalu yang terisi akan dipercaya. Diturunkan dari waktu tunggu, ia selalu berarti
+sesuatu yang benar: antrean bergerak, dan yang paling lama menunggu memang yang paling
+perlu didahulukan.
+
+Ambang 10 menit bukan selera: `estimated_wait_seconds` yang dikirim ke nasabah dihitung
+dari rata-rata panggilan, jadi menunggu lebih lama dari dua kali panggilan rata-rata
+berarti antreannya tidak bergerak sebagaimana ia diberi tahu. Di titik itu petugas perlu
+melihatnya menonjol, bukan membandingkan angka detik sendiri.
+
+**`service` selalu `EKYC_ONBOARDING`** hari ini — itu satu-satunya layanan yang mengantre
+di sini. Ada di kontrak supaya layar petugas tidak perlu berubah bentuk saat layanan
+kedua menyusul.
 
 #### 5b-1. Agent Token (internal)
 

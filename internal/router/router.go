@@ -632,13 +632,13 @@ func New(deps Deps) (http.Handler, error) {
 		Access:    postgres.NewCSAccessLogRepo(deps.DB),
 		Hasher:    lookupHasher,
 	})
-	csH := handler.NewCSHandler(csService)
-
 	// Terminal, sesi petugas, dan jejak audit CS. Satu paket domain `cs`, konteks sama:
 	// semuanya tentang apa yang dilakukan PETUGAS, bukan tentang nasabah.
 	csTerminalRepo := postgres.NewCSTerminalRepo(deps.DB)
 	csSessionRepo := postgres.NewCSAgentSessionRepo(deps.DB)
 	csAuditRepo := postgres.NewCSAuditEventRepo(deps.DB)
+
+	csSupervisorRepo := postgres.NewCSSupervisorRepo(deps.DB)
 
 	csSessionService := cs.NewAgentSessionService(cs.AgentSessionServiceConfig{
 		Creds:     postgres.NewCSAgentCredentialRepo(deps.DB),
@@ -646,15 +646,36 @@ func New(deps Deps) (http.Handler, error) {
 		Terminals: csTerminalRepo,
 		Audit:     csAuditRepo,
 		Hasher:    crypto.NewPasswordHasher(),
+
+		// Pendaftaran petugas (SCR-001). Direktori pegawai digerbangi APP_ENV seperti
+		// seluruh integrasi luar di repo ini: di luar development ia menolak dengan
+		// HRIS_UNAVAILABLE, bukan meluluskan NPP yang tidak pernah diperiksa siapa pun.
+		Registry:    postgres.NewCSAgentRegistryRepo(deps.DB),
+		Supervisors: csSupervisorRepo,
+		HRIS:        cs.HRISDirectoryFor(devMode),
 	})
 
 	csTerminalService := cs.NewTerminalService(cs.TerminalServiceConfig{
 		Terminals:   csTerminalRepo,
-		Supervisors: postgres.NewCSSupervisorRepo(deps.DB),
+		Supervisors: csSupervisorRepo,
 		Sessions:    csSessionRepo,
 		Audit:       csAuditRepo,
 	})
 
+	// Pembacaan jejak audit terpisah dari penulisnya: penulisan terjadi di dalam
+	// tindakan yang memicunya, sementara pembacaan adalah pekerjaan pengawas.
+	csAuditQueryService := cs.NewAuditQueryService(csAuditRepo)
+
+	// Dashboard tidak punya tabel sendiri — setiap angkanya sudah dicatat di tempat lain
+	// sebagai akibat sebuah tindakan. Tabel ringkasan tersendiri akan menjadi salinan
+	// kedua yang bisa melenceng dari aslinya.
+	csDashboardService := cs.NewDashboardService(cs.DashboardServiceConfig{
+		Calls:     postgres.NewCSDashboardRepo(deps.DB),
+		Sessions:  csSessionRepo,
+		Terminals: csTerminalRepo,
+	})
+
+	csH := handler.NewCSHandler(csService, csAuditQueryService, csDashboardService)
 	csAuthH := handler.NewCSAuthHandler(csSessionService)
 	csTerminalH := handler.NewCSTerminalHandler(csTerminalService)
 
@@ -987,6 +1008,21 @@ func New(deps Deps) (http.Handler, error) {
 				Post("/logout", csAuthH.Logout)
 		})
 
+		// Pendaftaran petugas dan direktori pegawai (SCR-001).
+		//
+		// Di belakang AgentIdentity: pendaftar harus bisa disebut namanya di jejak audit.
+		// Tidak menuntut cakupan tertentu — mendaftarkan petugas adalah pekerjaan
+		// supervisor/teknisi, dan tidak satu pun dari empat cakupan yang ada
+		// menggambarkannya. Otorisasi dual-control diminta di BODY, bukan sebagai gerbang
+		// sesi: yang perlu ditandatangani adalah pemberian kewenangan, bukan kesiapan
+		// loket si pendaftar.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.AgentIdentity(csAgentLookup))
+
+			r.Post("/agents", csAuthH.RegisterAgent)
+			r.Get("/hris/employees/{employee_id}", csAuthH.LookupEmployee)
+		})
+
 		// Supervisor: daftar untuk layar SCR-006, dan otorisasi dual-control.
 		r.Route("/supervisors", func(r chi.Router) {
 			// Daftar supervisor dibuka SEBELUM otorisasi, jadi ia hanya butuh sesi —
@@ -1050,6 +1086,20 @@ func New(deps Deps) (http.Handler, error) {
 			r.Get("/{ticket_number}", ticketH.GetTicket)
 			r.Patch("/{ticket_number}", ticketH.UpdateTicket)
 			r.Post("/{ticket_number}/notes", ticketH.AddNote)
+		})
+
+		// Beranda petugas dan jejak audit CS.
+		//
+		// Penjaganya AgentIdentity, BUKAN sebuah cakupan: keduanya menjawab tentang
+		// pekerjaan petugas sendiri, bukan tentang nasabah, dan CHECK
+		// cs_agents_scopes_valid di migrasi 000027 mengunci daftar cakupan ke empat
+		// nilai — cakupan AUDIT_READ menuntut migrasi tersendiri. Preseden yang diikuti:
+		// GET /v1/onboarding/sessions/{id}/audit juga tidak menuntut cakupan.
+		r.Route("/cs", func(r chi.Router) {
+			r.Use(middleware.AgentIdentity(csAgentLookup))
+
+			r.Get("/dashboard", csH.Dashboard)
+			r.Get("/audit-events", csH.ListAuditEvents)
 		})
 
 		// Pemantauan sesi onboarding.

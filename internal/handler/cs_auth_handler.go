@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/cs"
@@ -182,6 +183,67 @@ func (h *CSAuthHandler) SetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response.Success(w, r, http.StatusOK, map[string]any{"password_set": true})
+}
+
+// LookupEmployee handles GET /internal/v1/hris/employees/{employee_id}
+//
+// Di belakang kunci API petugas: yang mencari NPP orang lain di direktori pegawai harus
+// bisa disebut namanya. Tidak menuntut cakupan tertentu — mendaftarkan petugas adalah
+// pekerjaan supervisor/teknisi, dan tidak satu pun dari empat cakupan yang ada
+// menggambarkannya.
+//
+// Tiga jawaban yang dibedakan: 200 dengan `active: true`, 200 dengan `active: false`,
+// dan 404 EMPLOYEE_NOT_FOUND. Yang kedua BUKAN error — layar pendaftaran perlu
+// menampilkan "pegawai ini sudah tidak aktif", bukan "NPP tidak ditemukan".
+//
+// HRIS yang tidak bisa dihubungi menjawab 503 HRIS_UNAVAILABLE, bukan 404: 404 akan
+// terbaca sebagai "NPP tidak terdaftar", dan petugas yang mendapatkannya saat HRIS mati
+// akan menyimpulkan hal yang salah tentang rekannya.
+func (h *CSAuthHandler) LookupEmployee(w http.ResponseWriter, r *http.Request) {
+	emp, err := h.svc.LookupEmployee(r.Context(), chi.URLParam(r, "employee_id"))
+	if err != nil {
+		h.handleErr(w, r, "hris employee lookup failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, emp)
+}
+
+// RegisterAgent handles POST /internal/v1/agents
+//
+// Di belakang kunci API petugas DAN otorisasi supervisor di body: pemberian kewenangan
+// adalah tindakan dual-control, dan yang perlu ditandatangani adalah pemberian itu —
+// bukan kesiapan loket si pendaftar.
+//
+// Jawabannya memuat `api_key` SEKALI. Server menyimpan hash-nya; tidak ada endpoint yang
+// bisa mengembalikannya lagi.
+func (h *CSAuthHandler) RegisterAgent(w http.ResponseWriter, r *http.Request) {
+	registrar, _, ok := middleware.AgentFromCtx(r.Context())
+	if !ok || registrar == "" {
+		slog.Error("agent registration reached without an authenticated registrar",
+			"request_id", chimiddleware.GetReqID(r.Context()),
+		)
+		response.Err(w, r, apperr.Error{
+			Status:  http.StatusForbidden,
+			Code:    "FORBIDDEN",
+			Message: "Akses ditolak.",
+		})
+		return
+	}
+
+	var req cs.RegisterAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	resp, err := h.svc.RegisterAgent(r.Context(), req, registrar, extractIP(r), r.UserAgent())
+	if err != nil {
+		h.handleErr(w, r, "register cs agent failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusCreated, resp)
 }
 
 func (h *CSAuthHandler) handleErr(w http.ResponseWriter, r *http.Request, msg string, err error) {

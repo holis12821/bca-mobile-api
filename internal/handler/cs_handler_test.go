@@ -61,10 +61,13 @@ func newCSRouter(withAgent bool) (*chi.Mux, *stubCSCustomers, *stubCSAccessLog) 
 	}
 	access := &stubCSAccessLog{}
 
+	// audit dan dashboard nil: test ini hanya soal pencarian dan profil nasabah, dan
+	// kedua handler yang memakainya menolak dengan PROVIDER_NOT_CONFIGURED saat nil —
+	// bukan panic.
 	h := handler.NewCSHandler(cs.NewService(cs.ServiceConfig{
 		Customers: customers,
 		Access:    access,
-	}))
+	}), nil, nil)
 
 	r := chi.NewMux()
 	r.Route("/customers", func(r chi.Router) {

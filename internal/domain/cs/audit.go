@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 )
 
 // Jenis peristiwa audit petugas/terminal. Cocok dengan CHECK di migrasi 000037.
@@ -103,4 +105,79 @@ func writeCSAudit(
 		slog.Error("write cs audit event failed",
 			"event_type", eventType, "actor", actor, "error", err)
 	}
+}
+
+// --- Pencarian jejak untuk pengawas ---
+
+const (
+	auditDefaultLimit = 50
+	auditMaxLimit     = 200
+)
+
+// ValidAuditEventType melaporkan apakah sebuah jenis peristiwa dikenal.
+//
+// Dipakai menolak filter yang salah ketik. Nol baris karena `AGENT_LOGOUT_` tidak bisa
+// dibedakan dari nol baris karena memang belum ada yang logout, dan pengawas yang
+// menyimpulkan yang kedua dari yang pertama akan salah mengambil kesimpulan.
+func ValidAuditEventType(t string) bool {
+	switch t {
+	case EventAgentRegistered, EventAgentLogin, EventAgentLoginFailed,
+		EventAgentLogout, EventAgentPasswordSet,
+		EventSupervisorAuthorized, EventSupervisorAuthFailed,
+		EventDeviceHealthcheck, EventPIIAcknowledged,
+		EventTerminalRegistered, EventTerminalActivated, EventTerminalDeactivated:
+		return true
+	}
+	return false
+}
+
+// AuditQueryService membaca jejak petugas/terminal.
+//
+// Terpisah dari penulisnya: penulisan terjadi di dalam tindakan yang memicunya (lihat
+// writeCSAudit), sementara pembacaan adalah pekerjaan pengawas yang tidak boleh ikut
+// memegang jalur tulis.
+type AuditQueryService struct {
+	events AuditEventRepository
+}
+
+func NewAuditQueryService(events AuditEventRepository) *AuditQueryService {
+	return &AuditQueryService{events: events}
+}
+
+// List mengembalikan peristiwa, penanda masih-ada-lagi, dan kursor berikutnya.
+//
+// Bentuk kembaliannya mengikuti MonitoringService.ListSessions supaya handler-nya
+// mengemas pagination dengan cara yang sama — dua endpoint daftar yang berbeda bentuk
+// kursornya akan membuat klien menulis dua pembaca.
+func (s *AuditQueryService) List(ctx context.Context, filter AuditFilter) ([]AuditEvent, bool, *AuditCursor, error) {
+	if s.events == nil {
+		// Proses tanpa penulis audit juga tanpa pembacanya. Menolak, bukan menjawab
+		// daftar kosong: daftar kosong terbaca sebagai "tidak ada yang terjadi".
+		return nil, false, nil, apperr.ProviderNotConfigured
+	}
+
+	if filter.Limit <= 0 {
+		filter.Limit = auditDefaultLimit
+	}
+	if filter.Limit > auditMaxLimit {
+		filter.Limit = auditMaxLimit
+	}
+
+	rows, err := s.events.List(ctx, filter)
+	if err != nil {
+		return nil, false, nil, err
+	}
+
+	// Baris ke-(limit+1) hanya penanda bahwa masih ada lagi; ia tidak ikut dikirim.
+	hasMore := len(rows) > filter.Limit
+	if hasMore {
+		rows = rows[:filter.Limit]
+	}
+
+	var next *AuditCursor
+	if hasMore && len(rows) > 0 {
+		last := rows[len(rows)-1]
+		next = &AuditCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	return rows, hasMore, next, nil
 }

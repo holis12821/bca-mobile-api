@@ -1933,3 +1933,72 @@ func TestJoinQueue_BlockedByOpenEscalation(t *testing.T) {
 		t.Fatalf("antrean setelah eskalasi selesai: %v", err)
 	}
 }
+
+// --- priority & service pada daftar antrean (SCR-011) ---
+
+func TestQueuePriorityFor(t *testing.T) {
+	cases := []struct {
+		waited time.Duration
+		want   string
+	}{
+		{0, QueuePriorityNormal},
+		{QueueHighPriorityAfter - time.Second, QueuePriorityNormal},
+		// Ambangnya inklusif: tepat 10 menit sudah HIGH.
+		{QueueHighPriorityAfter, QueuePriorityHigh},
+		{30 * time.Minute, QueuePriorityHigh},
+	}
+	for _, tc := range cases {
+		if got := QueuePriorityFor(tc.waited); got != tc.want {
+			t.Errorf("menunggu %s: priority = %s, mau %s", tc.waited, got, tc.want)
+		}
+	}
+}
+
+// Daftar antrean yang dilihat petugas membawa priority dan service. Keduanya DITURUNKAN,
+// bukan dibaca dari kolom — tidak ada sumber prioritas di sistem ini.
+func TestListQueued_CarriesPriorityAndService(t *testing.T) {
+	svc, sessionRepo, cache, vcRepo, _ := setupVCService()
+	ctx := context.Background()
+
+	sessionID := createVCTestSession(sessionRepo, cache)
+	joinResp, err := svc.JoinQueue(ctx, JoinQueueRequest{SessionID: sessionID}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("join queue: %v", err)
+	}
+
+	resp, err := svc.ListQueued(ctx)
+	if err != nil {
+		t.Fatalf("list queued: %v", err)
+	}
+	if len(resp.Calls) != 1 {
+		t.Fatalf("mau 1 panggilan, dapat %d", len(resp.Calls))
+	}
+
+	// Baru mengantre: NORMAL.
+	if resp.Calls[0].Priority != QueuePriorityNormal {
+		t.Errorf("priority = %s, mau NORMAL", resp.Calls[0].Priority)
+	}
+	if resp.Calls[0].Service != QueueServiceEKYC {
+		t.Errorf("service = %s, mau %s", resp.Calls[0].Service, QueueServiceEKYC)
+	}
+
+	// Mundurkan joined_at melewati ambang: prioritasnya harus ikut naik tanpa ada yang
+	// menulis kolom apa pun.
+	//
+	// Relatif ke nilai yang SUDAH ada, bukan ke time.Now(): service memakai clock test
+	// (testClockWIB), dan memundurkan dari jam dinding akan menghitung selisih terhadap
+	// tanggal yang berbeda.
+	vc := vcRepo.byQueue[joinResp.QueueID]
+	vc.JoinedAt = vc.JoinedAt.Add(-(QueueHighPriorityAfter + time.Minute))
+
+	resp, err = svc.ListQueued(ctx)
+	if err != nil {
+		t.Fatalf("list queued kedua: %v", err)
+	}
+	if len(resp.Calls) != 1 {
+		t.Fatalf("mau 1 panggilan, dapat %d", len(resp.Calls))
+	}
+	if resp.Calls[0].Priority != QueuePriorityHigh {
+		t.Errorf("priority = %s, mau HIGH setelah menunggu lama", resp.Calls[0].Priority)
+	}
+}

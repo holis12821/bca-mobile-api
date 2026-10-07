@@ -5,12 +5,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/holis12821/bca-mobile-api/internal/domain/cs"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 )
 
 // CSCustomerRepo membaca nasabah untuk petugas CS.
@@ -194,6 +197,43 @@ func (r *CSAccessLogRepo) Insert(ctx context.Context, log *cs.AccessLog) error {
 	)
 	if err != nil {
 		return fmt.Errorf("insert cs access log: %w", err)
+	}
+	return nil
+}
+
+// --- Pendaftaran petugas ---
+
+// CSAgentRegistryRepo mengimplementasikan cs.AgentRegistry.
+type CSAgentRegistryRepo struct {
+	pool *pgxpool.Pool
+}
+
+func NewCSAgentRegistryRepo(pool *pgxpool.Pool) *CSAgentRegistryRepo {
+	return &CSAgentRegistryRepo{pool: pool}
+}
+
+// Register menyisipkan baris cs_agents baru.
+//
+// NPP ganda dijawab dari PELANGGARAN PRIMARY KEY (23505), bukan dari SELECT lebih dulu:
+// dua pendaftaran bersamaan untuk NPP yang sama akan sama-sama melihat "belum ada", dan
+// yang kedua akan menimpa kunci API yang baru saja diserahkan ke orang pertama.
+//
+// Cakupan kosong tidak perlu dijaga di sini — CHECK cs_agents_scopes_valid di migrasi
+// 000027 menuntut cardinality > 0 dan membatasi nilainya ke empat cakupan yang ada.
+// Service tetap memeriksanya lebih dulu supaya pesannya bisa menyebut cakupan MANA yang
+// tidak dikenal, yang tidak bisa dilakukan sebuah CHECK.
+func (r *CSAgentRegistryRepo) Register(ctx context.Context, employeeID, name, apiKeyHash string, scopes []string, at time.Time) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO cs_agents (employee_id, name, api_key_hash, scopes, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, true, $5, $5)`,
+		employeeID, name, apiKeyHash, scopes, at,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return apperr.AgentAlreadyRegistered
+		}
+		return fmt.Errorf("insert cs agent: %w", err)
 	}
 	return nil
 }

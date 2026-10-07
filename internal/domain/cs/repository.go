@@ -152,6 +152,20 @@ type AgentLoginRecord struct {
 	LockedUntil  *time.Time
 }
 
+// AgentRegistry mendaftarkan petugas baru.
+//
+// Terpisah dari AgentCredentialRepository: yang itu melayani login petugas yang SUDAH
+// ada, sementara ini menambah barisnya. Jalur tulis yang menciptakan kewenangan tidak
+// semestinya menumpang antarmuka yang dipanggil setiap login.
+type AgentRegistry interface {
+	// Register menyisipkan baris cs_agents baru.
+	//
+	// Mengembalikan apperr.AgentAlreadyRegistered kalau NPP-nya sudah ada — dijawab dari
+	// pelanggaran primary key, bukan SELECT lebih dulu: dua pendaftaran bersamaan akan
+	// sama-sama melihat "NPP belum ada".
+	Register(ctx context.Context, employeeID, name, apiKeyHash string, scopes []string, at time.Time) error
+}
+
 // AuditEventRepository menulis dan mencari jejak petugas/terminal.
 type AuditEventRepository interface {
 	// Insert menulis satu peristiwa.

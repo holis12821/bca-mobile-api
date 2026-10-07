@@ -3,6 +3,9 @@ package handler
 import (
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -11,6 +14,7 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/domain/cs"
 	"github.com/holis12821/bca-mobile-api/internal/middleware"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/pagination"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/response"
 )
 
@@ -20,11 +24,17 @@ import (
 // middleware.AgentAuth ber-scope CUSTOMER_PII. Tanpa yang kedua tidak ada identitas
 // petugas, dan tanpa identitas petugas jejak aksesnya tidak menjawab apa pun.
 type CSHandler struct {
-	svc *cs.Service
+	svc       *cs.Service
+	audit     *cs.AuditQueryService
+	dashboard *cs.DashboardService
 }
 
-func NewCSHandler(svc *cs.Service) *CSHandler {
-	return &CSHandler{svc: svc}
+func NewCSHandler(
+	svc *cs.Service,
+	audit *cs.AuditQueryService,
+	dashboard *cs.DashboardService,
+) *CSHandler {
+	return &CSHandler{svc: svc, audit: audit, dashboard: dashboard}
 }
 
 // SearchCustomers handles GET /internal/v1/customers?q=
@@ -114,4 +124,154 @@ func (h *CSHandler) handleErr(w http.ResponseWriter, r *http.Request, msg string
 		)
 	}
 	response.Err(w, r, appErr)
+}
+
+// ListAuditEvents handles GET /internal/v1/cs/audit-events
+//
+// Penjaganya kunci sistem + identitas petugas, BUKAN sebuah cakupan tersendiri. Itu
+// mengikuti preseden `GET /v1/onboarding/sessions/{id}/audit`, dan sekaligus batasan
+// nyata: CHECK `cs_agents_scopes_valid` di migrasi 000027 mengunci daftar cakupan ke
+// empat nilai, jadi cakupan `AUDIT_READ` menuntut migrasi tersendiri.
+//
+// Akibatnya setiap petugas terautentikasi bisa membaca jejak rekannya. Itu lebih longgar
+// daripada yang semestinya untuk kewenangan pengawas — lihat catatan di
+// docs/01-API-SPECIFICATION.md §11.
+func (h *CSHandler) ListAuditEvents(w http.ResponseWriter, r *http.Request) {
+	if h.audit == nil {
+		slog.Error("audit-events reached without an audit query service", "path", r.URL.Path)
+		response.Err(w, r, apperr.ProviderNotConfigured)
+		return
+	}
+
+	q := r.URL.Query()
+	filter := cs.AuditFilter{
+		Actor:      strings.TrimSpace(q.Get("actor")),
+		TerminalID: strings.TrimSpace(q.Get("terminal_id")),
+	}
+
+	// Jenis peristiwa yang tidak dikenal DITOLAK, bukan dibiarkan menghasilkan daftar
+	// kosong: nol baris karena salah ketik tidak bisa dibedakan dari nol baris karena
+	// memang belum ada yang terjadi, dan yang kedua adalah kesimpulan pemeriksaan.
+	if raw := strings.TrimSpace(q.Get("event_type")); raw != "" {
+		if !cs.ValidAuditEventType(raw) {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		filter.EventType = raw
+	}
+
+	// Rentang waktu. Keduanya opsional dan boleh sendirian.
+	for _, b := range []struct {
+		key string
+		dst **time.Time
+	}{{"from", &filter.From}, {"to", &filter.To}} {
+		raw := strings.TrimSpace(q.Get(b.key))
+		if raw == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		*b.dst = &parsed
+	}
+
+	// from setelah to tidak mungkin menghasilkan apa pun. Ditolak supaya pengawas tahu
+	// filternya terbalik, bukan menyimpulkan tidak ada peristiwa di rentang itu.
+	if filter.From != nil && filter.To != nil && filter.From.After(*filter.To) {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	limit := 50
+	if raw := q.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 200 {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		limit = parsed
+	}
+	filter.Limit = limit
+
+	if raw := q.Get("cursor"); raw != "" {
+		decoded, err := pagination.DecodeHistoryCursor(raw)
+		if err != nil {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, decoded.CreatedAt)
+		if err != nil {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		id, err := uuid.Parse(decoded.ID)
+		if err != nil {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		filter.Cursor = &cs.AuditCursor{CreatedAt: createdAt, ID: id}
+	}
+
+	items, hasMore, next, err := h.audit.List(r.Context(), filter)
+	if err != nil {
+		h.handleErr(w, r, "list cs audit events failed", err)
+		return
+	}
+	if items == nil {
+		items = []cs.AuditEvent{}
+	}
+
+	nextCursor := ""
+	if next != nil {
+		nextCursor = pagination.HistoryCursor{
+			CreatedAt: next.CreatedAt.Format(time.RFC3339Nano),
+			ID:        next.ID.String(),
+		}.Encode()
+	}
+
+	response.SuccessWithPagination(w, r, http.StatusOK, map[string]any{
+		"events": items,
+	}, response.Pagination{
+		Cursor:  nextCursor,
+		HasMore: hasMore,
+		Limit:   limit,
+	})
+}
+
+// Dashboard handles GET /internal/v1/cs/dashboard
+//
+// Satu permintaan, bukan empat: layar beranda dimuat setiap petugas membukanya, dan
+// empat permintaan untuk satu layar adalah empat kali verifikasi Argon2id (64 MB x 4
+// thread).
+func (h *CSHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
+	if h.dashboard == nil {
+		slog.Error("dashboard reached without a dashboard service", "path", r.URL.Path)
+		response.Err(w, r, apperr.ProviderNotConfigured)
+		return
+	}
+
+	employeeID, name, ok := middleware.AgentFromCtx(r.Context())
+	if !ok || employeeID == "" {
+		// Kesalahan perakitan rute, bukan kesalahan pemanggil.
+		slog.Error("dashboard reached without an authenticated agent",
+			"request_id", chimiddleware.GetReqID(r.Context()),
+		)
+		response.Err(w, r, apperr.Error{
+			Status:  http.StatusForbidden,
+			Code:    "FORBIDDEN",
+			Message: "Akses ditolak.",
+		})
+		return
+	}
+	scopes, _ := middleware.AgentScopesFromCtx(r.Context())
+
+	data, err := h.dashboard.Overview(r.Context(), employeeID, name, scopes)
+	if err != nil {
+		h.handleErr(w, r, "build cs dashboard failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, data)
 }

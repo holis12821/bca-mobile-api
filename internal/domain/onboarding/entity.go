@@ -1008,6 +1008,51 @@ type QueuedVideoCall struct {
 	Position      int64  `json:"position"`
 	WaitedSeconds int    `json:"waited_seconds"`
 	Status        string `json:"status"`
+
+	// Priority DITURUNKAN dari WaitedSeconds, bukan disimpan.
+	//
+	// Tidak ada sumber prioritas di sistem ini: tidak ada tier nasabah yang ikut ke
+	// sesi onboarding, dan nasabah yang belum punya rekening belum punya tier apa pun.
+	// Menyimpannya sebagai kolom berarti kolom yang semua barisnya bernilai sama —
+	// dan kolom yang ada akan diisi, lalu yang terisi akan dipercaya.
+	//
+	// Diturunkan dari waktu tunggu, ia selalu berarti sesuatu yang benar: antrean
+	// bergerak, dan yang paling lama menunggu memang yang paling perlu didahulukan.
+	Priority string `json:"priority"`
+
+	// Service selalu EKYC_ONBOARDING hari ini — itu satu-satunya layanan yang mengantre
+	// di sini. Ada di kontrak supaya layar petugas tidak perlu berubah bentuk saat
+	// layanan kedua menyusul.
+	Service string `json:"service"`
+}
+
+// Prioritas antrean. Diturunkan dari waktu tunggu — lihat QueuedVideoCall.Priority.
+const (
+	QueuePriorityNormal = "NORMAL"
+	QueuePriorityHigh   = "HIGH"
+)
+
+// QueueHighPriorityAfter adalah ambang NORMAL → HIGH.
+//
+// Sepuluh menit, dan angkanya bukan selera: `estimated_wait_seconds` yang dikirim ke
+// nasabah dihitung dari rata-rata panggilan, dan menunggu lebih lama dari dua kali
+// panggilan rata-rata berarti antreannya tidak bergerak sebagaimana ia diberi tahu.
+// Di titik itu petugas perlu melihatnya menonjol, bukan membaca angka detik di kolom
+// lain dan membandingkannya sendiri.
+const QueueHighPriorityAfter = 10 * time.Minute
+
+// QueueServiceEKYC adalah satu-satunya layanan yang mengantre di sini hari ini.
+const QueueServiceEKYC = "EKYC_ONBOARDING"
+
+// QueuePriorityFor menurunkan prioritas dari lama menunggu.
+//
+// Satu tempat, supaya daftar petugas dan apa pun yang menampilkannya nanti tidak pernah
+// berbeda pendapat soal ambangnya.
+func QueuePriorityFor(waited time.Duration) string {
+	if waited >= QueueHighPriorityAfter {
+		return QueuePriorityHigh
+	}
+	return QueuePriorityNormal
 }
 
 // ListQueuedVideoCallsResponse dikembalikan GET /v1/onboarding/video-call/queued.
