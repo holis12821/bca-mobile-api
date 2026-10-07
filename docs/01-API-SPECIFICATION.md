@@ -1781,6 +1781,297 @@ Kunci sistem salah **dan** kewenangan kurang keduanya dijawab `403 FORBIDDEN` de
 pesan identik — disengaja, supaya penyerang tidak bisa menebak kunci mana yang sudah
 benar. Pakai `meta.request_id` dan log server untuk membedakannya.
 
+### Lapis keempat — token sesi petugas
+
+Tiga header di atas membuktikan **siapa**. Sebagian endpoint menuntut lebih: bahwa
+petugasnya sedang **bertugas di sebuah loket**. Buktinya token sesi dari `auth/login`:
+
+```
+Authorization: Bearer <session_token>
+```
+
+Dipakai di endpoint yang terminalnya ditentukan **sesi**, bukan parameter — seluruh
+`/terminals/*` kecuali pendaftaran dan pembacaan, `/supervisors/*`, dan `auth/logout`.
+Itu yang membuat petugas tidak bisa menyatakan kesiapan atas loket yang bukan tempat ia
+masuk, atau menutup giliran orang lain.
+
+`session_token` **hanya terkirim sekali**, pada jawaban `auth/login`. Server menyimpan
+hash-nya; tidak ada endpoint yang bisa mengembalikannya lagi.
+
+### `POST /internal/v1/auth/password`
+
+Header: kunci sistem + kedua header petugas. **Bukan** token sesi — ini jalur penyetelan
+kata sandi pertama, dan petugas yang belum punya kata sandi tidak bisa punya sesi.
+
+```json
+{ "current_password": "", "new_password": "KataSandiPanjang2026" }
+```
+
+`current_password` wajib **hanya** kalau petugas sudah punya kata sandi. Minimal 12
+karakter → `422 AGENT_PASSWORD_WEAK`.
+
+Response `200 OK`: `{ "password_set": true }`
+
+### `POST /internal/v1/auth/login`
+
+Header: **kunci sistem saja.** Di sinilah petugas membuktikan dirinya; menuntut
+kredensial petugas lebih dulu akan membuatnya harus sudah masuk untuk bisa masuk.
+
+```json
+{
+  "employee_id": "CS-1042",
+  "password": "KataSandiPanjang2026",
+  "terminal_id": "WKS-SMG-0842",
+  "shift": "PAGI"
+}
+```
+
+### Response `200 OK`
+```json
+{
+  "data": {
+    "session_token": "cst_8f3a…",
+    "employee_id": "CS-1042",
+    "name": "Sarah Adisti",
+    "scopes": ["VIDEO_CALL", "CUSTOMER_PII"],
+    "terminal_id": "WKS-SMG-0842",
+    "terminal_status": "REGISTERED",
+    "started_at": "2026-10-07T08:02:11+07:00",
+    "expires_at": "2026-10-07T16:02:11+07:00",
+    "next_step": "TERMINAL_READINESS"
+  }
+}
+```
+
+`next_step` selalu `TERMINAL_READINESS`. Sesi yang baru terautentikasi **wajib** lewat
+layar kesiapan, tidak boleh langsung ke dashboard — dikirim server supaya aturan itu
+tidak hidup hanya di routing klien, yang bisa disunting.
+
+| Keadaan | Jawaban |
+|---|---|
+| NPP atau kata sandi salah | `401 AGENT_CREDENTIAL_INVALID` |
+| Kata sandi belum pernah disetel | `422 AGENT_PASSWORD_NOT_SET` |
+| Terlalu banyak percobaan gagal | `423 AGENT_LOCKED` |
+| Terminal tidak terdaftar | `404 TERMINAL_NOT_FOUND` |
+| Petugas masih aktif di terminal lain | `409 TERMINAL_AGENT_BUSY` |
+
+### `GET /internal/v1/auth/me`
+
+Header: kunci sistem + kedua header petugas. Menjawab **tentang pemanggilnya**.
+
+```json
+{
+  "data": {
+    "employee_id": "CS-1042",
+    "name": "Sarah Adisti",
+    "scopes": ["VIDEO_CALL", "CUSTOMER_PII"],
+    "session": {
+      "terminal_id": "WKS-SMG-0842",
+      "shift": "PAGI",
+      "started_at": "2026-10-07T08:02:11+07:00",
+      "expires_at": "2026-10-07T16:02:11+07:00"
+    }
+  }
+}
+```
+
+`scopes` **selalu array**, tidak pernah `null`: klien yang menerima `null` akan memanggil
+`scopes.includes(...)` pada nilai yang bukan array.
+
+`session` `null` berarti petugasnya belum membuka giliran di loket mana pun. Dibedakan
+supaya aplikasi desktop tahu apakah ia perlu login, bukan menebaknya dari ada-tidaknya
+token di penyimpanannya sendiri.
+
+Endpoint ini menghapus tebak-tebakan cakupan. Tanpanya aplikasi desktop menyembunyikan
+menu berdasarkan `403` yang pernah diterima — artinya setiap menu harus dicoba sekali
+untuk diketahui, dan setiap percobaan memicu verifikasi Argon2id (64 MB × 4 thread).
+
+### `POST /internal/v1/auth/logout`
+
+Header: kunci sistem + `Authorization: Bearer <session_token>`. Yang ditutup adalah sesi
+yang **tokennya dikirim**, bukan sesi yang disebut di body — tanpa itu token siapa pun
+bisa menutup giliran orang lain.
+
+Response `200 OK`: `{ "ended": true, "terminal_status": "OFFLINE" }`
+
+### `POST /internal/v1/terminals`
+
+Header: kunci sistem + kedua header petugas. Pendaftar harus bisa disebut namanya di
+jejak audit. Tidak menuntut cakupan tertentu — memasang terminal adalah pekerjaan
+teknisi, dan tidak satu pun dari empat cakupan yang ada menggambarkannya.
+
+```json
+{ "terminal_id": "WKS-SMG-0842", "workstation": "Loket 4", "location": "KCU Semarang" }
+```
+
+Response `201 Created` memuat barisnya lengkap (`status`, `registered_by`,
+`registered_at`). ID yang sudah ada → `409 TERMINAL_ALREADY_REGISTERED`.
+
+### `GET /internal/v1/terminals/{terminal_id}`
+
+Header: **kunci sistem saja** — klien perlu tahu terminalnya terdaftar sebelum ada
+petugas yang masuk. Melayani baris "Terminal Secure ID #WKS-SMG-0842 / ✓ Registered".
+
+```json
+{
+  "data": {
+    "terminal_id": "WKS-SMG-0842",
+    "workstation": "Loket 4",
+    "location": "KCU Semarang",
+    "status": "REGISTERED",
+    "registered": true
+  }
+}
+```
+
+Jalur pra-login ini **tidak** menyertakan siapa yang sedang memegang terminalnya: nama
+petugas giliran sebelumnya bukan hal yang perlu dibaca layar masuk.
+
+`status` ∈ `REGISTERED` (barisnya ada, belum ada yang bertugas) · `READY` (ketiga gerbang
+lolos) · `ONLINE` (boleh mengambil antrean) · `OFFLINE` (giliran ditutup). `BUSY`,
+`CALL_ACTIVE`, dan `PROCESSING` **tidak disimpan** — ketiganya diturunkan dari panggilan
+aktif petugasnya, dan status tersimpan tanpa satu sumber kebenaran akan melenceng dari
+tabel panggilan.
+
+### Tiga gerbang kesiapan
+
+Terminal tidak bisa `ONLINE` sebelum **ketiga** gerbang lolos:
+
+| Gerbang | Dilewati dengan |
+|---|---|
+| `SUPERVISOR_AUTH` | `POST /internal/v1/supervisors/authorize` |
+| `DEVICE_HEALTHCHECK` | `POST /internal/v1/terminals/healthcheck` |
+| `PII_ACK` | `POST /internal/v1/terminals/pii-ack` |
+
+Setiap gerbang berlaku **8 jam** — satu giliran kerja. Lebih pendek memaksa petugas
+mengulang probe di tengah shift tanpa alasan; lebih panjang membuat healthcheck kemarin
+menyatakan sesuatu tentang kamera hari ini.
+
+Seluruh endpoint di bawah ini memakai `Authorization: Bearer <session_token>` dan **tidak
+punya `{terminal_id}` di path**: terminalnya ditentukan sesi.
+
+### `GET /internal/v1/supervisors?location=`
+
+Dibuka **sebelum** otorisasi, jadi ia hanya butuh sesi — bukan gerbang yang justru akan
+dilaluinya.
+
+```json
+{
+  "data": {
+    "supervisors": [
+      { "supervisor_id": "SPV-0021", "name": "Budi Hartono", "location": "KCU Semarang" }
+    ],
+    "count": 1
+  }
+}
+```
+
+Jawaban ini **tidak pernah** memuat token dual-control supervisor. Token yang ikut terbaca
+di sini akan terserah ke setiap petugas yang membuka daftarnya.
+
+### `POST /internal/v1/supervisors/authorize`
+
+```json
+{ "supervisor_id": "SPV-0021", "token": "123456" }
+```
+
+Mengembalikan **tanda terima**, bukan token:
+
+```json
+{
+  "data": {
+    "authorization_ref": "auth_7c1f…",
+    "supervisor_id": "SPV-0021",
+    "supervisor_name": "Budi Hartono",
+    "authorized_at": "2026-10-07T08:05:40+07:00",
+    "expires_at": "2026-10-07T16:05:40+07:00"
+  }
+}
+```
+
+| Keadaan | Jawaban |
+|---|---|
+| Supervisor tidak ada | `404 SUPERVISOR_NOT_FOUND` |
+| Token salah | `401 SUPERVISOR_TOKEN_INVALID` |
+
+### `POST /internal/v1/terminals/healthcheck`
+
+```json
+{
+  "passed": true,
+  "details": { "camera": "ok", "microphone": "ok", "bandwidth_mbps": 24.5 }
+}
+```
+
+`details` sengaja bebas: klien melaporkan apa yang ada di mejanya, dan daftar bidangnya
+akan berubah tanpa rilis server. Yang wajib hanya `passed`.
+
+**Probe-nya di klien, pencatatannya di server.** Server tidak pernah mengukur kamera atau
+mikrofon di meja petugas — perlakukan isi `details` sebagai pernyataan, bukan pengukuran.
+
+### `POST /internal/v1/terminals/pii-ack`
+
+```json
+{ "acknowledged": true, "pact_version": "2026.1" }
+```
+
+`acknowledged` harus `true` secara eksplisit — pakta integritas yang tercatat dari field
+kosong bukan pakta. `pact_version` menyebut versi teks yang disetujui; tanpa itu jejaknya
+tidak bisa menjawab "menyetujui **apa**" setelah teksnya direvisi.
+
+### `GET /internal/v1/terminals/readiness`
+
+Juga jawaban dari `healthcheck`, `pii-ack`, dan `supervisors/authorize` — keadaan gerbang
+**terbaru**, bukan `{"ok": true}`. Layar kesiapan menampilkan ketiga gerbang sekaligus,
+dan tanpa ini ia harus memanggil `readiness` lagi setiap kali: dua permintaan untuk satu
+tindakan, masing-masing melewati verifikasi sesi.
+
+```json
+{
+  "data": {
+    "terminal_id": "WKS-SMG-0842",
+    "status": "READY",
+    "session_id": "4f2c…",
+    "gates": [
+      {
+        "gate": "SUPERVISOR_AUTH",
+        "passed": true,
+        "passed_at": "2026-10-07T08:05:40+07:00",
+        "expires_at": "2026-10-07T16:05:40+07:00",
+        "expired": false,
+        "authorization_ref": "auth_7c1f…",
+        "supervisor_id": "SPV-0021"
+      },
+      { "gate": "DEVICE_HEALTHCHECK", "passed": true, "expired": false,
+        "details": { "camera": "ok" } },
+      { "gate": "PII_ACK", "passed": false, "expired": false }
+    ],
+    "can_activate": false
+  }
+}
+```
+
+`expired: true` berarti gerbangnya **pernah** lolos tapi sudah kedaluwarsa — dibedakan
+dari belum pernah lolos: yang pertama diselesaikan dengan mengulang probe, yang kedua
+mungkin berarti petugas melewatkan satu layar.
+
+`can_activate` **dihitung server**, bukan diserahkan ke klien.
+
+### `POST /internal/v1/terminals/activate`
+
+Response `200 OK` memuat barisnya lengkap dengan `status: "ONLINE"` dan `activated_at`.
+
+Gerbang belum lengkap → `422 TERMINAL_NOT_READY`, dan pesannya **menyebut gerbang mana**
+yang kurang. Tanpa itu petugas hanya melihat "belum siap" dan harus menebak layar mana
+yang harus diulang.
+
+### `POST /internal/v1/terminals/deactivate`
+
+Response `200 OK`: `{ "terminal_id": "WKS-SMG-0842", "status": "OFFLINE" }`
+
+**Tanpa menutup sesi:** petugas yang istirahat menonaktifkan loketnya tanpa mengakhiri
+gilirannya. Yang pulang memanggil `auth/logout`, yang melakukan keduanya.
+
 ### `GET /internal/v1/onboarding/sessions`
 
 Scope `VIDEO_CALL`. Daftar sesi onboarding untuk layar pemantauan. **Tidak memuat PII** —
@@ -2051,4 +2342,23 @@ dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
 | `VIDEO_CALL_ALREADY_SCHEDULED` | 422 | Sesi sudah punya jadwal video call aktif. Batalkan dulu untuk menjadwalkan ulang |
 | `VIDEO_CALL_SCHEDULE_INVALID` | 422 | Waktu di luar 06:00–22:00 WIB, kurang dari 15 menit dari sekarang, atau lebih dari 7 hari ke depan |
 | `VIDEO_CALL_SCHEDULE_NOT_FOUND` | 404 | Tidak ada jadwal aktif yang bisa dibatalkan |
+| `AGENT_CREDENTIAL_INVALID` | 401 | NPP atau kata sandi petugas salah pada `auth/login` |
+| `AGENT_PASSWORD_NOT_SET` | 422 | Petugas belum pernah menyetel kata sandi — lewat `POST /internal/v1/auth/password` lebih dulu |
+| `AGENT_PASSWORD_WEAK` | 422 | Kata sandi petugas kurang dari 12 karakter |
+| `AGENT_LOCKED` | 423 | Akun petugas terkunci sementara karena terlalu banyak percobaan gagal |
+| `AGENT_SESSION_INVALID` | 401 | `Authorization: Bearer <session_token>` tidak berlaku atau sudah ditutup |
+| `AGENT_SESSION_NOT_FOUND` | 404 | Tidak ada sesi petugas yang aktif |
+| `AGENT_ALREADY_REGISTERED` | 409 | NPP itu sudah terdaftar sebagai petugas |
+| `AGENT_CALL_IN_PROGRESS` | 409 | Petugas masih menangani panggilan lain |
+| `TERMINAL_NOT_FOUND` | 404 | Terminal tidak terdaftar |
+| `TERMINAL_ALREADY_REGISTERED` | 409 | Terminal dengan ID itu sudah terdaftar |
+| `TERMINAL_NOT_READY` | 422 | Aktivasi ditolak: salah satu dari tiga gerbang kesiapan belum lolos. Pesannya menyebut gerbang mana |
+| `TERMINAL_NOT_ONLINE` | 422 | Terminal belum diaktifkan — selesaikan kesiapan terminal lebih dulu |
+| `TERMINAL_AGENT_BUSY` | 409 | Petugas masih aktif di terminal lain; tutup giliran di sana lebih dulu |
+| `SUPERVISOR_NOT_FOUND` | 404 | Supervisor tidak ditemukan |
+| `SUPERVISOR_TOKEN_INVALID` | 401 | Token otorisasi dual-control supervisor tidak sah |
+| `VIDEO_CALL_UNDER_REVIEW` | 422 | Sesi punya eskalasi `NEED_REVIEW` yang belum selesai — nasabah ditahan dari antrean sampai Tier 2 memutus |
+| `VIDEO_CALL_ESCALATION_EXISTS` | 409 | Sesi ini sudah dalam peninjauan |
+| `VIDEO_CALL_NOT_ACTIVE` | 422 | Hasil disubmit untuk panggilan yang belum diambil petugas (`QUEUED`) atau sudah `CANCELLED` |
+| `VIDEO_CALL_AGENT_MISMATCH` | 409 | Hasil disubmit oleh petugas yang bukan pengambil panggilannya |
 | `INTERNAL_ERROR` | 500 | Kesalahan internal server |

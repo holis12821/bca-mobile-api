@@ -2808,6 +2808,492 @@
    ]
   },
   {
+   "name": "Internal (CS) — Identitas & Sesi Petugas",
+   "description": "Empat lapis penjaga, dan bedanya disengaja.\n\n`login` → kunci sistem SAJA. Di sinilah petugas membuktikan dirinya; menuntut kredensial petugas lebih dulu akan membuatnya harus sudah masuk untuk bisa masuk.\n`me`, `password` → kunci API petugas. `me` justru yang MEMBERI TAHU cakupan, jadi menuntut cakupan di sana memutar balik; `password` adalah jalur penyetelan PERTAMA, jadi pemanggilnya belum bisa punya sesi.\n`logout` → token sesi. Yang ditutup adalah sesi yang TOKENNYA dikirim, bukan sesi yang disebut di body.\n\nJalankan berurutan: `1` menyetel kata sandi, `2` mengisi {{cs_session_token}} otomatis.",
+   "item": [
+    {
+     "name": "1. Setel kata sandi petugas",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{agent_api_key}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"current_password\": \"\",\n  \"new_password\": \"{{agent_password}}\"\n}"
+      },
+      "url": {
+       "raw": "{{internal_base_url}}/auth/password",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "auth",
+        "password"
+       ]
+      },
+      "description": "Jalur penyetelan kata sandi PERTAMA, dan satu-satunya yang ada. Dibuktikan dengan kunci API petugas yang sudah dipegangnya, BUKAN dengan kata sandi lama yang belum pernah ada.\n\n`current_password` wajib hanya kalau petugas SUDAH punya kata sandi.\n\nMinimal 12 karakter → 422 AGENT_PASSWORD_WEAK."
+     },
+     "response": []
+    },
+    {
+     "name": "2. Login petugas",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"employee_id\": \"{{agent_employee_id}}\",\n  \"password\": \"{{agent_password}}\",\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"shift\": \"PAGI\"\n}"
+      },
+      "url": {
+       "raw": "{{internal_base_url}}/auth/login",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "auth",
+        "login"
+       ]
+      },
+      "description": "Kunci sistem saja — tidak ada header petugas.\n\n`session_token` HANYA terkirim di sini. Server menyimpan hash-nya; tidak ada endpoint yang bisa mengembalikannya lagi. Script test di request ini menyimpannya ke {{cs_session_token}}.\n\n`next_step` selalu TERMINAL_READINESS: sesi yang baru terautentikasi WAJIB lewat layar kesiapan, tidak boleh langsung ke dashboard. Dikirim server supaya aturan itu tidak hidup hanya di routing klien, yang bisa disunting.\n\nJawaban yang mungkin: 401 AGENT_CREDENTIAL_INVALID, 422 AGENT_PASSWORD_NOT_SET, 423 AGENT_LOCKED, 404 TERMINAL_NOT_FOUND, 409 TERMINAL_AGENT_BUSY."
+     },
+     "response": [],
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "const body = pm.response.json();",
+         "const token = body && body.data && body.data.session_token;",
+         "if (token) {",
+         "    pm.environment.set('cs_session_token', token);",
+         "}",
+         "pm.test('login mengembalikan session_token', function () {",
+         "    pm.expect(token, 'session_token').to.be.a('string').and.not.empty;",
+         "});",
+         "pm.test('next_step memaksa layar kesiapan', function () {",
+         "    pm.expect(body.data.next_step).to.eql('TERMINAL_READINESS');",
+         "});"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "3. Siapa saya (cakupan + giliran)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{agent_api_key}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/auth/me",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "auth",
+        "me"
+       ]
+      },
+      "description": "Menjawab TENTANG pemanggilnya: identitas, cakupan, dan giliran yang sedang berjalan.\n\n`scopes` selalu array, tidak pernah null — klien yang menerima null akan memanggil scopes.includes(...) pada nilai yang bukan array.\n\n`session` null berarti petugasnya belum membuka giliran di loket mana pun. Dibedakan supaya aplikasi desktop tahu apakah ia perlu login, bukan menebaknya dari ada-tidaknya token di penyimpanannya sendiri.\n\nTanpa endpoint ini aplikasi desktop menyembunyikan menu berdasarkan 403 yang pernah diterima — setiap menu harus dicoba sekali untuk diketahui, dan setiap percobaan memicu verifikasi Argon2id (64 MB x 4 thread)."
+     },
+     "response": []
+    },
+    {
+     "name": "4. Logout petugas",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{cs_session_token}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/auth/logout",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "auth",
+        "logout"
+       ]
+      },
+      "description": "Di belakang token sesi: yang ditutup adalah sesi yang TOKENNYA dikirim, bukan sesi yang disebut di body. Tanpa itu token siapa pun bisa menutup giliran orang lain.\n\nMenutup giliran SEKALIGUS menonaktifkan loket → terminal_status OFFLINE. Yang hanya istirahat memanggil /terminals/deactivate, yang tidak mengakhiri sesinya."
+     },
+     "response": []
+    }
+   ]
+  },
+  {
+   "name": "Internal (CS) — Terminal & Kesiapan",
+   "description": "Siklus hidup loket petugas: REGISTERED → READY → ONLINE → OFFLINE.\n\n`BUSY`, `CALL_ACTIVE`, dan `PROCESSING` TIDAK disimpan — ketiganya diturunkan dari panggilan aktif petugasnya. Status tersimpan tanpa satu sumber kebenaran akan melenceng dari tabel panggilan, dan yang melenceng akan dipercaya.\n\nTerminal tidak bisa ONLINE sebelum KETIGA gerbang lolos: SUPERVISOR_AUTH, DEVICE_HEALTHCHECK, PII_ACK. Masing-masing berlaku 8 jam — satu giliran kerja.\n\nEndpoint gerbang TIDAK punya {terminal_id} di path: terminalnya ditentukan SESI. Petugas tidak bisa menyatakan kesiapan atas loket yang bukan tempat ia masuk, dan tidak bisa menanyakan kesiapan loket orang lain.\n\nButuh {{cs_session_token}} dari folder Identitas & Sesi Petugas.",
+   "item": [
+    {
+     "name": "1. Daftarkan terminal",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{agent_api_key}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"workstation\": \"Loket 4\",\n  \"location\": \"KCU Semarang\"\n}"
+      },
+      "url": {
+       "raw": "{{internal_base_url}}/terminals",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "terminals"
+       ]
+      },
+      "description": "Di belakang kunci API petugas: pendaftar harus bisa disebut namanya di jejak audit.\n\nTIDAK menuntut cakupan tertentu — memasang terminal adalah pekerjaan teknisi, dan tidak satu pun dari empat cakupan yang ada (VIDEO_CALL, CUSTOMER_PII, CARD_ADMIN, TICKET) menggambarkannya. Menambah cakupan baru tanpa ada yang memberikannya hanya akan membuat endpoint yang tidak bisa dipakai siapa pun.\n\n201 Created. ID yang sudah ada → 409 TERMINAL_ALREADY_REGISTERED."
+     },
+     "response": []
+    },
+    {
+     "name": "2. Baca terminal (pra-login)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/terminals/{{terminal_id}}",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "terminals",
+        "{{terminal_id}}"
+       ]
+      },
+      "description": "Kunci sistem SAJA — klien perlu tahu terminalnya terdaftar SEBELUM ada petugas yang masuk. Melayani baris 'Terminal Secure ID #WKS-SMG-0842 / Registered Terminal' di layar masuk.\n\nJalur pra-login ini TIDAK menyertakan siapa yang sedang memegang terminalnya: nama petugas giliran sebelumnya bukan hal yang perlu dibaca layar masuk, dan ia tetap terbaca lewat auth/me oleh pemegangnya sendiri."
+     },
+     "response": []
+    },
+    {
+     "name": "3. Daftar supervisor",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{cs_session_token}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/supervisors?location=KCU Semarang",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "supervisors?location=KCU Semarang"
+       ]
+      },
+      "description": "Dibuka SEBELUM otorisasi, jadi ia hanya butuh sesi — bukan gerbang yang justru akan dilaluinya.\n\nJawaban ini TIDAK PERNAH memuat token dual-control supervisor. Token yang ikut terbaca di sini akan terserah ke setiap petugas yang membuka daftarnya."
+     },
+     "response": []
+    },
+    {
+     "name": "4. Gerbang 1 — otorisasi supervisor",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{cs_session_token}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"supervisor_id\": \"{{supervisor_id}}\",\n  \"token\": \"123456\"\n}"
+      },
+      "url": {
+       "raw": "{{internal_base_url}}/supervisors/authorize",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "supervisors",
+        "authorize"
+       ]
+      },
+      "description": "Meloloskan gerbang SUPERVISOR_AUTH untuk sesi pemanggil.\n\nMengembalikan TANDA TERIMA (authorization_ref), bukan token.\n\n404 SUPERVISOR_NOT_FOUND kalau supervisornya tidak ada, 401 SUPERVISOR_TOKEN_INVALID kalau tokennya salah."
+     },
+     "response": []
+    },
+    {
+     "name": "5. Gerbang 2 — healthcheck perangkat",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{cs_session_token}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"passed\": true,\n  \"details\": {\n    \"camera\": \"ok\",\n    \"microphone\": \"ok\",\n    \"speaker\": \"ok\",\n    \"bandwidth_mbps\": 24.5\n  }\n}"
+      },
+      "url": {
+       "raw": "{{internal_base_url}}/terminals/healthcheck",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "terminals",
+        "healthcheck"
+       ]
+      },
+      "description": "Probe-nya di KLIEN, pencatatannya di server. Server tidak bisa mengukur kamera atau mikrofon di meja petugas — perlakukan isi `details` sebagai PERNYATAAN, bukan pengukuran.\n\n`details` sengaja bebas: klien melaporkan apa yang ada di mejanya, dan daftar bidangnya akan berubah tanpa rilis server. Yang wajib hanya `passed`.\n\nMenjawab dengan keadaan gerbang TERBARU, bukan {\"ok\": true} — layar kesiapan menampilkan ketiga gerbang sekaligus."
+     },
+     "response": []
+    },
+    {
+     "name": "6. Gerbang 3 — pakta integritas PII",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{cs_session_token}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"acknowledged\": true,\n  \"pact_version\": \"2026.1\"\n}"
+      },
+      "url": {
+       "raw": "{{internal_base_url}}/terminals/pii-ack",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "terminals",
+        "pii-ack"
+       ]
+      },
+      "description": "`acknowledged` harus true secara EKSPLISIT. Pakta integritas yang tercatat dari field kosong bukan pakta.\n\n`pact_version` menyebut versi teks yang disetujui petugas. Tanpa itu, jejaknya tidak bisa menjawab 'menyetujui APA' setelah teksnya direvisi."
+     },
+     "response": []
+    },
+    {
+     "name": "7. Keadaan kesiapan",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{cs_session_token}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/terminals/readiness",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "terminals",
+        "readiness"
+       ]
+      },
+      "description": "Ketiga gerbang sekaligus, plus `can_activate` yang DIHITUNG SERVER — bukan diserahkan ke klien.\n\n`expired: true` berarti gerbangnya PERNAH lolos tapi sudah kedaluwarsa. Dibedakan dari belum pernah lolos: yang pertama diselesaikan dengan mengulang probe, yang kedua mungkin berarti petugas melewatkan satu layar."
+     },
+     "response": []
+    },
+    {
+     "name": "8. Aktifkan terminal (ONLINE)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{cs_session_token}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/terminals/activate",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "terminals",
+        "activate"
+       ]
+      },
+      "description": "Gerbang belum lengkap → 422 TERMINAL_NOT_READY, dan pesannya MENYEBUT gerbang mana yang kurang. Tanpa itu petugas hanya melihat 'belum siap' dan harus menebak layar mana yang harus diulang.\n\nHanya terminal ONLINE yang boleh mengambil antrean."
+     },
+     "response": []
+    },
+    {
+     "name": "9. Nonaktifkan terminal",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "Authorization",
+        "value": "Bearer {{cs_session_token}}"
+       }
+      ],
+      "url": {
+       "raw": "{{internal_base_url}}/terminals/deactivate",
+       "host": [
+        "{{internal_base_url}}"
+       ],
+       "path": [
+        "terminals",
+        "deactivate"
+       ]
+      },
+      "description": "TANPA menutup sesi: petugas yang istirahat menonaktifkan loketnya tanpa mengakhiri gilirannya. Yang pulang memanggil auth/logout, yang melakukan keduanya."
+     },
+     "response": []
+    }
+   ]
+  },
+  {
    "name": "Onboarding — Internal (CS)",
    "description": "Dipanggil backend CS, bukan aplikasi nasabah. Autentikasinya header `X-Internal-API-Key`, bukan Bearer token.",
    "item": [
@@ -2881,6 +3367,94 @@
       },
       "description": "Identitas petugas ada di header (X-Agent-Employee-ID + X-Agent-API-Key), BUKAN di body: agent_employee_id sudah dihapus dari payload. Selama ia sebuah field body, siapa pun yang memegang INTERNAL_API_KEY bisa menandatangani hasil verifikasi dengan nama pegawai mana pun.\n\nJawaban yang mungkin: 422 VIDEO_CALL_NOT_ACTIVE (panggilan belum diambil petugas), 409 VIDEO_CALL_AGENT_MISMATCH (pelapor bukan petugas yang mengambil panggilan), 200 dengan hasil tersimpan kalau ini pengiriman ulang."
      }
+    },
+    {
+     "name": "Submit Video Call Result — REJECTED",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{agent_api_key}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"queue_id\": \"{{queue_id}}\",\n  \"result\": \"REJECTED\",\n  \"rejection_reason\": \"FACE_MISMATCH\",\n  \"ktp_shown_live\": true,\n  \"identity_confirmed\": false,\n  \"notes\": \"Wajah pada e-KTP tidak cocok dengan nasabah di kamera.\",\n  \"call_duration_seconds\": 120\n}"
+      },
+      "url": {
+       "raw": "{{base_url}}/onboarding/video-call/result",
+       "host": [
+        "{{base_url}}"
+       ],
+       "path": [
+        "onboarding",
+        "video-call",
+        "result"
+       ]
+      },
+      "description": "`rejection_reason` WAJIB dan ber-ENUM: IDENTITY_MISMATCH, INVALID_DOCUMENT, FACE_MISMATCH, SUSPICIOUS_ACTIVITY, INCOMPLETE_INFORMATION, OTHER. Di luar itu — termasuk kosong atau teks bebas — dijawab 400 VALIDATION_ERROR dan TIDAK ADA yang tercatat.\n\nBukan teks bebas karena alasan penolakan akan dilaporkan dan dihitung, dan teks bebas membuat 'KTP tidak jelas', 'ktp blur', dan 'dokumen tidak terbaca' menjadi tiga kategori yang berbeda. Penjelasan bebasnya tetap punya tempat: `notes`.\n\nAlasannya masuk jejak audit VIDEO_CALL_ENDED, bukan hanya kolom panggilan: pemeriksaan pola penolakan per petugas dibaca dari jejak.\n\nREJECTED tidak memindahkan step — sesi tetap di VIDEO_CALL supaya nasabah bisa mengantre lagi."
+     },
+     "response": []
+    },
+    {
+     "name": "Submit Video Call Result — NEED_REVIEW",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "POST",
+      "header": [
+       {
+        "key": "Content-Type",
+        "value": "application/json"
+       },
+       {
+        "key": "X-Internal-API-Key",
+        "value": "{{internal_api_key}}"
+       },
+       {
+        "key": "X-Agent-Employee-ID",
+        "value": "{{agent_employee_id}}"
+       },
+       {
+        "key": "X-Agent-API-Key",
+        "value": "{{agent_api_key}}"
+       }
+      ],
+      "body": {
+       "mode": "raw",
+       "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"queue_id\": \"{{queue_id}}\",\n  \"result\": \"NEED_REVIEW\",\n  \"notes\": \"Wajah mirip tapi tanda tangan berbeda; perlu pemeriksaan Tier 2.\",\n  \"escalation_queue\": \"TIER_2_VERIFICATION\",\n  \"ktp_shown_live\": true,\n  \"identity_confirmed\": false,\n  \"call_duration_seconds\": 240\n}"
+      },
+      "url": {
+       "raw": "{{base_url}}/onboarding/video-call/result",
+       "host": [
+        "{{base_url}}"
+       ],
+       "path": [
+        "onboarding",
+        "video-call",
+        "result"
+       ]
+      },
+      "description": "Untuk perkara yang petugas Tier 1 tidak berwenang memutuskan.\n\n`notes` WAJIB dan tidak boleh hanya spasi — perkara tanpa alasan tidak bisa ditangani siapa pun di hilirnya. `escalation_queue` boleh dikosongkan; kosong berarti TIER_2_VERIFICATION. Nilai sahnya: TIER_2_VERIFICATION, FRAUD_REVIEW, COMPLIANCE_REVIEW.\n\nResponse membawa eskalasinya (escalation_id, status PENDING) karena petugas perlu nomor perkaranya.\n\nESKALASI TERBUKA MENAHAN NASABAH DARI ANTREAN: /video-call/queue menjawab 422 VIDEO_CALL_UNDER_REVIEW selama eskalasinya belum selesai. Tanpa penjaga itu ia akan mengantre lagi dan dilayani Tier 1, yang akan menghasilkan keputusan yang sama — karena yang membuat perkaranya dieskalasi bukan petugasnya melainkan perkaranya.\n\nDi lingkungan tanpa penyimpanan eskalasi: 503 PROVIDER_NOT_CONFIGURED — BUKAN disimpan tanpa eskalasi. Sesi NEED_REVIEW tanpa baris eskalasi akan menggantung tanpa jalan keluar."
+     },
+     "response": []
     },
     {
      "name": "Agent Signaling Token",

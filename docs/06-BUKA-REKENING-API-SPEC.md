@@ -749,6 +749,12 @@ startup — server TURN tanpa kredensial menolak semua alokasi.
 Kredensial itu khusus lokal. Dari HP atau emulator, `localhost` harus diganti
 alamat LAN mesin pengembang — kalau tidak, HP mencari TURN di dirinya sendiri.
 
+**Sesi yang sedang ditinjau tidak boleh mengantre.** Kalau hasil panggilan sebelumnya
+`NEED_REVIEW` dan eskalasinya belum selesai, endpoint ini menjawab
+`422 VIDEO_CALL_UNDER_REVIEW` — diperiksa **sebelum** jam operasional, karena nasabah yang
+sedang ditinjau perlu diberi tahu bahwa perkaranya sedang ditangani, bukan soal jam
+layanan. Lihat §5c.
+
 ### 5b. WebSocket Signaling Protocol
 
 ```
@@ -937,10 +943,115 @@ ini sebelumnya menulis `X-Internal-Service-Key`, yang tidak pernah ada di kode.
 }
 ```
 
+#### Tiga hasil, tiga akibat
+
+| `result` | Step sesudahnya | Wajib ikut |
+|---|---|---|
+| `APPROVED` | `CREDENTIALS` | — |
+| `REJECTED` | tetap `VIDEO_CALL` | `rejection_reason` |
+| `NEED_REVIEW` | tetap `VIDEO_CALL`, **dan nasabah ditahan dari antrean** | `notes`, dan `escalation_queue` kalau bukan Tier 2 |
+
+`APPROVED` pun tidak dipaksakan: mesin step yang memutuskan, bukan pemanggil. Persetujuan
+untuk sesi yang sudah melewati `VIDEO_CALL` dicatat di rekaman panggilan lalu dibiarkan.
+
+#### `REJECTED` — alasannya ber-enum
+
+```json
+{
+  "session_id": "onb_9f8e7d6c5b4a",
+  "queue_id": "q_abc123",
+  "result": "REJECTED",
+  "rejection_reason": "FACE_MISMATCH",
+  "notes": "Wajah pada e-KTP tidak cocok dengan nasabah di kamera.",
+  "call_duration_seconds": 120
+}
+```
+
+`rejection_reason` **wajib** dan terbatas pada: `IDENTITY_MISMATCH`, `INVALID_DOCUMENT`,
+`FACE_MISMATCH`, `SUSPICIOUS_ACTIVITY`, `INCOMPLETE_INFORMATION`, `OTHER`. Di luar itu —
+termasuk kosong atau teks bebas — dijawab `400 VALIDATION_ERROR` dan **tidak ada** yang
+tercatat.
+
+Bukan teks bebas karena alasan penolakan verifikasi identitas akan dilaporkan dan
+dihitung, dan teks bebas membuat "KTP tidak jelas", "ktp blur", dan "dokumen tidak
+terbaca" menjadi tiga kategori yang berbeda. Penjelasan bebasnya tetap ada tempatnya:
+`notes`.
+
+Alasannya masuk **jejak audit** `VIDEO_CALL_ENDED`, bukan hanya kolom panggilan:
+pemeriksaan pola penolakan per petugas dibaca dari jejak, dan tanpa itu ia harus
+menggabungkan dua tabel untuk pertanyaan yang paling sering diajukan.
+
+`REJECTED` tidak memindahkan step: sesi tetap di `VIDEO_CALL` supaya nasabah bisa mengantre
+lagi.
+
+#### `NEED_REVIEW` — perkaranya dieskalasi
+
+Untuk perkara yang petugas Tier 1 tidak berwenang memutuskan.
+
+```json
+{
+  "session_id": "onb_9f8e7d6c5b4a",
+  "queue_id": "q_abc123",
+  "result": "NEED_REVIEW",
+  "notes": "Wajah mirip tapi tanda tangan berbeda; perlu pemeriksaan Tier 2.",
+  "escalation_queue": "TIER_2_VERIFICATION",
+  "call_duration_seconds": 240
+}
+```
+
+`notes` **wajib** dan tidak boleh hanya spasi — perkara tanpa alasan tidak bisa ditangani
+siapa pun di hilirnya. `escalation_queue` boleh dikosongkan; kosong berarti
+`TIER_2_VERIFICATION`. Nilai sahnya: `TIER_2_VERIFICATION`, `FRAUD_REVIEW`,
+`COMPLIANCE_REVIEW`.
+
+Response `200 OK` membawa eskalasinya, karena petugas perlu nomor perkaranya:
+
+```json
+{
+  "data": {
+    "session_id": "onb_9f8e7d6c5b4a",
+    "result": "NEED_REVIEW",
+    "current_step": "VIDEO_CALL",
+    "escalation": {
+      "escalation_id": "esc_4f2c8a91bd3e7056",
+      "session_id": "onb_9f8e7d6c5b4a",
+      "queue_id": "q_abc123",
+      "escalation_queue": "TIER_2_VERIFICATION",
+      "status": "PENDING",
+      "reason": "Wajah mirip tapi tanda tangan berbeda; perlu pemeriksaan Tier 2.",
+      "raised_by_agent": "CS-1042",
+      "raised_at": "2026-10-07T10:14:03+07:00"
+    }
+  }
+}
+```
+
+**Eskalasi terbuka menahan nasabah dari antrean.** `POST /video-call/queue` menjawab
+`422 VIDEO_CALL_UNDER_REVIEW` selama eskalasinya belum selesai — diperiksa **sebelum** jam
+operasional, karena nasabah yang sedang ditinjau tidak perlu diberi tahu soal jam layanan,
+ia perlu diberi tahu bahwa perkaranya sedang ditangani. Tanpa penjaga itu ia akan
+mengantre lagi dan dilayani Tier 1, yang akan menghasilkan keputusan yang sama — karena
+yang membuat perkaranya dieskalasi bukan petugasnya melainkan perkaranya. Eskalasinya jadi
+hiasan.
+
+Eskalasi ditulis **sebelum** `call_ended` dikirim: kalau penulisannya gagal, petugas harus
+tahu dari response, bukan setelah nasabah sudah diberi tahu panggilannya berakhir.
+
+Di lingkungan yang tidak punya penyimpanan eskalasi, `NEED_REVIEW` dijawab
+`503 PROVIDER_NOT_CONFIGURED` — **bukan** disimpan tanpa eskalasi. Sesi `NEED_REVIEW`
+tanpa baris eskalasi akan menggantung tanpa jalan keluar, dan itu lebih buruk daripada
+menolak permintaannya.
+
+#### Penolakan permintaan
+
 | Keadaan | Jawaban |
 |---|---|
 | Panggilan belum diambil petugas (`QUEUED`) atau sudah `CANCELLED` | `422 VIDEO_CALL_NOT_ACTIVE` |
 | Pelapor bukan petugas yang mengambil panggilan | `409 VIDEO_CALL_AGENT_MISMATCH` |
+| `REJECTED` tanpa `rejection_reason`, atau di luar enum | `400 VALIDATION_ERROR` |
+| `NEED_REVIEW` tanpa `notes`, atau `escalation_queue` di luar enum | `400 VALIDATION_ERROR` |
+| `NEED_REVIEW` padahal sesi sudah punya eskalasi terbuka | `409 VIDEO_CALL_ESCALATION_EXISTS` |
+| `NEED_REVIEW` di lingkungan tanpa penyimpanan eskalasi | `503 PROVIDER_NOT_CONFIGURED` |
 | Hasil sudah pernah tercatat | `200 OK`, hasil tersimpan dikembalikan apa adanya |
 
 Dua aturan pertama dulu tidak ada. Akibatnya satu permintaan bisa menyelesaikan panggilan
@@ -948,9 +1059,6 @@ yang belum pernah terjadi — memindahkan sesi ke `CREDENTIALS` tanpa verifikasi
 sama sekali — dan petugas mana pun bisa menandatangani verifikasi milik orang lain,
 sekaligus **menimpa** `agent_employee_id` yang sudah tercatat sehingga jejak auditnya ikut
 berubah.
-
-`REJECTED` tidak memindahkan step: sesi tetap di `VIDEO_CALL` supaya nasabah bisa mengantre
-lagi.
 
 ---
 
