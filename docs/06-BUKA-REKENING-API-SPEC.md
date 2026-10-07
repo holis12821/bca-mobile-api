@@ -1042,6 +1042,19 @@ Di lingkungan yang tidak punya penyimpanan eskalasi, `NEED_REVIEW` dijawab
 tanpa baris eskalasi akan menggantung tanpa jalan keluar, dan itu lebih buruk daripada
 menolak permintaannya.
 
+> **BELUM BISA DIPAKAI (per 2026-10-07).** `VideoCallEscalationRepository` hanya ada
+> sebagai interface di `internal/domain/onboarding/repository.go` — tidak ada implementasi
+> Postgres, dan `router.New` tidak mengisi `Escalations`. Akibatnya **setiap**
+> `NEED_REVIEW` dijawab `503 PROVIDER_NOT_CONFIGURED`, di development maupun di mana pun,
+> dan penjaga `VIDEO_CALL_UNDER_REVIEW` di `/video-call/queue` tidak pernah aktif. Tabel
+> `onboarding_video_call_escalations` (migrasi 000038) sudah ada tapi belum ada yang
+> menulis atau membacanya.
+>
+> Yang kurang: satu repository Postgres untuk `Create` + `FindOpenBySessionID`, lalu
+> `Escalations:` ditambahkan ke `VideoCallServiceConfig` di `internal/router/router.go`.
+> Sampai itu ada, aplikasi desktop CS hanya punya dua hasil yang berfungsi: `APPROVED`
+> dan `REJECTED`.
+
 #### Penolakan permintaan
 
 | Keadaan | Jawaban |

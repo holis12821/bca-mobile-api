@@ -1836,12 +1836,16 @@ kredensial petugas lebih dulu akan membuatnya harus sudah masuk untuk bisa masuk
     "scopes": ["VIDEO_CALL", "CUSTOMER_PII"],
     "terminal_id": "WKS-SMG-0842",
     "terminal_status": "REGISTERED",
-    "started_at": "2026-10-07T08:02:11+07:00",
-    "expires_at": "2026-10-07T16:02:11+07:00",
+    "started_at": "2026-10-07T01:02:11Z",
+    "expires_at": "2026-10-07T09:02:11Z",
     "next_step": "TERMINAL_READINESS"
   }
 }
 ```
+
+Stempel waktu di sini **UTC** (`Z`), sementara `auth/me` mengembalikan offset `+07:00`
+untuk stempel yang sama. Instannya identik; yang berbeda hanya representasinya. Parse
+sebagai RFC 3339 dan jangan bandingkan string-nya.
 
 `next_step` selalu `TERMINAL_READINESS`. Sesi yang baru terautentikasi **wajib** lewat
 layar kesiapan, tidak boleh langsung ke dashboard — dikirim server supaya aturan itu
@@ -1980,7 +1984,7 @@ Mengembalikan **tanda terima**, bukan token:
 ```json
 {
   "data": {
-    "authorization_ref": "auth_7c1f…",
+    "authorization_ref": "BCA-AUTH-B6E7C4",
     "supervisor_id": "SPV-0021",
     "supervisor_name": "Budi Hartono",
     "authorized_at": "2026-10-07T08:05:40+07:00",
@@ -2039,14 +2043,15 @@ tindakan, masing-masing melewati verifikasi sesi.
         "passed_at": "2026-10-07T08:05:40+07:00",
         "expires_at": "2026-10-07T16:05:40+07:00",
         "expired": false,
-        "authorization_ref": "auth_7c1f…",
+        "authorization_ref": "BCA-AUTH-B6E7C4",
         "supervisor_id": "SPV-0021"
       },
       { "gate": "DEVICE_HEALTHCHECK", "passed": true, "expired": false,
         "details": { "camera": "ok" } },
-      { "gate": "PII_ACK", "passed": false, "expired": false }
+      { "gate": "PII_ACK", "passed": true, "expired": false,
+        "details": { "pact_version": "2026.1" } }
     ],
-    "can_activate": false
+    "can_activate": true
   }
 }
 ```
@@ -2357,7 +2362,7 @@ dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
 | `TERMINAL_AGENT_BUSY` | 409 | Petugas masih aktif di terminal lain; tutup giliran di sana lebih dulu |
 | `SUPERVISOR_NOT_FOUND` | 404 | Supervisor tidak ditemukan |
 | `SUPERVISOR_TOKEN_INVALID` | 401 | Token otorisasi dual-control supervisor tidak sah |
-| `VIDEO_CALL_UNDER_REVIEW` | 422 | Sesi punya eskalasi `NEED_REVIEW` yang belum selesai — nasabah ditahan dari antrean sampai Tier 2 memutus |
+| `VIDEO_CALL_UNDER_REVIEW` | 422 | Sesi punya eskalasi `NEED_REVIEW` yang belum selesai — nasabah ditahan dari antrean sampai Tier 2 memutus. **Belum pernah terbit:** penyimpanan eskalasi belum terpasang, lihat `docs/06` §5c |
 | `VIDEO_CALL_ESCALATION_EXISTS` | 409 | Sesi ini sudah dalam peninjauan |
 | `VIDEO_CALL_NOT_ACTIVE` | 422 | Hasil disubmit untuk panggilan yang belum diambil petugas (`QUEUED`) atau sudah `CANCELLED` |
 | `VIDEO_CALL_AGENT_MISMATCH` | 409 | Hasil disubmit oleh petugas yang bukan pengambil panggilannya |

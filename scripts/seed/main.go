@@ -451,6 +451,11 @@ func seed(ctx context.Context, pool *pgxpool.Pool) {
 
 	// Petugas CS untuk menguji video call e-KYC dari ujung ke ujung.
 	seedCSAgents(ctx, pool, hashPIN)
+
+	// Terminal, supervisor, dan kata sandi petugas: tanpa ketiganya alur desktop CS
+	// (login → kesiapan → aktivasi) tidak bisa dijalankan sekali pun secara lokal,
+	// karena tidak ada endpoint yang membuat baris supervisor.
+	seedCSWorkstations(ctx, pool, hashPIN)
 }
 
 // seedCSAgents menanam satu petugas CS untuk pengujian lokal video call.
@@ -821,4 +826,98 @@ func seedPromotions(ctx context.Context, pool *pgxpool.Pool, now time.Time) {
 		}
 	}
 	log.Printf("  promotions: %d seeded", len(promos))
+}
+
+// seedCSWorkstations menanam loket, supervisor, dan kata sandi petugas untuk alur desktop CS.
+//
+// Digerbangi APP_ENV dengan alasan yang sama dengan seedCSAgents, dan satu alasan
+// tambahan: token dual-control supervisor adalah kredensial yang MENANDATANGANI kesiapan
+// orang lain. Token yang diketahui umum membuat otorisasi dua-orang menjadi satu orang.
+//
+// Dibutuhkan karena `cs_supervisors` tidak punya endpoint pembuat — satu-satunya jalan
+// masuknya adalah seed atau SQL manual, jadi tanpa ini layar SCR-006 tidak bisa dilewati
+// di lingkungan lokal.
+func seedCSWorkstations(ctx context.Context, pool *pgxpool.Pool, hash func(string) string) {
+	if env := os.Getenv("APP_ENV"); env != "development" {
+		log.Printf("cs_terminals/cs_supervisors dilewati: APP_ENV=%q, bukan development", env)
+		return
+	}
+
+	terminals := []struct {
+		terminalID  string
+		workstation string
+		location    string
+	}{
+		{"WKS-SMG-0842", "Loket 4", "KCU Semarang"},
+		{"WKS-JKT-0117", "Loket 1", "KCU Jakarta Thamrin"},
+	}
+
+	for _, t := range terminals {
+		// registered_by menunjuk petugas yang ada: kolomnya NOT NULL dan jejak audit
+		// pendaftaran terminal harus bisa menyebut seseorang.
+		_, err := pool.Exec(ctx, `
+			INSERT INTO cs_terminals (terminal_id, workstation, location, status, registered_by)
+			VALUES ($1, $2, $3, 'REGISTERED', 'OPS-2001')
+			ON CONFLICT (terminal_id) DO UPDATE
+			SET workstation = EXCLUDED.workstation,
+			    location    = EXCLUDED.location,
+			    updated_at  = now()`,
+			t.terminalID, t.workstation, t.location,
+		)
+		if err != nil {
+			log.Fatalf("seed cs_terminals: %v", err)
+		}
+		log.Printf("cs terminal: %s (%s, %s) REGISTERED", t.terminalID, t.workstation, t.location)
+	}
+
+	supervisors := []struct {
+		supervisorID string
+		name         string
+		location     string
+		token        string
+	}{
+		{"SPV-0021", "Budi Hartono", "KCU Semarang", "123456"},
+		{"SPV-0022", "Rina Kusuma", "KCU Jakarta Thamrin", "654321"},
+	}
+
+	for _, sv := range supervisors {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO cs_supervisors (supervisor_id, name, location, token_hash, is_active)
+			VALUES ($1, $2, $3, $4, true)
+			ON CONFLICT (supervisor_id) DO UPDATE
+			SET name       = EXCLUDED.name,
+			    location   = EXCLUDED.location,
+			    token_hash = EXCLUDED.token_hash,
+			    is_active  = true,
+			    updated_at = now()`,
+			sv.supervisorID, sv.name, sv.location, hash(sv.token),
+		)
+		if err != nil {
+			log.Fatalf("seed cs_supervisors: %v", err)
+		}
+		log.Printf("cs supervisor: %s (%s, %s), token dual-control: %s",
+			sv.supervisorID, sv.name, sv.location, sv.token)
+	}
+
+	// Kata sandi login petugas. Minimal 12 karakter — aturan yang sama dengan
+	// AGENT_PASSWORD_WEAK di jalur `POST /internal/v1/auth/password`; kata sandi seed yang
+	// lebih pendek akan membuat seed menanam baris yang endpoint-nya sendiri menolak.
+	const devAgentPassword = "KataSandiPanjang2026"
+
+	for _, employeeID := range []string{"CS-1042", "OPS-2001", "SPV-3001"} {
+		_, err := pool.Exec(ctx, `
+			UPDATE cs_agents
+			SET password_hash         = $2,
+			    password_set_at       = now(),
+			    failed_login_attempts = 0,
+			    locked_until          = NULL,
+			    updated_at            = now()
+			WHERE employee_id = $1`,
+			employeeID, hash(devAgentPassword),
+		)
+		if err != nil {
+			log.Fatalf("seed cs agent password: %v", err)
+		}
+	}
+	log.Printf("cs agent password (CS-1042, OPS-2001, SPV-3001): %s", devAgentPassword)
 }

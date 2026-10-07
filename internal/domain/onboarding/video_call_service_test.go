@@ -1657,7 +1657,7 @@ func TestGetVideoCallSchedule_ReturnsNilWhenNone(t *testing.T) {
 
 // --- NEED_REVIEW, alasan penolakan, dan eskalasi (§38) ---
 
-// mockEscalationRepo meniru `idx_vc_escalation_session_open_unique` di migrasi 000038:
+// mockEscalationRepo meniru `idx_vc_escalations_one_open` di migrasi 000038:
 // satu sesi hanya boleh punya satu eskalasi terbuka sekaligus.
 type mockEscalationRepo struct {
 	byID      map[string]*VideoCallEscalation
