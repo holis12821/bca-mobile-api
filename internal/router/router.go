@@ -456,10 +456,16 @@ func New(deps Deps) (http.Handler, error) {
 	sigHub := ws.NewHub()
 
 	videoCallService := onboarding.NewVideoCallService(onboarding.VideoCallServiceConfig{
-		Sessions:         onboardingSessionRepo,
-		Cache:            onboardingCache,
-		VideoCalls:       onboardingVideoCallRepo,
-		Schedules:        postgres.NewOnboardingVideoCallScheduleRepo(deps.DB),
+		Sessions:   onboardingSessionRepo,
+		Cache:      onboardingCache,
+		VideoCalls: onboardingVideoCallRepo,
+		Schedules:  postgres.NewOnboardingVideoCallScheduleRepo(deps.DB),
+
+		// Tanpa baris ini NEED_REVIEW dijawab 503 di setiap environment, dan penjaga
+		// VIDEO_CALL_UNDER_REVIEW di JoinQueue adalah kode mati — tabel migrasi 000038
+		// ada tapi tidak ada yang menulis maupun membacanya.
+		Escalations: postgres.NewOnboardingVideoCallEscalationRepo(deps.DB),
+
 		QueueCache:       videoCallQueueCache,
 		JWTManager:       deps.JWTManager,
 		Audit:            onboardingAuditRepo,

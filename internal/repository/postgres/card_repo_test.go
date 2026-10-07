@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -905,5 +906,188 @@ func TestAccountCardRepo_RegisterIssuedCard(t *testing.T) {
 	// Dan nama produk datang dari join ke katalog, bukan disalin ke kartunya.
 	if cards[0].ProductName != "Gold Mastercard" {
 		t.Errorf("nama produk dari katalog: %q", cards[0].ProductName)
+	}
+}
+
+// --- Eskalasi NEED_REVIEW (migrasi 000038) ---
+//
+// Repo ini yang membuat NEED_REVIEW nyata: tanpa implementasinya, service menolak
+// setiap NEED_REVIEW dengan 503 dan penjaga VIDEO_CALL_UNDER_REVIEW tidak pernah
+// berjalan. Yang perlu dibuktikan di Postgres sungguhan ada dua: pemindaian kolomnya
+// cocok dengan skema yang dipasang, dan daftar status di query cocok dengan predikat
+// idx_vc_escalations_one_open.
+
+// insertEscalationSession membuat satu sesi onboarding untuk disangkutkan foreign key.
+func insertEscalationSession(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID string) {
+	t.Helper()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO onboarding_sessions (session_id, device_id, product_type, current_step, expires_at)
+		VALUES ($1, 'dev_esc', 'TAHAPAN_BCA', 'VIDEO_CALL', now() + interval '24 hours')`,
+		sessionID)
+	if err != nil {
+		t.Fatalf("insert onboarding session: %v", err)
+	}
+}
+
+func newEscalation(sessionID, escalationID, queue string) *onboarding.VideoCallEscalation {
+	return &onboarding.VideoCallEscalation{
+		EscalationID:    escalationID,
+		SessionID:       sessionID,
+		QueueID:         "q_esc_test",
+		EscalationQueue: queue,
+		Status:          "PENDING",
+		Reason:          "Wajah mirip tapi tanda tangan berbeda; perlu Tier 2.",
+		RaisedByAgent:   "CS-1042",
+		RaisedAt:        time.Now().UTC().Truncate(time.Microsecond),
+	}
+}
+
+func TestEscalationRepo_CreateAndFindOpen(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	const sessionID = "onb_esc_roundtrip"
+	insertEscalationSession(ctx, t, pool, sessionID)
+
+	esc := newEscalation(sessionID, "esc_roundtrip0001", onboarding.EscalationTier2)
+	if err := repo.Create(ctx, esc); err != nil {
+		t.Fatalf("create escalation: %v", err)
+	}
+
+	got, err := repo.FindOpenBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("find open escalation: %v", err)
+	}
+	if got == nil {
+		t.Fatal("eskalasi yang baru dibuat harus terbaca sebagai terbuka")
+	}
+	if got.EscalationID != esc.EscalationID {
+		t.Errorf("escalation_id = %q, mau %q", got.EscalationID, esc.EscalationID)
+	}
+	if got.EscalationQueue != onboarding.EscalationTier2 {
+		t.Errorf("escalation_queue = %q, mau %q", got.EscalationQueue, onboarding.EscalationTier2)
+	}
+	if got.Status != "PENDING" {
+		t.Errorf("status = %q, mau PENDING", got.Status)
+	}
+	if got.Reason != esc.Reason {
+		t.Errorf("reason = %q, mau %q", got.Reason, esc.Reason)
+	}
+	if got.RaisedByAgent != "CS-1042" {
+		t.Errorf("raised_by_agent = %q, mau CS-1042", got.RaisedByAgent)
+	}
+	if got.ResolvedAt != nil {
+		t.Errorf("resolved_at harus nil pada eskalasi terbuka, dapat %v", got.ResolvedAt)
+	}
+	if got.RaisedAt.IsZero() {
+		t.Error("raised_at tidak boleh kosong")
+	}
+}
+
+// Sesi tanpa eskalasi menjawab nil, nil — BUKAN error. Penjaga JoinQueue membaca ini
+// pada setiap percobaan antre, dan error di jalur itu akan menolak nasabah yang tidak
+// punya perkara apa pun.
+func TestEscalationRepo_FindOpenReturnsNilWhenNone(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	got, err := repo.FindOpenBySessionID(ctx, "onb_tidak_pernah_ada")
+	if err != nil {
+		t.Fatalf("find open escalation: %v", err)
+	}
+	if got != nil {
+		t.Errorf("mau nil, dapat %+v", got)
+	}
+}
+
+// Eskalasi kedua untuk sesi yang sama ditolak oleh idx_vc_escalations_one_open, dan
+// pelanggarannya diterjemahkan ke apperr — bukan dibocorkan sebagai error pgx mentah.
+func TestEscalationRepo_SecondOpenEscalationRejected(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	const sessionID = "onb_esc_ganda"
+	insertEscalationSession(ctx, t, pool, sessionID)
+
+	if err := repo.Create(ctx, newEscalation(sessionID, "esc_ganda00000001", onboarding.EscalationTier2)); err != nil {
+		t.Fatalf("create escalation pertama: %v", err)
+	}
+
+	err := repo.Create(ctx, newEscalation(sessionID, "esc_ganda00000002", onboarding.EscalationFraud))
+	if !errors.Is(err, apperr.VideoCallEscalationExists) {
+		t.Fatalf("mau VIDEO_CALL_ESCALATION_EXISTS, dapat %v", err)
+	}
+}
+
+// Eskalasi yang sudah RESOLVED berhenti terbaca sebagai terbuka, dan sesi itu boleh
+// punya eskalasi baru. Inilah yang melepaskan nasabah kembali ke antrean setelah Tier 2
+// memutus — tanpa ini ia tertahan selamanya.
+func TestEscalationRepo_ResolvedNoLongerBlocks(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	const sessionID = "onb_esc_selesai"
+	insertEscalationSession(ctx, t, pool, sessionID)
+
+	if err := repo.Create(ctx, newEscalation(sessionID, "esc_selesai000001", onboarding.EscalationTier2)); err != nil {
+		t.Fatalf("create escalation: %v", err)
+	}
+
+	// Penyelesaian menuntut penyelesai, waktu, DAN keputusan sekaligus —
+	// vc_escalations_resolved_consistent di migrasi 000038.
+	if _, err := pool.Exec(ctx, `
+		UPDATE onboarding_video_call_escalations
+		SET status = 'RESOLVED', resolved_at = now(),
+		    resolved_by_agent = 'SPV-3001', resolution = 'APPROVED'
+		WHERE escalation_id = $1`, "esc_selesai000001"); err != nil {
+		t.Fatalf("resolve escalation: %v", err)
+	}
+
+	got, err := repo.FindOpenBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("find open escalation: %v", err)
+	}
+	if got != nil {
+		t.Errorf("eskalasi RESOLVED tidak boleh terbaca terbuka, dapat %+v", got)
+	}
+
+	if err := repo.Create(ctx, newEscalation(sessionID, "esc_selesai000002", onboarding.EscalationCompliance)); err != nil {
+		t.Fatalf("eskalasi baru setelah yang lama selesai harus boleh: %v", err)
+	}
+}
+
+// IN_REVIEW juga menahan. Daftar status di query HARUS sama dengan predikat index:
+// kalau query membaca lebih sedikit, penjaga JoinQueue meluluskan nasabah yang
+// Create-nya justru akan ditolak index.
+func TestEscalationRepo_InReviewStillBlocks(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	const sessionID = "onb_esc_ditinjau"
+	insertEscalationSession(ctx, t, pool, sessionID)
+
+	if err := repo.Create(ctx, newEscalation(sessionID, "esc_tinjau0000001", onboarding.EscalationTier2)); err != nil {
+		t.Fatalf("create escalation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE onboarding_video_call_escalations SET status = 'IN_REVIEW'
+		WHERE escalation_id = $1`, "esc_tinjau0000001"); err != nil {
+		t.Fatalf("set IN_REVIEW: %v", err)
+	}
+
+	got, err := repo.FindOpenBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("find open escalation: %v", err)
+	}
+	if got == nil {
+		t.Fatal("IN_REVIEW harus tetap terbaca sebagai terbuka")
+	}
+	if got.Status != "IN_REVIEW" {
+		t.Errorf("status = %q, mau IN_REVIEW", got.Status)
 	}
 }

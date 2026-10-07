@@ -1024,3 +1024,71 @@ func (r *OnboardingVideoCallScheduleRepo) CancelBySessionID(ctx context.Context,
 	}
 	return tag.RowsAffected() > 0, nil
 }
+
+// --- Eskalasi NEED_REVIEW (migrasi 000038) ---
+
+// OnboardingVideoCallEscalationRepo mengimplementasikan
+// onboarding.VideoCallEscalationRepository di atas onboarding_video_call_escalations.
+type OnboardingVideoCallEscalationRepo struct {
+	pool *pgxpool.Pool
+}
+
+func NewOnboardingVideoCallEscalationRepo(pool *pgxpool.Pool) *OnboardingVideoCallEscalationRepo {
+	return &OnboardingVideoCallEscalationRepo{pool: pool}
+}
+
+// Create menyisipkan eskalasi baru.
+//
+// `id` dibiarkan DEFAULT gen_random_uuid(): entitas domainnya tidak punya kolom itu, dan
+// menambahkannya hanya supaya aplikasi bisa mengisinya akan membuat satu field yang tidak
+// pernah dibaca siapa pun.
+//
+// Eskalasi ganda dijawab dari PELANGGARAN UNIQUE INDEX (23505), bukan dari SELECT lebih
+// dulu — alasannya sama dengan jadwal video call di atas: idx_vc_escalations_one_open
+// hanya mengizinkan satu baris PENDING/IN_REVIEW per sesi, dan dua petugas yang menyubmit
+// NEED_REVIEW bersamaan akan sama-sama melihat "belum ada eskalasi" kalau diperiksa di
+// aplikasi. Yang benar-benar menahannya adalah index.
+func (r *OnboardingVideoCallEscalationRepo) Create(ctx context.Context, esc *onboarding.VideoCallEscalation) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO onboarding_video_call_escalations
+			(escalation_id, session_id, queue_id, escalation_queue,
+			 status, reason, raised_by_agent, raised_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		esc.EscalationID, esc.SessionID, esc.QueueID, esc.EscalationQueue,
+		esc.Status, esc.Reason, esc.RaisedByAgent, esc.RaisedAt,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return apperr.VideoCallEscalationExists
+		}
+		return fmt.Errorf("insert video call escalation: %w", err)
+	}
+	return nil
+}
+
+// FindOpenBySessionID mengembalikan eskalasi yang masih terbuka, atau nil, nil.
+//
+// Daftar statusnya SAMA dengan predikat idx_vc_escalations_one_open. Dua daftar yang
+// boleh berbeda akan berbeda: kalau query ini membaca lebih sedikit status daripada yang
+// ditahan index, penjaga JoinQueue akan meluluskan nasabah yang Create-nya justru akan
+// ditolak index — nasabah mengantre, lalu petugas tidak bisa menuntaskan perkaranya.
+func (r *OnboardingVideoCallEscalationRepo) FindOpenBySessionID(ctx context.Context, sessionID string) (*onboarding.VideoCallEscalation, error) {
+	var esc onboarding.VideoCallEscalation
+
+	err := r.pool.QueryRow(ctx, `
+		SELECT escalation_id, session_id, queue_id, escalation_queue,
+		       status, reason, raised_by_agent, raised_at, resolved_at
+		FROM onboarding_video_call_escalations
+		WHERE session_id = $1 AND status IN ('PENDING', 'IN_REVIEW')`, sessionID,
+	).Scan(&esc.EscalationID, &esc.SessionID, &esc.QueueID, &esc.EscalationQueue,
+		&esc.Status, &esc.Reason, &esc.RaisedByAgent, &esc.RaisedAt, &esc.ResolvedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find open video call escalation: %w", err)
+	}
+
+	return &esc, nil
+}

@@ -2362,7 +2362,7 @@ dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
 | `TERMINAL_AGENT_BUSY` | 409 | Petugas masih aktif di terminal lain; tutup giliran di sana lebih dulu |
 | `SUPERVISOR_NOT_FOUND` | 404 | Supervisor tidak ditemukan |
 | `SUPERVISOR_TOKEN_INVALID` | 401 | Token otorisasi dual-control supervisor tidak sah |
-| `VIDEO_CALL_UNDER_REVIEW` | 422 | Sesi punya eskalasi `NEED_REVIEW` yang belum selesai — nasabah ditahan dari antrean sampai Tier 2 memutus. **Belum pernah terbit:** penyimpanan eskalasi belum terpasang, lihat `docs/06` §5c |
+| `VIDEO_CALL_UNDER_REVIEW` | 422 | Sesi punya eskalasi `NEED_REVIEW` yang belum selesai — nasabah ditahan dari antrean sampai Tier 2 memutus |
 | `VIDEO_CALL_ESCALATION_EXISTS` | 409 | Sesi ini sudah dalam peninjauan |
 | `VIDEO_CALL_NOT_ACTIVE` | 422 | Hasil disubmit untuk panggilan yang belum diambil petugas (`QUEUED`) atau sudah `CANCELLED` |
 | `VIDEO_CALL_AGENT_MISMATCH` | 409 | Hasil disubmit oleh petugas yang bukan pengambil panggilannya |
