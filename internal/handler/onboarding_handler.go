@@ -56,6 +56,7 @@ type OnboardingHandler struct {
 	submitService       *onboarding.SubmitService
 	monitoringService   *onboarding.MonitoringService
 	tncService          *onboarding.TNCService
+	productService      *onboarding.ProductService
 	pinKeys             *crypto.RSAKeyPair
 }
 
@@ -69,6 +70,7 @@ func NewOnboardingHandler(
 	submitSvc *onboarding.SubmitService,
 	monSvc *onboarding.MonitoringService,
 	tncSvc *onboarding.TNCService,
+	productSvc *onboarding.ProductService,
 	pinKeys *crypto.RSAKeyPair,
 ) *OnboardingHandler {
 	return &OnboardingHandler{
@@ -81,6 +83,7 @@ func NewOnboardingHandler(
 		submitService:       submitSvc,
 		monitoringService:   monSvc,
 		tncService:          tncSvc,
+		productService:      productSvc,
 		pinKeys:             pinKeys,
 	}
 }
@@ -93,6 +96,63 @@ func NewOnboardingHandler(
 //
 // `?version=` opsional, untuk menampilkan kembali teks versi lama yang pernah
 // disetujui. Tanpa parameter: versi yang sedang berlaku.
+// GetProducts handles GET /v1/onboarding/products
+//
+// Layar PERTAMA buka rekening — tampil sebelum S&K, sebelum kartu, sebelum sesi lahir.
+// Publik: tanpa Authorization dan tanpa session_id.
+//
+// Sebelum endpoint ini, isi layar hidup sebagai 16 entri strings.xml di dalam APK.
+// Akibatnya setoran awal yang DILIHAT nasabah tidak punya arsip, produk tidak bisa
+// ditutup tanpa rilis aplikasi, dan client memilih produk berdasarkan POSISI array —
+// yang membuat nasabah membuka rekening yang bukan pilihannya begitu server mengurutkan
+// atau menyembunyikan satu produk.
+func (h *OnboardingHandler) GetProducts(w http.ResponseWriter, r *http.Request) {
+	if h.productService == nil {
+		// Pola GetTNC: service yang tidak dirakit adalah katalog yang tidak tersedia,
+		// bukan panic. Client jatuh ke fallback strings.xml.
+		response.Err(w, r, apperr.OnboardingCatalogUnavailable)
+		return
+	}
+
+	// X-Device-Id DIWAJIBKAN di sini, berbeda dari GetTNC yang membolehkannya kosong.
+	// Bedanya bukan selera: rate limit endpoint ini per device, dan tanpa header itu
+	// seluruh nasabah di belakang satu NAT operator berbagi satu jatah. Teks S&K sama
+	// untuk semua perangkat sehingga jatuh ke IP tidak merugikan siapa pun; katalog
+	// dibaca sekali per pendaftaran oleh setiap perangkat.
+	deviceID := strings.TrimSpace(r.Header.Get("X-Device-Id"))
+	if deviceID == "" {
+		missing := apperr.ValidationError
+		missing.Details = map[string]any{"missing_header": "X-Device-Id"}
+		response.Err(w, r, missing)
+		return
+	}
+
+	catalog, err := h.productService.Catalog(r.Context())
+	if err != nil {
+		h.handleErr(w, r, "get onboarding product catalog failed", err)
+		return
+	}
+
+	// ETag dari versi yang BENAR-BENAR dilayani, bukan dari apa pun yang datang di
+	// request — pelajaran yang sama dari catalogETag dan GetTNC. ETag yang dibangun dari
+	// nilai request akan membuat client terus menerima 304 berisi setoran awal lama.
+	etag := `"products-` + catalog.CatalogVersion + `"`
+	w.Header().Set("ETag", etag)
+
+	// Lima menit, bukan 24 jam seperti TTL cache server: client yang menahan katalog
+	// lebih lama hanya menampilkan setoran awal yang keliru, dan setoran awal adalah
+	// komitmen 30 hari kalender yang disebut pasal 4 S&K.
+	w.Header().Set("Cache-Control", "public, max-age=300")
+
+	if matchesETag(r.Header.Get("If-None-Match"), etag) {
+		// 304 tidak boleh membawa body — termasuk envelope standar.
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, catalog)
+}
+
 func (h *OnboardingHandler) GetTNC(w http.ResponseWriter, r *http.Request) {
 	if h.tncService == nil {
 		response.Err(w, r, apperr.TNCUnavailable)

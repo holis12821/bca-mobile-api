@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/holis12821/bca-mobile-api/internal/config"
 )
 
@@ -348,5 +350,50 @@ func TestSupervisorEndpoints_DoNotRequireAgentCredentials(t *testing.T) {
 	}
 	if rr.Code != http.StatusInternalServerError {
 		t.Errorf("tanpa database endpoint ini seharusnya sampai ke handler dan gagal 500, dapat %d", rr.Code)
+	}
+}
+
+// /products dan /products/{product_type}/cards hidup di prefix yang sama.
+//
+// chi mencocokkan pola statis lebih dulu, jadi secara teori keduanya aman — tapi
+// "secara teori" bukan jawaban untuk dua rute yang bisa saling menelan tanpa suara.
+//
+// Diperiksa dengan MENELUSURI pohon rute, bukan dengan menjalankan permintaan: rate
+// limiter kedua endpoint ini menyentuh Redis, dan newTestRouter merakit seluruh
+// dependensi sebagai nil. Yang perlu dibuktikan di sini adalah pendaftaran rutenya —
+// perilaku handler-nya sudah diuji di internal/handler/onboarding_handler_test.go.
+func TestOnboardingProductRoutes_BothRegistered(t *testing.T) {
+	r := newTestRouter(t, productionLikeConfig("s3cret-from-the-vault"))
+
+	mux, ok := r.(*chi.Mux)
+	if !ok {
+		t.Fatalf("router bukan *chi.Mux, dapat %T", r)
+	}
+
+	found := map[string]bool{}
+	err := chi.Walk(mux, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if method == http.MethodGet {
+			found[route] = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk routes: %v", err)
+	}
+
+	for _, want := range []string{
+		"/v1/onboarding/products",
+		"/v1/onboarding/products/{product_type}/cards",
+	} {
+		if !found[want] {
+			t.Errorf("rute %s tidak terdaftar — kemungkinan tertelan rute lain", want)
+		}
+	}
+
+	// Rute satu produk SENGAJA tidak dibuat: layar hanya butuh daftar, dan
+	// /products/{product_type} bertabrakan secara visual dengan
+	// /products/{product_type}/cards milik katalog kartu.
+	if found["/v1/onboarding/products/{product_type}"] {
+		t.Error("/products/{product_type} seharusnya tidak ada — lihat SKILL.md buka-rekening-produk")
 	}
 }

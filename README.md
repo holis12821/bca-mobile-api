@@ -214,6 +214,28 @@ client-side guidance in `.claude/skills/cs-desktop-api-integration/SKILL.md`.
 > `cs_agents` must carry the `CARD_ADMIN` scope. Callers sending only the system
 > key get `403`.
 
+Savings account catalog — the **first** screen of account opening, served before T&C,
+before card selection, before a session exists:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/onboarding/products` | Savings product types, their minimum initial deposit, features, and the screen copy. Public; requires `X-Device-Id`. `ETag: "products-<catalog_version>"`, `Cache-Control: public, max-age=300`, own rate-limit bucket (30 / 5 min per device) |
+
+`product_type` is the only product identity in the response — the client must never
+infer a product from its array position. Display order lives in `display_order`, and
+`display_order` is not identity. Products under maintenance stay **in** the list with
+`availability_status: "DISABLED"`; they do not disappear and they do not make the whole
+endpoint fail.
+
+`POST /v1/onboarding/sessions` records `product_catalog_version` and
+`min_initial_deposit_shown` from the catalog in force, so the figure the customer
+actually saw is provable later. Both columns are nullable: an old APK that never calls
+the catalog still creates sessions, and a dead catalog never blocks session creation.
+
+> The deposit figures and feature texts in migration `000039` are **design data** copied
+> verbatim from the Android `strings.xml` (500,000 / 50,000 / 20,000) — **not official
+> BCA tariffs**. See `COMMENT ON TABLE onboarding_products`.
+
 Customer-facing video call rescheduling (serves the Android "Jadwalkan Panggilan
 Nanti" button, which was disabled until these existed):
 
@@ -271,6 +293,8 @@ See `internal/config/config.go` for all supported variables. Key ones:
 | `MIN_APP_VERSION` | `1.0.0` | Served by `GET /v1/health/config`; drives force-update |
 | `FEATURE_*` | `true` | Feature flags in `GET /v1/health/config` (`FEATURE_BIOMETRIC_LOGIN`, `FEATURE_QRIS_PAYMENT`, `FEATURE_EWALLET_TOPUP`, `FEATURE_ONBOARDING`) |
 | `FEATURE_CARD_SELECTION` | `false` | Turns the Paspor card-selection step on. Off keeps the old flow whole: sessions start at `OCR`, the catalog answers `CARD_CATALOG_EMPTY`, and submit does not demand a card. This is only the default — the Redis key `flag:onboarding:card_selection:enabled` overrides it without a restart. `.env.example` sets it to `true`: the catalog now carries real numbers (migration `000022`), so the screen has something to show. The code default stays `false` so a deployment that has not migrated cannot serve an empty catalog as a feature |
+| `FEATURE_ONBOARDING_PRODUCT_CATALOG` | `true` | Serves `GET /v1/onboarding/products`. Off makes it answer `503 ONBOARDING_CATALOG_UNAVAILABLE` and the Android client falls back to its bundled `strings.xml` list — the screen stays fully usable. Turning it off never blocks `POST /v1/onboarding/sessions`. Defaults to `true`, unlike `FEATURE_CARD_SELECTION`: the catalog's text is copied verbatim from the APK, so serving it changes not one word the customer sees. What is not yet official is the deposit **figures**, and that is flagged in the migration comment rather than by disabling the endpoint |
+| `ONBOARDING_PRODUCTS_MAINTENANCE` | (empty) | Comma-separated `product_type` list that is temporarily closed, e.g. `TABUNGANKU`. The catalog still **lists** them, with `availability_status: "DISABLED"` and `availability_reason_key: "MAINTENANCE"` — a customer needs to know the product exists and is closed, not be confused by a choice that vanished. `POST /sessions` for those products is refused with `422 ONBOARDING_PRODUCT_UNAVAILABLE`. Read by both the product and card catalogs |
 | `ONBOARDING_CARD_CORE_BANKING_CODES` | (empty) | Maps `card_type` to the core banking card code, e.g. `PASPOR_BLUE:CB-BLUE,PASPOR_GOLD:CB-GOLD`. Verified **at startup** when `FEATURE_CARD_SELECTION` is on: an active catalogued card with no mapping refuses to start, so a hole in the config surfaces at deploy rather than after a nasabah's account exists without a card. The values currently in `.env.example` are dev placeholders |
 | `ONBOARDING_CARD_LEGACY_APP_VERSION` | (empty) | `X-App-Version` threshold below which a session with no `card_type` gets the product's default card instead of stopping at `CARD_SELECTION`. Empty disables the fallback — pushing a default card, and its monthly fee, onto a nasabah who never chose it is a product decision |
 | `SMS_PROVIDER` | (empty) | OTP delivery transport. `twilio` is the only one implemented. Empty is allowed **only** in development (the gateway logs the code); outside development the boot is refused, because a process with no provider generates, stores and audits every OTP while no nasabah can get past `OTP_VERIFY`. An unknown value also fails the boot rather than falling back to silence |

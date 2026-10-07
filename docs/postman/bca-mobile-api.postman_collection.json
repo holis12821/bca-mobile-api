@@ -1909,6 +1909,174 @@
    "description": "**USANG — pakai folder Onboarding (Buka Rekening).**\n\n`/v1/registration/*` dan `/v1/onboarding/*` menggambarkan fitur yang sama dengan dua kontrak berbeda: yang pertama memakai Registration Token, yang kedua `session_id`. Aplikasi Android mengimplementasikan yang kedua, dan itu yang dipelihara.\n\nKeluarga ini masih berjalan untuk build lama dan tidak dihapus diam-diam. Setiap responsnya membawa `Deprecation: true` dan `Link: </v1/onboarding/*>; rel=\"successor-version\"`. Header `Sunset` tidak dikirim: belum ada tanggal penghapusan yang disepakati."
   },
   {
+   "name": "Onboarding — Katalog Jenis Rekening",
+   "description": "GET /v1/onboarding/products — layar PERTAMA flow buka rekening.\n\nSebelum endpoint ini ada, isi layar hidup sebagai 16 entri strings.xml di dalam APK. Tiga akibatnya: setoran awal yang DILIHAT nasabah tidak punya arsip, produk tidak bisa ditutup tanpa rilis aplikasi, dan client memilih produk berdasarkan POSISI array.\n\nBucket rate limit SENDIRI (30/5 menit per device, plafon 600/jam per IP), bukan menumpang bucket S&K atau katalog kartu: flow Android memuat ketiganya pada tiga layar berurutan, jadi bucket bersama berarti nasabah menerima 429 di tengah pendaftaran.\n\nCATATAN: angka setoran awal dan teks fitur di migrasi 000039 adalah DATA DESAIN yang disalin apa adanya dari strings.xml — BUKAN tarif resmi BCA.",
+   "item": [
+    {
+     "name": "1. Katalog jenis rekening",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Device-Id",
+        "value": "{{device_id}}"
+       }
+      ],
+      "url": {
+       "raw": "{{base_url}}/onboarding/products",
+       "host": [
+        "{{base_url}}"
+       ],
+       "path": [
+        "onboarding",
+        "products"
+       ]
+      },
+      "description": "Layar PERTAMA buka rekening — sebelum S&K, sebelum kartu, sebelum sesi lahir. Publik: tanpa Authorization dan tanpa session_id.\n\nX-Device-Id DIWAJIBKAN di sini, berbeda dari GET /onboarding/tnc yang membolehkannya kosong. Bedanya bukan selera: rate limit endpoint ini per device, dan tanpa header itu seluruh nasabah di belakang satu NAT operator berbagi satu jatah.\n\nproduct_type adalah SATU-SATUNYA identitas produk. Client tidak boleh menyimpulkan produk dari posisi array — urutan tampilan ada di display_order, dan display_order BUKAN identitas. Itu kopling yang membuat nasabah membuka rekening yang bukan pilihannya begitu server mengurutkan atau menyembunyikan satu produk, tanpa error di mana pun.\n\nmin_initial_deposit integer rupiah penuh (500000), bukan string terformat (\"Rp 500.000\"). Pemformatan milik client.\n\nPayload TIDAK memuat nilai visual: hanya enum icon_key dan style. Client memetakannya ke drawable dan design token.\n\npage ikut dilayani supaya mengubah judul atau isi kotak Persiapan Dokumen tidak menuntut rilis APK. page.consent dipecah TIGA karena bagian tengahnya dicetak tebal oleh aplikasi — satu kalimat utuh memaksa client mencari substring yang pecah pada setiap perbaikan kata.\n\nJawaban yang mungkin: 400 VALIDATION_ERROR (details.missing_header), 503 ONBOARDING_CATALOG_UNAVAILABLE (tidak ada produk aktif atau flag mati), 429 RATE_LIMIT_EXCEEDED.\n\nETag disimpan otomatis ke {{products_etag}} oleh script test request ini."
+     },
+     "response": [],
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "const etag = pm.response.headers.get('ETag');",
+         "if (etag) { pm.environment.set('products_etag', etag); }",
+         "",
+         "pm.test('status 200', function () { pm.response.to.have.status(200); });",
+         "",
+         "pm.test('ETag dan Cache-Control terpasang', function () {",
+         "    pm.expect(etag).to.be.a('string').and.match(/^\"products-/);",
+         "    pm.expect(pm.response.headers.get('Cache-Control')).to.eql('public, max-age=300');",
+         "});",
+         "",
+         "const d = pm.response.json().data;",
+         "pm.test('setiap produk membawa product_type, bukan sekadar posisi', function () {",
+         "    pm.expect(d.products).to.be.an('array').and.not.empty;",
+         "    d.products.forEach(function (p) {",
+         "        pm.expect(p.product_type, 'product_type').to.be.a('string').and.not.empty;",
+         "        pm.expect(p.display_order, 'display_order').to.be.a('number');",
+         "    });",
+         "});",
+         "",
+         "pm.test('nominal integer, bukan string terformat', function () {",
+         "    d.products.forEach(function (p) {",
+         "        pm.expect(p.min_initial_deposit, p.product_type).to.be.a('number');",
+         "    });",
+         "});",
+         "",
+         "pm.test('payload tidak memuat nilai visual', function () {",
+         "    const raw = pm.response.text();",
+         "    ['0xFF', 'drawable', 'AppColor'].forEach(function (bad) {",
+         "        pm.expect(raw, bad).to.not.include(bad);",
+         "    });",
+         "});",
+         "",
+         "pm.test('consent tetap tiga potong', function () {",
+         "    pm.expect(d.page.consent.prefix).to.be.a('string').and.not.empty;",
+         "    pm.expect(d.page.consent.link).to.be.a('string').and.not.empty;",
+         "    pm.expect(d.page.consent.suffix).to.be.a('string').and.not.empty;",
+         "});",
+         "",
+         "pm.test('maksimum satu produk is_popular', function () {",
+         "    pm.expect(d.products.filter(function (p) { return p.is_popular; }).length)",
+         "      .to.be.at.most(1);",
+         "});"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "2. Katalog — 304 Not Modified",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [
+       {
+        "key": "X-Device-Id",
+        "value": "{{device_id}}"
+       },
+       {
+        "key": "If-None-Match",
+        "value": "{{products_etag}}"
+       }
+      ],
+      "url": {
+       "raw": "{{base_url}}/onboarding/products",
+       "host": [
+        "{{base_url}}"
+       ],
+       "path": [
+        "onboarding",
+        "products"
+       ]
+      },
+      "description": "Jalankan request 1 lebih dulu supaya {{products_etag}} terisi.\n\n304 TIDAK boleh membawa satu byte pun body — termasuk envelope standar. Script test memeriksa itu.\n\nETag dibangun dari catalog_version yang BENAR-BENAR dilayani, bukan dari apa pun yang datang di request. ETag dari nilai request akan membuat client terus menerima 304 berisi setoran awal lama."
+     },
+     "response": [],
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 304', function () { pm.response.to.have.status(304); });",
+         "pm.test('304 tidak membawa body', function () {",
+         "    pm.expect(pm.response.responseSize).to.eql(0);",
+         "});"
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "3. Katalog — tanpa X-Device-Id (400)",
+     "request": {
+      "auth": {
+       "type": "noauth"
+      },
+      "method": "GET",
+      "header": [],
+      "url": {
+       "raw": "{{base_url}}/onboarding/products",
+       "host": [
+        "{{base_url}}"
+       ],
+       "path": [
+        "onboarding",
+        "products"
+       ]
+      },
+      "description": "X-Device-Id kosong dijawab 400 VALIDATION_ERROR dengan details.missing_header, bukan dibiarkan lolos ke bucket rate limit bersama."
+     },
+     "response": [],
+     "event": [
+      {
+       "listen": "test",
+       "script": {
+        "type": "text/javascript",
+        "exec": [
+         "pm.test('status 400', function () { pm.response.to.have.status(400); });",
+         "pm.test('menyebut header yang kurang', function () {",
+         "    const e = pm.response.json().error;",
+         "    pm.expect(e.code).to.eql('VALIDATION_ERROR');",
+         "    pm.expect(e.details.missing_header).to.eql('X-Device-Id');",
+         "});"
+        ]
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
    "name": "Onboarding (Buka Rekening)",
    "description": "Alur buka rekening: Session → OCR e-KTP → Personal Data → OTP → Biometrik → Video Call → Credentials → Submit.\n\nSemua provider eksternal (OCR, Dukcapil, biometrik, SMS, core banking) memakai implementasi mock di dalam proses — tidak ada panggilan keluar.\n\n**WebSocket signaling** (`/v1/onboarding/video-call/signal`) tidak bisa disimpan dalam file collection. Buat manual: New → WebSocket Request → `ws://localhost:8080/v1/onboarding/video-call/signal?token=<signaling_token>&role=nasabah`. Lewat ngrok, skemanya `wss://`.\n\n**`X-Device-ID` di setiap request.** Server membandingkannya dengan perangkat pembuat sesi; berbeda → `403 ONBOARDING_DEVICE_MISMATCH` (docs/06-BUKA-REKENING-API-SPEC.md §0). Header yang tidak dikirim tetap lolos, supaya build yang sudah ada di tangan tester tidak terputus di tengah flow. Untuk `GET /products/{type}/cards` header ini WAJIB.",
    "item": [

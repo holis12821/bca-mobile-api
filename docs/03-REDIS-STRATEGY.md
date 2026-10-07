@@ -276,6 +276,38 @@ jatuh ke Postgres dan mencatat peringatan. Halaman inilah tempat nasabah yang
 terkunci di luar aplikasi mencari nomor CS — mematikannya karena cache bermasalah
 justru menutup pintu keluarnya.
 
+### Katalog Jenis Rekening Tabungan
+
+```
+Key:    onboarding:products:v1:catalog        ← katalog aktif
+Key:    onboarding:products:v1:ver:{version}  ← snapshot per versi katalog
+Type:   String (JSON)
+TTL:    24 jam
+
+Invalidation:
+  - Mengubah katalog WAJIB diikuti DEL onboarding:products:v1:catalog.
+    Kenaikan onboarding_product_catalog_version.counter TIDAK cukup: entri
+    :catalog menyimpan catalog_version LAMA di dalamnya, jadi tanpa DEL
+    nasabah melihat setoran awal lama DAN ETag lama sampai TTL habis — dan
+    karena ETag-nya konsisten dengan isinya, tidak ada error yang terlihat.
+    Yang terjadi hanyalah sehari penuh layar yang menampilkan angka keliru,
+    dan setoran awal adalah komitmen 30 hari kalender (pasal 4 S&K).
+    Keterbatasan yang sama dengan onboarding:tnc:v1:active.
+  - Entri :ver:{version} tidak perlu di-DEL: isinya per versi dan versi lama
+    tidak berubah lagi. Ia ada supaya product_catalog_version yang sudah
+    tersimpan di baris sesi tetap punya isinya.
+  - Katalog KOSONG tidak pernah di-cache: menyimpannya berarti menahan jawaban
+    503 selama 24 jam setelah migrasi yang mengisinya akhirnya dijalankan.
+  - Status maintenance (ONBOARDING_PRODUCTS_MAINTENANCE) diterapkan SESUDAH
+    cache dibaca, jadi mengubah env itu langsung terlihat tanpa menunggu TTL.
+  - Entri yang tidak bisa di-decode diperlakukan sebagai MISS, bukan kegagalan:
+    bentuk response yang berubah tanpa menaikkan v1 akan meninggalkan entri
+    rusak, dan menolak permintaan karenanya berarti layar pertama buka rekening
+    mati sampai seseorang menghapus kuncinya.
+  - Galat Redis apa pun TURUN ke Postgres, bukan ke halaman error. Redis yang
+    mati tidak boleh menutup pintu masuk buka rekening.
+```
+
 ### Syarat & Ketentuan Buka Rekening
 
 ```
@@ -541,6 +573,7 @@ func (r *RedisRepo) InvalidateTransactionCaches(ctx context.Context, parties []A
 | `lock:account:*` | 30 menit | Lockout duration |
 | `idem:*` | 24 jam | Idempotency guarantee |
 | `dlock:*` | 30 detik | Auto-release lock |
+| `onboarding:products:v1:*` | 24 jam | Katalog produk; invalidasi WAJIB `DEL …:catalog` |
 | `inquiry:*` | 5 menit | Inquiry validity |
 
 ---

@@ -99,6 +99,29 @@ type VideoCallEscalationRepository interface {
 	FindOpenBySessionID(ctx context.Context, sessionID string) (*VideoCallEscalation, error)
 }
 
+// ProductCatalogRepository membaca katalog jenis rekening tabungan.
+//
+// Satu metode saja: layar hanya butuh daftar. GET /products/{product_type} untuk satu
+// produk sengaja TIDAK dibuat — rute itu bertabrakan secara visual dengan
+// /products/{product_type}/cards milik katalog kartu.
+type ProductCatalogRepository interface {
+	// ActiveCatalog mengembalikan produk aktif beserta copy halaman dan versi katalog.
+	//
+	// Produk yang is_active = FALSE tidak ikut. Produk yang tutup (availability_status
+	// bukan AVAILABLE) TETAP ikut — nasabah perlu tahu produk itu ada dan sedang tutup.
+	ActiveCatalog(ctx context.Context) (*SavingsProductCatalog, error)
+}
+
+// ProductCatalogCache menyimpan katalog yang sudah dirakit.
+//
+// Isinya sama untuk semua nasabah dan berubah beberapa kali setahun, jadi satu entri
+// cukup — tanpa kunci per wilayah seperti katalog kartu.
+type ProductCatalogCache interface {
+	// GetCatalog mengembalikan nil, nil saat cache miss. Miss BUKAN error.
+	GetCatalog(ctx context.Context) (*SavingsProductCatalog, error)
+	SetCatalog(ctx context.Context, c *SavingsProductCatalog) error
+}
+
 // VideoCallScheduleRepository menyimpan janji video call.
 type VideoCallScheduleRepository interface {
 	// Create menyisipkan jadwal baru.

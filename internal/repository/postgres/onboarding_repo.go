@@ -40,8 +40,18 @@ func (r *OnboardingSessionRepo) Create(ctx context.Context, session *onboarding.
 		INSERT INTO onboarding_sessions
 			(id, session_id, device_id, product_type, current_step, tnc_version,
 			 steps_completed, created_at, updated_at, expires_at,
-			 card_type, card_selected_at, card_catalog_version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`
+			 card_type, card_selected_at, card_catalog_version,
+			 product_catalog_version, min_initial_deposit_shown)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
+
+	// product_catalog_version dan min_initial_deposit_shown ditulis NULL saat kosong,
+	// bukan "" dan 0: kolomnya nullable dengan sengaja, dan 0 di kolom nominal terbaca
+	// sebagai "setoran awalnya Rp 0" — keadaan yang berbeda dari "tidak tercatat".
+	var depositShown *int64
+	if session.MinInitialDepositShown > 0 {
+		d := session.MinInitialDepositShown
+		depositShown = &d
+	}
 
 	_, err = r.pool.Exec(ctx, query,
 		session.ID, session.SessionID, session.DeviceID,
@@ -50,6 +60,7 @@ func (r *OnboardingSessionRepo) Create(ctx context.Context, session *onboarding.
 		session.CreatedAt, session.UpdatedAt, session.ExpiresAt,
 		nullableText(session.CardType), session.CardSelectedAt,
 		nullableText(session.CardCatalogVersion),
+		nullableText(session.ProductCatalogVersion), depositShown,
 	)
 	if err != nil {
 		return fmt.Errorf("insert onboarding session: %w", err)

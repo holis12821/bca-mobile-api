@@ -178,6 +178,19 @@ var (
 	// konfigurasi server (migrasi belum jalan), bukan salah client — jadi 5xx,
 	// dan jangan sampai terbaca sebagai "nasabah mengirim sesuatu yang salah".
 	TNCUnavailable = Error{http.StatusServiceUnavailable, "TNC_UNAVAILABLE", "Syarat & Ketentuan belum tersedia. Silakan coba beberapa saat lagi.", nil}
+
+	// OnboardingCatalogUnavailable 503, pola yang sama dengan TNCUnavailable: tidak
+	// ada satu pun produk aktif, atau feature flag katalognya mati. Dua-duanya salah
+	// konfigurasi server, bukan salah client.
+	//
+	// 503 dan BUKAN 404 atau daftar kosong: client jatuh ke fallback strings.xml saat
+	// menerima ini, dan daftar kosong akan membuatnya menampilkan layar tanpa pilihan
+	// — nasabah berhenti di layar pertama tanpa tahu kenapa.
+	//
+	// Dipisah dari ONBOARDING_PRODUCT_UNKNOWN (404) dan ONBOARDING_PRODUCT_UNAVAILABLE
+	// (422) yang sudah ada: keduanya tentang SATU produk yang diminta client, ini
+	// tentang katalognya yang tidak bisa dilayani sama sekali.
+	OnboardingCatalogUnavailable = Error{http.StatusServiceUnavailable, "ONBOARDING_CATALOG_UNAVAILABLE", "Daftar jenis rekening belum tersedia. Silakan coba beberapa saat lagi.", nil}
 )
 
 // --- 422 (onboarding) ---

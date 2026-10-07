@@ -2608,4 +2608,5 @@ dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
 | `EMPLOYEE_INACTIVE` | 422 | NPP ada di HRIS tapi status kepegawaiannya dicabut — bukan salah ketik |
 | `HRIS_UNAVAILABLE` | 503 | Direktori pegawai tidak bisa dihubungi, atau belum terpasang di environment ini. Bukan penolakan — boleh dicoba lagi |
 | `SCOPE_UNKNOWN` | 422 | Cakupan kewenangan di luar `VIDEO_CALL`/`CARD_ADMIN`/`CUSTOMER_PII`/`TICKET`. `details.scope` menyebut yang mana |
+| `ONBOARDING_CATALOG_UNAVAILABLE` | 503 | Katalog jenis rekening tidak bisa dilayani: tidak ada produk aktif, atau `FEATURE_ONBOARDING_PRODUCT_CATALOG=false`. Client jatuh ke daftar bawaannya. Dipisah dari `ONBOARDING_PRODUCT_UNKNOWN`/`UNAVAILABLE` yang tentang SATU produk |
 | `INTERNAL_ERROR` | 500 | Kesalahan internal server |

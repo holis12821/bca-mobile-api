@@ -986,6 +986,116 @@ jam database bukan jam Jakarta.
 
 ---
 
+## Katalog Jenis Rekening Tabungan (migrasi `000039`)
+
+Empat tabel yang melayani layar **pertama** buka rekening. Sebelumnya isi layar hidup
+sebagai 16 entri `strings.xml` di dalam APK; sisi bank hanya punya enum
+`onboarding_product_type` (migrasi `000010`) — tiga nama tanpa satu pun atribut.
+
+```sql
+CREATE TABLE onboarding_products (
+    product_type  onboarding_product_type PRIMARY KEY,   -- enum, bukan TEXT
+    name, description        TEXT NOT NULL,
+    min_initial_deposit      BIGINT NOT NULL CHECK (>= 0),
+    currency                 CHAR(3) NOT NULL DEFAULT 'IDR',
+    icon_key, style          TEXT NOT NULL + CHECK enum,
+    badge_key                TEXT NULL + CHECK,
+    is_popular, is_default, is_active  BOOLEAN NOT NULL,
+    display_order            INT NOT NULL,
+    availability_status      TEXT NOT NULL DEFAULT 'AVAILABLE' + CHECK,
+    availability_reason_key  TEXT NULL + CHECK,
+    ...
+);
+
+CREATE UNIQUE INDEX idx_onboarding_products_one_popular
+    ON onboarding_products ((TRUE)) WHERE is_popular;
+CREATE UNIQUE INDEX idx_onboarding_products_one_default
+    ON onboarding_products ((TRUE)) WHERE is_default;
+```
+
+Keputusan skema yang punya alasan:
+
+- **`product_type` bertipe enum, bukan `TEXT`.** `TEXT` di sini menciptakan sumber
+  kebenaran kedua untuk daftar produk yang sama — persis yang dihindari komentar di
+  `000019` untuk `product_card_options`. Katalog ini **mengisi atribut** nilai enum yang
+  sudah ada, bukan membuat daftar produk kedua.
+- **Maksimum satu `is_popular` dan satu `is_default`**, ditegakkan unique index
+  berekspresi atas konstanta. Dua produk "Paling Populer" membuat jawabannya bergantung
+  `ORDER BY`, dan jawaban yang bergantung urutan baris bisa berubah sendiri tanpa ada
+  yang menyunting apa pun.
+- **`availability_status` selain `AVAILABLE` wajib menyebut `availability_reason_key`**
+  (CHECK `onboarding_products_reason_required`). Tanpa alasan, nasabah hanya melihat
+  kartu mati tanpa penjelasan — dan tidak ada cara membedakan "sedang maintenance" dari
+  "belum dibuka untuk umum".
+- **Baris produk tidak pernah dihapus.** `onboarding_sessions.product_type` menunjuk ke
+  sini dan sesi lama harus tetap bisa menyebut produk yang dipilihnya. Produk yang
+  dihentikan di-set `is_active = FALSE`.
+
+```sql
+CREATE TABLE onboarding_product_features (
+    id            BIGSERIAL PRIMARY KEY,
+    product_type  onboarding_product_type NOT NULL REFERENCES onboarding_products ...,
+    feature_order INT NOT NULL CHECK (> 0),
+    label         TEXT NOT NULL,
+    UNIQUE (product_type, feature_order)
+);
+```
+
+**Tabel terpisah, bukan JSONB dan bukan kolom berpola `feature_N`.** Jumlah fiturnya
+berbeda per produk — layar merender 3, 3, dan 2 fitur — dan berubah tiap revisi materi
+pemasaran. Menambah fitur keempat tidak boleh berarti menambah kolom. Pola
+`onboarding_tnc_sections`.
+
+```sql
+CREATE TABLE onboarding_product_page (
+    id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),   -- satu-satunya baris
+    heading, subtitle, deposit_label, cta_label,
+    notice_icon_key, notice_title, notice_body,
+    consent_prefix, consent_link, consent_suffix
+);
+
+CREATE TABLE onboarding_product_catalog_version (
+    id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    version_date DATE, counter INT CHECK (> 0)
+);
+```
+
+`id BOOLEAN DEFAULT TRUE CHECK (id)` pada dua tabel konfigurasi satu baris: tanpa
+penjaga itu akan ada baris kedua yang tidak pernah terbaca, lalu seseorang menyunting
+yang salah.
+
+**Versi katalog di Postgres, bukan hanya di Redis.** Redis adalah cache: restart atau
+eviction menghapusnya, sementara `ETag` yang sudah dipegang client — dan
+`product_catalog_version` yang sudah tersimpan di baris sesi — tetap merujuk versi itu.
+Alasan yang sama dengan `card_catalog_version`.
+
+### Dua kolom jejak di `onboarding_sessions`
+
+```sql
+ALTER TABLE onboarding_sessions
+    ADD COLUMN product_catalog_version   TEXT,
+    ADD COLUMN min_initial_deposit_shown BIGINT;
+```
+
+Setoran awal yang **dilihat** nasabah, beserta versi katalog yang menampilkannya. Yang
+perlu dibuktikan saat sengketa adalah angka saat itu, bukan angka hari ini — alasan yang
+sama dengan `monthly_admin_fee_shown` pada `onboarding_card_selection_log`. Setoran awal
+adalah komitmen 30 hari kalender yang disebut pasal 4 S&K.
+
+**Dua kolom, bukan tabel log:** produk dipilih sekali dan sesi lahir sesudahnya — tidak
+ada jalur perubahan yang perlu dirunut, berbeda dari kartu yang bisa diganti lewat
+`PUT /sessions/{id}/card`.
+
+**Keduanya nullable, dan `NULL` adalah keadaan sah.** APK lama tidak mengenal katalog ini
+sama sekali, dan katalog yang mati tidak boleh mematikan `POST /sessions`.
+
+> **Angka `min_initial_deposit` dan teks `name`/`description`/`features` di migrasi
+> `000039` adalah DATA DESAIN**, disalin apa adanya dari `strings.xml` repo Android —
+> **bukan tarif resmi BCA**. Lihat `COMMENT ON TABLE onboarding_products`. Pola yang sama
+> dengan `000025_onboarding_tnc`.
+
+---
+
 ## Backup Strategy
 
 ```

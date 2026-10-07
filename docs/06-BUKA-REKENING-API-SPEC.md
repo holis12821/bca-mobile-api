@@ -105,6 +105,227 @@ memperpanjangnya; setelah lewat, semua endpoint menjawab
 
 ---
 
+## 0a. Katalog Jenis Rekening
+
+Layar **pertama** buka rekening — tampil sebelum S&K, sebelum kartu, sebelum sesi lahir.
+
+```
+GET /v1/onboarding/products
+X-Device-Id: <device_id>
+```
+
+Publik: tanpa `Authorization`, tanpa `session_id`. Tidak ada query parameter.
+
+Sebelum endpoint ini ada, isi layar hidup sebagai 16 entri `strings.xml` di dalam APK.
+Tiga akibatnya: setoran awal yang **dilihat** nasabah tidak punya arsip, produk tidak
+bisa ditutup tanpa rilis aplikasi, dan client memilih produk berdasarkan **posisi
+array** — yang membuat nasabah membuka rekening yang bukan pilihannya begitu server
+mengurutkan atau menyembunyikan satu produk, tanpa error di mana pun.
+
+### Response `200 OK`
+
+```json
+{
+  "status": "success",
+  "data": {
+    "catalog_version": "2026-10-07.1",
+    "page": {
+      "heading": "Pilih Jenis Rekening",
+      "subtitle": "Pilih jenis rekening yang sesuai dengan kebutuhan dan gaya hidup Anda.",
+      "deposit_label": "Setoran Awal Minimum",
+      "cta_label": "Lanjut",
+      "notice": {
+        "icon_key": "INFO",
+        "title": "Persiapan Dokumen",
+        "body": "Siapkan e-KTP fisik Anda dan pastikan berada di area dengan koneksi internet yang stabil untuk kelancaran video verifikasi."
+      },
+      "consent": {
+        "prefix": "Dengan melanjutkan, Anda menyetujui ",
+        "link": "Syarat & Ketentuan",
+        "suffix": " pembukaan rekening BCA."
+      }
+    },
+    "products": [
+      {
+        "product_type": "TAHAPAN_BCA",
+        "name": "Tahapan BCA",
+        "description": "Tabungan utama untuk kemudahan transaksi harian dan proteksi finansial keluarga.",
+        "min_initial_deposit": 500000,
+        "currency": "IDR",
+        "icon_key": "WALLET",
+        "style": "PRIMARY",
+        "features": [
+          "Debit Mastercard",
+          "m-BCA & KlikBCA",
+          "Bebas tarik tunai di ribuan ATM"
+        ],
+        "is_popular": true,
+        "badge_key": "MOST_POPULAR",
+        "is_default": true,
+        "display_order": 1,
+        "availability_status": "AVAILABLE",
+        "availability_reason_key": null
+      }
+    ]
+  },
+  "meta": { "request_id": "..." }
+}
+```
+
+**`product_type` adalah satu-satunya identitas produk.** Response ini tidak pernah
+menuntut client menyimpulkan produk dari posisi array. Urutan tampilan ada di
+`display_order`, dan `display_order` **bukan** identitas — server boleh mengubahnya
+tanpa mengubah produk mana pun.
+
+**`min_initial_deposit` integer rupiah penuh**, bukan string terformat: `500000`, bukan
+`"Rp 500.000"`. Pemformatan milik client.
+
+**`page` ikut dilayani** supaya mengubah judul, label setoran, atau isi kotak Persiapan
+Dokumen tidak menuntut rilis APK — sejajar dengan `GET /onboarding/tnc` yang sudah
+melayani `heading`/`subtitle`/`agree_cta` miliknya sendiri.
+
+**`consent` dipecah tiga** dengan alasan yang sama seperti `TNCConsent`: bagian
+tengahnya dicetak tebal dan berwarna oleh aplikasi. Satu kalimat utuh memaksa client
+mencari substring, dan substring itu pecah pada setiap perbaikan kata.
+
+### Enum yang dikenal client
+
+| Field | Nilai sah | Dipetakan client ke |
+|---|---|---|
+| `icon_key` | `WALLET`, `CARD`, `SAVINGS` | `ic_account_balance_wallet`, `ic_credit_card`, `ic_savings` |
+| `page.notice.icon_key` | `INFO` | `ic_info` |
+| `style` | `PRIMARY`, `SECONDARY`, `NEUTRAL` | pasangan token `AppColor.*100`/`*900` |
+| `badge_key` | `MOST_POPULAR`, `null` | teks badge sudut kartu |
+| `availability_status` | `AVAILABLE`, `DISABLED`, `COMING_SOON` | kartu redup + alasan |
+| `availability_reason_key` | `TEMPORARILY_DISABLED`, `MAINTENANCE`, `COMING_SOON`, `null` | kalimat alasan |
+
+**Payload tidak memuat nilai visual.** Tidak ada hex, gradient, nama drawable, atau URL
+gambar — hanya enum `icon_key` dan `style`. Mengirim hex membuat client melanggar aturan
+design token di repo Android.
+
+Nilai di luar daftar harus **diabaikan dengan aman** oleh client: ikon bawaan, kartu
+tetap terbaca, tidak crash. Menambah nilai baru berarti memperbarui tabel ini **dan**
+`.claude/skills/buka-rekening-produk/references/verification.md` di commit yang sama —
+kalau tidak, client lama menampilkan kartu tanpa ikon tanpa ada yang tahu.
+
+### Produk yang tutup tetap tampil
+
+`ONBOARDING_PRODUCTS_MAINTENANCE=TABUNGANKU` membuat produk itu dijawab dengan
+`availability_status: "DISABLED"` dan `availability_reason_key: "MAINTENANCE"` — **tetap
+di daftar**, bukan menghilang dan bukan membuat seluruh endpoint `422`. Nasabah perlu
+tahu produk itu ada dan sedang tutup, bukan bingung karena pilihannya lenyap.
+
+Urutannya juga tidak berubah: produk tutup **tidak** dipindah ke bawah. Urutan adalah
+keputusan product owner, dan memindahkannya sendiri berarti layar menyusun ulang dirinya
+tanpa ada yang memintanya.
+
+Status dari database tidak ditimpa kalau ia sudah bukan `AVAILABLE`: produk yang ditandai
+`COMING_SOON` punya alasan yang lebih tepat daripada `MAINTENANCE`.
+
+### Caching
+
+| Hal | Nilai |
+|---|---|
+| `ETag` | `"products-<catalog_version>"` |
+| `Cache-Control` | `public, max-age=300` |
+| `If-None-Match` cocok | `304` **tanpa body** — termasuk tanpa envelope |
+
+`ETag` dibangun dari versi yang **benar-benar dilayani**, bukan dari apa pun yang datang
+di request. ETag dari nilai request akan membuat client terus menerima `304` berisi
+setoran awal lama.
+
+Lima menit di client, bukan 24 jam seperti TTL cache server: client yang menahan katalog
+lebih lama hanya menampilkan setoran awal yang keliru — dan setoran awal adalah komitmen
+30 hari kalender yang disebut pasal 4 S&K.
+
+### Rate limit
+
+Bucket **sendiri**: 30 per 5 menit per `X-Device-Id`, berlapis plafon 600/jam per IP.
+
+Bukan menumpang bucket S&K atau katalog kartu: flow Android memuat ketiganya pada tiga
+layar berurutan, jadi bucket bersama berarti ketiga endpoint saling menghabiskan jatah dan
+nasabah menerima `429` di tengah pendaftaran.
+
+Rutenya didaftarkan **di luar** grup ber-limit-IP milik endpoint bersesi, sama seperti
+`/tnc` dan `/products/{product_type}/cards`: batas itu ada untuk mencegah penelusuran
+`session_id` dan pemerasan OTP, yang tidak berlaku untuk daftar publik dan cacheable.
+
+### Error Codes
+
+| Kondisi | Respons |
+|---|---|
+| `X-Device-Id` kosong | `400 VALIDATION_ERROR`, `details.missing_header: "X-Device-Id"` |
+| Tidak ada satu pun produk aktif | `503 ONBOARDING_CATALOG_UNAVAILABLE` |
+| `FEATURE_ONBOARDING_PRODUCT_CATALOG=false` | `503 ONBOARDING_CATALOG_UNAVAILABLE` |
+| Melewati rate limit | `429 RATE_LIMIT_EXCEEDED` + `Retry-After` |
+
+`X-Device-Id` **diwajibkan** di sini, berbeda dari `GET /onboarding/tnc` yang
+membolehkannya kosong. Bedanya bukan selera: rate limit endpoint ini per device, dan tanpa
+header itu seluruh nasabah di belakang satu NAT operator berbagi satu jatah. Teks S&K sama
+untuk semua perangkat sehingga jatuh ke IP tidak merugikan siapa pun.
+
+`503` dan **bukan** daftar kosong: daftar kosong akan membuat client menampilkan layar
+tanpa pilihan dan nasabah berhenti di layar pertama tanpa tahu kenapa. `503` adalah
+sinyal untuk jatuh ke daftar bawaan di `strings.xml`.
+
+`GET /v1/onboarding/products/{product_type}` (satu produk) **sengaja tidak dibuat**: layar
+hanya butuh daftar, dan rute itu bertabrakan secara visual dengan
+`/products/{product_type}/cards` milik katalog kartu.
+
+### Jejak di baris sesi
+
+`POST /v1/onboarding/sessions` menyimpan dua kolom dari katalog yang sedang berlaku:
+
+| Kolom | Isi |
+|---|---|
+| `product_catalog_version` | versi katalog yang dilihat nasabah |
+| `min_initial_deposit_shown` | setoran awal yang ditampilkan untuk produk pilihannya |
+
+Keduanya diambil dari katalog **server**, bukan dari body. Berbeda dari
+`accepted_tnc_version` yang memang harus datang dari client karena ia bukti persetujuan,
+angka ini adalah apa yang server tampilkan — menerimanya dari client berarti membiarkan
+yang disengketakan menentukan bukti sengketanya.
+
+Yang perlu dibuktikan saat sengketa adalah angka **saat itu**, bukan angka hari ini —
+alasan yang sama dengan `monthly_admin_fee_shown` pada `onboarding_card_selection_log`.
+
+Keduanya **nullable**, dan `NULL` adalah keadaan sah: APK lama tidak mengenal katalog ini
+sama sekali, dan katalog yang mati **tidak boleh** mematikan `POST /sessions`. Validasi
+`product_type` di sana tidak berubah — tetap `pt.Valid()` lalu cek maintenance, dan tidak
+pernah menuntut baris `onboarding_products` ada.
+
+### Mengubah katalog
+
+Isi katalog ikut **migrasi**, bukan seeder: seeder menolak jalan di luar
+`APP_ENV=development`, jadi staging akan menjawab layar kosong. Pelajaran dari `000025`.
+
+Sesudah mengubahnya, naikkan `onboarding_product_catalog_version.counter` **dan** hapus
+kunci cache aktifnya:
+
+```sql
+UPDATE onboarding_product_catalog_version
+SET counter = counter + 1, version_date = CURRENT_DATE, updated_at = now()
+WHERE id;
+```
+
+```bash
+redis-cli -n 0 DEL onboarding:products:v1:catalog
+```
+
+`DEL` itu **wajib**, bukan opsional. Kenaikan versi mengubah `ETag` yang akan dilayani,
+tapi entri `onboarding:products:v1:catalog` punya TTL 24 jam dan akan terus melayani isi
+lama sampai TTL-nya habis — termasuk `catalog_version` lamanya. Keterbatasan yang sama
+dengan `onboarding:tnc:v1:active`.
+
+> **Angka setoran awal di database saat ini adalah DATA DESAIN**, disalin apa adanya dari
+> `strings.xml` repo Android (500.000 / 50.000 / 20.000) supaya nasabah tidak melihat
+> perubahan kata saat katalog dinyalakan. **Bukan tarif resmi BCA.** Begitu juga teks
+> `name`, `description`, dan `features[]`. Ketiganya wajib diganti angka dan teks resmi
+> dari product owner sebelum dipakai di produksi — lihat `COMMENT ON TABLE
+> onboarding_products` di migrasi `000039`.
+
+---
+
 ## 0b. Syarat & Ketentuan
 
 ```

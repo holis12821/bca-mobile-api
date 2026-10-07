@@ -176,6 +176,21 @@ type Client struct {
 	// jadi menyalakannya adalah keputusan sadar, bukan bawaan.
 	CardSelectionEnabled bool `env:"FEATURE_CARD_SELECTION" envDefault:"false"`
 
+	// ProductCatalogEnabled adalah feature flag katalog jenis rekening. Mati berarti
+	// GET /v1/onboarding/products menjawab 503 ONBOARDING_CATALOG_UNAVAILABLE dan
+	// client jatuh ke daftar bawaannya di strings.xml — layar tetap berfungsi penuh,
+	// tanpa rollback deployment.
+	//
+	// Matinya katalog TIDAK BOLEH mematikan POST /sessions: validasi product_type di
+	// sana tetap pt.Valid() + cek maintenance, dan tidak pernah menuntut baris
+	// onboarding_products ada.
+	//
+	// Default true, berbeda dari CardSelectionEnabled: isi katalog ini disalin apa
+	// adanya dari strings.xml, jadi menyalakannya tidak mengubah satu kata pun yang
+	// dilihat nasabah. Yang belum resmi adalah ANGKA setoran awalnya — itu ditandai di
+	// komentar migrasi 000039, bukan dengan mematikan endpointnya.
+	ProductCatalogEnabled bool `env:"FEATURE_ONBOARDING_PRODUCT_CATALOG" envDefault:"true"`
+
 	// CardLegacyAppVersion adalah ambang X-App-Version untuk fallback client
 	// lama (§7 butir 6): build di bawah ambang ini tidak mengenal langkah
 	// CARD_SELECTION, jadi sesinya dibuatkan kartu default produk dan langsung

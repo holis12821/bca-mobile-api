@@ -132,6 +132,20 @@ type Session struct {
 	CardType           string     `json:"-"`
 	CardSelectedAt     *time.Time `json:"-"`
 	CardCatalogVersion string     `json:"-"`
+
+	// ProductCatalogVersion dan MinInitialDepositShown adalah JEJAK: angka setoran awal
+	// yang DILIHAT nasabah saat ia memilih produk, beserta versi katalog yang
+	// menampilkannya.
+	//
+	// Yang perlu dibuktikan saat sengketa adalah angka saat itu, bukan angka hari ini —
+	// alasan yang sama dengan monthly_admin_fee_shown pada onboarding_card_selection_log.
+	// Setoran awal adalah komitmen 30 hari kalender yang disebut pasal 4 S&K.
+	//
+	// Kosong/0 adalah keadaan SAH: APK lama tidak mengenal katalog, dan katalog yang
+	// mati tidak boleh mematikan pembuatan sesi. `json:"-"` karena ini bukan bagian
+	// kontrak client.
+	ProductCatalogVersion  string `json:"-"`
+	MinInitialDepositShown int64  `json:"-"`
 }
 
 // IsExpired checks whether the session has passed its expiration time.
@@ -167,6 +181,16 @@ type ProductInfo struct {
 }
 
 // ProductCatalog maps product types to their info.
+//
+// HARDCODED, dan sekarang bukan satu-satunya: migrasi 000039 menaruh daftar yang sama
+// di onboarding_products, yang dilayani GET /v1/onboarding/products lewat
+// [SavingsProductCatalog]. Keduanya hidup bersamaan dan teks fiturnya BERBEDA — map ini
+// menyebut "Paspor BCA Mastercard Debit", katalog yang dilayani menyebut
+// "Debit Mastercard" (nilai yang benar-benar dilihat nasabah di layar).
+//
+// Map ini masih dibaca response POST /sessions, GET /sessions/{id}, submit, dan
+// provisioning core banking. Menyatukannya ke tabel adalah pekerjaan tersendiri:
+// empat pemanggil, dan jalur submit tidak boleh ikut mati kalau katalog mati.
 var ProductCatalog = map[ProductType]ProductInfo{
 	ProductTahapanBCA: {
 		Type:              ProductTahapanBCA,
@@ -1830,4 +1854,138 @@ type TNCDocument struct {
 	// is_active=false TIDAK boleh menawarkan tombol setuju: persetujuannya
 	// akan ditolak saat sesi dibuat.
 	IsActive bool `json:"is_active"`
+}
+
+// --- Katalog jenis rekening tabungan (layar PERTAMA buka rekening) ---
+
+// Nilai enum tampilan yang dikenal client. Nilai di luar daftar ini harus diabaikan
+// dengan aman oleh client — ikon bawaan, kartu tetap terbaca. Menambah nilai baru
+// berarti memperbarui tabel enum di SKILL.md DAN references/verification.md di commit
+// yang sama; kalau tidak, client lama menampilkan kartu tanpa ikon tanpa ada yang tahu.
+const (
+	ProductIconWallet  = "WALLET"
+	ProductIconCard    = "CARD"
+	ProductIconSavings = "SAVINGS"
+
+	ProductStylePrimary   = "PRIMARY"
+	ProductStyleSecondary = "SECONDARY"
+	ProductStyleNeutral   = "NEUTRAL"
+
+	ProductBadgeMostPopular = "MOST_POPULAR"
+)
+
+// Status ketersediaan produk. Produk yang tutup TETAP muncul di daftar — nasabah perlu
+// tahu produk itu ada dan sedang tutup, bukan bingung karena pilihannya lenyap.
+const (
+	ProductAvailable  = "AVAILABLE"
+	ProductDisabled   = "DISABLED"
+	ProductComingSoon = "COMING_SOON"
+)
+
+// Alasan kenapa sebuah produk tidak bisa dipilih. Dikirim sebagai KEY, bukan kalimat:
+// client yang sudah menerjemahkannya tidak ikut berubah saat katanya diperbaiki.
+const (
+	ProductReasonTemporarilyDisabled = "TEMPORARILY_DISABLED"
+	ProductReasonMaintenance         = "MAINTENANCE"
+	ProductReasonComingSoon          = "COMING_SOON"
+)
+
+// SavingsProductCatalog adalah jawaban GET /v1/onboarding/products.
+//
+// BUKAN bernama ProductCatalog karena nama itu sudah dipakai map Go hardcoded di atas
+// (baris ~170) yang dibaca jalur sesi, submit, dan provisioning. Map itu sumber
+// kebenaran lain untuk daftar produk yang sama, dengan teks fitur yang BERBEDA dari
+// strings.xml — lihat catatan di ProductCatalog. Tipe ini tidak menggantikannya;
+// menggantinya adalah pekerjaan tersendiri yang menyentuh empat pemanggil.
+type SavingsProductCatalog struct {
+	// CatalogVersion ikut tersimpan di baris sesi sebagai bukti katalog mana yang
+	// dilihat nasabah, dan menjadi ETag endpoint ini.
+	CatalogVersion string `json:"catalog_version"`
+
+	// Page dilayani server supaya mengubah judul, label setoran, atau isi kotak
+	// Persiapan Dokumen tidak menuntut rilis APK.
+	Page ProductPage `json:"page"`
+
+	Products []ProductOption `json:"products"`
+}
+
+// ProductOption adalah satu kartu jenis rekening di layar.
+type ProductOption struct {
+	// ProductType adalah SATU-SATUNYA identitas produk. Response ini tidak pernah
+	// menuntut client menyimpulkan produk dari posisi array — itu kopling yang
+	// membuat nasabah membuka rekening yang bukan pilihannya begitu server
+	// mengurutkan atau menyembunyikan satu produk.
+	ProductType ProductType `json:"product_type"`
+
+	Name        string `json:"name"`
+	Description string `json:"description"`
+
+	// MinInitialDeposit rupiah penuh sebagai integer: 500000, bukan "Rp 500.000".
+	// Pemformatan milik client.
+	MinInitialDeposit int64  `json:"min_initial_deposit"`
+	Currency          string `json:"currency"`
+
+	// IconKey dan Style adalah enum, bukan nilai visual. Tidak ada hex, gradient,
+	// nama drawable, atau URL gambar — client memetakannya ke drawable dan design
+	// token. Mengirim hex membuat client melanggar aturan token repo Android.
+	IconKey string `json:"icon_key"`
+	Style   string `json:"style"`
+
+	Features []string `json:"features"`
+
+	// IsPopular menggantikan POPULAR_PRODUCT_INDEX di client: badge "Paling Populer"
+	// milik data, bukan posisi array.
+	IsPopular bool `json:"is_popular"`
+
+	// BadgeKey nil-able lewat pointer supaya JSON-nya `null`, bukan string kosong —
+	// client membedakan "tidak ada badge" dari "badge tanpa teks".
+	BadgeKey *string `json:"badge_key"`
+
+	// IsDefault menandai kartu yang terpilih saat layar dibuka. Maksimum satu,
+	// ditegakkan unique index.
+	IsDefault bool `json:"is_default"`
+
+	// DisplayOrder adalah urutan TAMPILAN, dan ia bukan identitas.
+	DisplayOrder int `json:"display_order"`
+
+	// AvailabilityStatus selain AVAILABLE membuat kartu tidak bisa dipilih tapi TETAP
+	// tampil, dengan alasannya.
+	AvailabilityStatus    string  `json:"availability_status"`
+	AvailabilityReasonKey *string `json:"availability_reason_key"`
+}
+
+// Selectable melaporkan apakah produk ini boleh dipilih nasabah.
+//
+// Dihitung di sini, bukan di client: aturan "hanya AVAILABLE yang bisa dipilih" adalah
+// aturan server, dan client yang menyimpulkannya dari string status bisa menyimpulkan
+// sebaliknya.
+func (p ProductOption) Selectable() bool {
+	return p.AvailabilityStatus == ProductAvailable
+}
+
+// ProductPage adalah copy layar Pilih Jenis Rekening.
+type ProductPage struct {
+	Heading      string `json:"heading"`
+	Subtitle     string `json:"subtitle"`
+	DepositLabel string `json:"deposit_label"`
+	CTALabel     string `json:"cta_label"`
+
+	Notice  ProductNotice  `json:"notice"`
+	Consent ProductConsent `json:"consent"`
+}
+
+// ProductNotice adalah kotak "Persiapan Dokumen" di bawah daftar produk.
+type ProductNotice struct {
+	IconKey string `json:"icon_key"`
+	Title   string `json:"title"`
+	Body    string `json:"body"`
+}
+
+// ProductConsent dipecah TIGA dengan alasan yang sama seperti TNCConsent: bagian
+// tengahnya dicetak tebal dan berwarna oleh aplikasi. Satu kalimat utuh memaksa client
+// mencari substring, dan substring itu pecah pada setiap perbaikan kata.
+type ProductConsent struct {
+	Prefix string `json:"prefix"`
+	Link   string `json:"link"`
+	Suffix string `json:"suffix"`
 }

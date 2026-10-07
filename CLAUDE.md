@@ -49,6 +49,7 @@ untuk pekerjaan mendalam:
 | `buka-rekening-video-call-backend` | video call e-KYC — antrean, WebSocket signaling, siklus panggilan, sisi CS |
 | `buka-rekening-otp` | OTP onboarding — penerbitan, verifikasi, blokir, kirim ulang |
 | `buka-rekening-kartu` | katalog kartu + pemilihan kartu pada flow buka rekening |
+| `buka-rekening-produk` | katalog jenis rekening tabungan — `GET /v1/onboarding/products`, setoran awal minimum, fitur produk, copy layar Pilih Jenis Rekening |
 | `profil-saya-kartu-api` | kartu milik nasabah, `tier`, konten Pusat Bantuan & Kontak CS |
 | `push-notification-api` | `POST /account/device/push-token`, `internal/pkg/notify` + `push`, filter `type` notifikasi, transport FCM |
 | `twilio-sms-otp` | setup & integrasi provider SMS: kredensial Twilio, `SMS_*`, `internal/pkg/sms`, normalisasi E.164, menelusuri OTP yang tidak sampai |

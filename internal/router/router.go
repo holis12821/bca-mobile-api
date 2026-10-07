@@ -433,6 +433,20 @@ func New(deps Deps) (http.Handler, error) {
 		Cache: redisrepo.NewOnboardingTNCCache(deps.RedisCache),
 	})
 
+	// Katalog jenis rekening: layar PERTAMA, dibaca sebelum S&K dan sebelum sesi ada —
+	// alasan yang sama kenapa ia service sendiri, bukan bagian SessionService.
+	//
+	// UnderMaintenance dibaca dari env yang SAMA dengan katalog kartu
+	// (ONBOARDING_PRODUCTS_MAINTENANCE), tapi dijawab berbeda: produk yang tutup tetap
+	// MUNCUL di daftar dengan availability_status DISABLED, bukan menghilang dan bukan
+	// membuat seluruh endpoint 422. Nasabah perlu tahu produk itu ada dan sedang tutup.
+	onboardingProductService := onboarding.NewProductService(onboarding.ProductServiceConfig{
+		Repo:             postgres.NewOnboardingProductRepo(deps.DB),
+		Cache:            redisrepo.NewOnboardingProductCache(deps.RedisCache),
+		Enabled:          clientCfg.ProductCatalogEnabled,
+		UnderMaintenance: clientCfg.ProductUnderMaintenance,
+	})
+
 	onboardingVideoCallRepo := postgres.NewOnboardingVideoCallRepo(deps.DB)
 
 	// Registry petugas CS. Interface-nya, bukan tipe konkretnya: tanpa database —
@@ -485,6 +499,7 @@ func New(deps Deps) (http.Handler, error) {
 		Audit:            onboardingAuditRepo,
 		Cards:            cardService,
 		TNC:              tncService,
+		Products:         onboardingProductService,
 		LegacyAppVersion: clientCfg.CardLegacyAppVersion,
 		VideoCalls:       videoCallService,
 	})
@@ -687,7 +702,7 @@ func New(deps Deps) (http.Handler, error) {
 	cardAdminH := handler.NewCardAdminHandler(
 		onboarding.NewCardAdminService(cardRepo, cardCache))
 
-	onboardingH := handler.NewOnboardingHandler(onboardingSessionService, ocrService, personalDataService, biometricService, videoCallService, credentialService, submitService, monitoringService, tncService, deps.PINKeys)
+	onboardingH := handler.NewOnboardingHandler(onboardingSessionService, ocrService, personalDataService, biometricService, videoCallService, credentialService, submitService, monitoringService, tncService, onboardingProductService, deps.PINKeys)
 
 	uploadDir := "uploads"
 	if deps.Config != nil && deps.Config.UploadDir != "" {
@@ -779,6 +794,35 @@ func New(deps Deps) (http.Handler, error) {
 					cardCatalogIPRateLimit, cardCatalogIPRateWindow, false))
 
 				r.Get("/products/{product_type}/cards", cardH.GetCatalog)
+			})
+
+			// Katalog jenis rekening: layar PERTAMA, sebelum S&K. Publik, tanpa
+			// session_id dan tanpa Authorization.
+			//
+			// Sengaja DI LUAR grup ber-limit-IP di bawah, sama seperti /tnc dan
+			// /products/{product_type}/cards: batas IP itu ada untuk mencegah
+			// penelusuran session_id dan pemerasan OTP, yang tidak berlaku untuk daftar
+			// produk yang publik dan cacheable.
+			//
+			// Jatahnya SENDIRI, bukan menumpang bucket S&K atau katalog kartu. Flow
+			// Android memuat ketiganya pada tiga layar berurutan, jadi bucket bersama
+			// berarti ketiga endpoint saling menghabiskan jatah dan nasabah menerima 429
+			// di tengah pendaftaran.
+			//
+			// Didaftarkan di grup terpisah dari /products/{product_type}/cards meski
+			// prefix-nya sama: chi mencocokkan pola statis lebih dulu, jadi /products
+			// tidak pernah tertelan oleh pola ber-parameter di atasnya. Keduanya diuji
+			// berdampingan di router_test.
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.RateLimit(rateLimiter, productCatalogRateKey,
+					productCatalogRateLimit, productCatalogRateWindow, false))
+				// Per-IP di atasnya dengan alasan yang sama seperti katalog kartu: batas
+				// per-device sendirian bisa dilewati dengan memutar X-Device-Id, dan
+				// setiap permintaan yang lolos membaca katalog utuh dari cache.
+				r.Use(middleware.RateLimit(rateLimiter, productCatalogIPRateKey,
+					productCatalogIPRateLimit, productCatalogIPRateWindow, false))
+
+				r.Get("/products", onboardingH.GetProducts)
 			})
 
 			// S&K dibaca pada layar PERTAMA buka rekening — sebelum sesi ada,
@@ -1334,6 +1378,45 @@ func setCardRateKey(r *http.Request) string {
 		return "rate:cards:set:ip:" + middleware.ClientIP(r)
 	}
 	return "rate:cards:set:session:" + sessionID
+}
+
+// Katalog jenis rekening: 30 per 5 menit per device.
+//
+// Angkanya mengikuti S&K, bukan katalog kartu (60/jam), karena pemakaiannya mirip S&K:
+// satu layar yang dibuka sekali per pendaftaran dengan isi yang di-cache 5 menit di
+// client. Bucket-nya sendiri — lihat alasannya di titik pendaftaran rute.
+const (
+	productCatalogRateLimit  = 30
+	productCatalogRateWindow = 5 * time.Minute
+)
+
+// productCatalogRateKey membatasi per X-Device-Id, dan jatuh ke IP bila headernya tidak
+// ada.
+//
+// Cabang IP itu hanya jaring pengaman: GetProducts MENOLAK 400 tanpa X-Device-Id, jadi
+// permintaan tanpa header tidak pernah sampai ke handler. Cabangnya tetap ada supaya
+// penolakan itu sendiri ikut berbatas — tanpa itu, permintaan tanpa header bisa diulang
+// tanpa henti dan semuanya berbagi satu kunci kosong.
+func productCatalogRateKey(r *http.Request) string {
+	if deviceID := strings.TrimSpace(r.Header.Get("X-Device-Id")); deviceID != "" {
+		return "rate:products:device:" + deviceID
+	}
+	return "rate:products:ip:" + middleware.ClientIP(r)
+}
+
+// Plafon per-IP di atas batas per-device, alasan yang sama dengan
+// cardCatalogIPRateLimit: X-Device-Id dipilih client, jadi memutarnya setiap permintaan
+// melewati batas per-device sepenuhnya.
+//
+// Longgar dengan sengaja — pemakai m-BCA berbagi alamat di belakang NAT operator, dan
+// batas per-IP yang ketat akan memutus nasabah yang wajar.
+const (
+	productCatalogIPRateLimit  = 600
+	productCatalogIPRateWindow = time.Hour
+)
+
+func productCatalogIPRateKey(r *http.Request) string {
+	return "rate:products:ip:" + middleware.ClientIP(r)
 }
 
 // S&K: 30 per 5 menit. Layarnya dibuka sekali per pendaftaran dan isinya
