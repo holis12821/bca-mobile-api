@@ -489,10 +489,13 @@ func TestSubmitResult_Rejected(t *testing.T) {
 	joinResp, _ := svc.JoinQueue(ctx, JoinQueueRequest{SessionID: sessionID}, "127.0.0.1", "test")
 	pickUpCall(t, svc, joinResp.QueueID, testAgent)
 
+	// RejectionReason wajib dan ber-enum sejak §38: penolakan tanpa alasan
+	// terstruktur tidak bisa dilaporkan maupun dihitung.
 	resp, err := svc.SubmitResult(ctx, SubmitVideoCallResultRequest{
-		SessionID: sessionID,
-		QueueID:   joinResp.QueueID,
-		Result:    "REJECTED",
+		SessionID:       sessionID,
+		QueueID:         joinResp.QueueID,
+		Result:          "REJECTED",
+		RejectionReason: string(RejectIdentityMismatch),
 	}, testAgent, "127.0.0.1", "test")
 
 	if err != nil {
