@@ -68,11 +68,20 @@ func (r *OnboardingSessionRepo) FindBySessionID(ctx context.Context, sessionID s
 	var s onboarding.Session
 	var pt, step string
 	var stepsJSON []byte
-	var cardType, cardCatalogVersion *string
+	var cardType, cardCatalogVersion, tncVersion *string
 
+	// tnc_version lewat *string, bukan langsung ke field string-nya — alasan yang SAMA
+	// dengan ListForCS di bawah, dan di sini akibatnya lebih luas: jalur ini dipanggil
+	// oleh deviceOwnsSession, jadi satu baris dengan tnc_version NULL membuat SETIAP
+	// endpoint onboarding untuk sesi itu menjawab 500 permanen — bukan hanya satu daftar.
+	//
+	// Kolomnya nullable sejak migrasi 000010 dan sesi yang dibuat lewat API selalu
+	// mengisinya, jadi kegagalannya hanya muncul pada baris lama atau baris yang ditulis
+	// di luar jalur biasa. Itu tepat baris yang sedang ditelusuri orang ketika ia butuh
+	// endpointnya bekerja.
 	err := r.pool.QueryRow(ctx, query, sessionID).Scan(
 		&s.ID, &s.SessionID, &s.DeviceID,
-		&pt, &step, &s.TNCVersion,
+		&pt, &step, &tncVersion,
 		&stepsJSON,
 		&s.CreatedAt, &s.UpdatedAt, &s.ExpiresAt, &s.DeletedAt,
 		&cardType, &s.CardSelectedAt, &cardCatalogVersion,
@@ -86,6 +95,9 @@ func (r *OnboardingSessionRepo) FindBySessionID(ctx context.Context, sessionID s
 
 	s.ProductType = onboarding.ProductType(pt)
 	s.CurrentStep = onboarding.Step(step)
+	if tncVersion != nil {
+		s.TNCVersion = *tncVersion
+	}
 	if cardType != nil {
 		s.CardType = *cardType
 	}
