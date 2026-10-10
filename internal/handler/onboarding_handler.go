@@ -57,7 +57,30 @@ type OnboardingHandler struct {
 	monitoringService   *onboarding.MonitoringService
 	tncService          *onboarding.TNCService
 	productService      *onboarding.ProductService
-	pinKeys             *crypto.RSAKeyPair
+
+	// productAdminService melayani /internal/v1/onboarding/products. Dipasang lewat
+	// SetProductAdminService, bukan lewat konstruktor: tambahan argumen ke-12 pada
+	// konstruktor posisional ini akan memaksa setiap pemanggil dan setiap test berubah
+	// untuk sebuah jalur yang hanya dipakai admin. Pola yang sama dengan
+	// card.Service.SetVerificationTokenConsumer.
+	//
+	// Nil berarti jalur admin menjawab 503, bukan panic.
+	productAdminService *onboarding.ProductAdminService
+
+	// livenessChallengeService menerbitkan tantangan liveness. Dipasang lewat
+	// SetLivenessChallengeService dengan alasan yang sama seperti
+	// productAdminService: konstruktor posisional ini sudah punya sebelas argumen,
+	// dan menambah satu lagi memaksa setiap test yang membangun handler berubah.
+	//
+	// Nil berarti endpoint tantangan menjawab 503, bukan panic.
+	livenessChallengeService *onboarding.LivenessChallengeService
+
+	pinKeys *crypto.RSAKeyPair
+}
+
+// SetLivenessChallengeService memasang penerbit tantangan liveness.
+func (h *OnboardingHandler) SetLivenessChallengeService(s *onboarding.LivenessChallengeService) {
+	h.livenessChallengeService = s
 }
 
 func NewOnboardingHandler(
@@ -151,6 +174,63 @@ func (h *OnboardingHandler) GetProducts(w http.ResponseWriter, r *http.Request) 
 	}
 
 	response.Success(w, r, http.StatusOK, catalog)
+}
+
+// SetProductAdminService memasang jalur tulis katalog produk. Lihat field-nya.
+func (h *OnboardingHandler) SetProductAdminService(s *onboarding.ProductAdminService) {
+	h.productAdminService = s
+}
+
+// AdminListProducts menangani GET /internal/v1/onboarding/products.
+//
+// Berbeda dari GetProducts yang melayani nasabah, dan bedanya bukan hanya penjaga:
+//
+//   - Tidak ada ETag dan tidak ada Cache-Control. Layar admin yang menerima 304 akan
+//     menyunting salinan yang mungkin dibuat sebelum penulisan terakhir, lalu
+//     mengirimkannya kembali — menulis ulang perubahan orang lain tanpa ada yang tahu.
+//   - Tidak menuntut X-Device-Id. Jatah rate limit di /internal/v1 bukan per perangkat
+//     nasabah, dan tidak ada aplikasi nasabah yang memanggil jalur ini.
+//   - Produk is_active = FALSE IKUT dikembalikan. Admin yang menyalakannya kembali
+//     harus bisa melihat barisnya.
+func (h *OnboardingHandler) AdminListProducts(w http.ResponseWriter, r *http.Request) {
+	if h.productAdminService == nil {
+		response.Err(w, r, apperr.OnboardingCatalogUnavailable)
+		return
+	}
+
+	catalog, err := h.productAdminService.ListProducts(r.Context())
+	if err != nil {
+		h.handleErr(w, r, "list admin product catalog failed", err)
+		return
+	}
+	response.Success(w, r, http.StatusOK, catalog)
+}
+
+// AdminWriteProducts menangani PUT /internal/v1/onboarding/products.
+//
+// Badan permintaan memakai decodeAdminBody, yang MENOLAK field yang tidak dikenal.
+// Alasannya sama dengan admin katalog kartu, dan di sini akibatnya lebih mahal: salah
+// tulis nama field pada katalog yang tayang ke nasabah akan diam-diam menulis nilai
+// default, dan "is_ative" yang terabaikan menonaktifkan produk tanpa ada yang meminta.
+func (h *OnboardingHandler) AdminWriteProducts(w http.ResponseWriter, r *http.Request) {
+	if h.productAdminService == nil {
+		response.Err(w, r, apperr.OnboardingCatalogUnavailable)
+		return
+	}
+
+	var body onboarding.ProductCatalogWriteRequest
+	if err := decodeAdminBody(r, &body); err != nil {
+		response.Err(w, r, apperr.From(err))
+		return
+	}
+
+	result, err := h.productAdminService.WriteProducts(
+		r.Context(), body, adminActor(r), extractIP(r))
+	if err != nil {
+		h.handleErr(w, r, "write admin product catalog failed", err)
+		return
+	}
+	response.Success(w, r, http.StatusOK, result)
 }
 
 func (h *OnboardingHandler) GetTNC(w http.ResponseWriter, r *http.Request) {
@@ -319,6 +399,10 @@ func (h *OnboardingHandler) ProcessOCR(w http.ResponseWriter, r *http.Request) {
 		SharpnessScore:  optionalFloat(r.FormValue("sharpness_score")),
 		GlareScore:      optionalFloat(r.FormValue("glare_score")),
 		CornersDetected: optionalInt(r.FormValue("corners_detected")),
+
+		// What the device's own recognizer read from this photo. Used only when
+		// no server-side OCR engine is configured, and validated either way.
+		ClientOCRText: r.FormValue("client_ocr_text"),
 	}
 
 	clientIP := extractIP(r)
@@ -434,9 +518,69 @@ func (h *OnboardingHandler) ResendOTP(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, r, http.StatusOK, resp)
 }
 
+// RequestLivenessChallenge handles POST /v1/onboarding/liveness/challenge
+//
+// The challenge — which movements, in which order — is minted here and nowhere
+// else. The client renders what it is given and never generates or reorders it.
+func (h *OnboardingHandler) RequestLivenessChallenge(w http.ResponseWriter, r *http.Request) {
+	if h.livenessChallengeService == nil {
+		// Fail closed: without an issuer there is no nonce, and without a nonce
+		// there is nothing to verify later.
+		response.Err(w, r, apperr.LivenessProviderUnavailable)
+		return
+	}
+
+	var req struct {
+		SessionID          string `json:"session_id"`
+		DeviceKeyID        string `json:"device_key_id"`
+		DevicePublicKey    string `json:"device_public_key"`
+		SignatureAlgorithm string `json:"signature_algorithm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if req.SessionID == "" || req.DevicePublicKey == "" || req.DeviceKeyID == "" {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+	if req.SignatureAlgorithm != "" && req.SignatureAlgorithm != livenessSignatureAlgorithm {
+		// Refusing early is kinder than minting a nonce the client will sign in a
+		// format this server cannot verify.
+		response.Err(w, r, apperr.LivenessDeviceKeyInvalid)
+		return
+	}
+
+	if !h.deviceOwnsSession(w, r, req.SessionID) {
+		return
+	}
+
+	challenge, err := h.livenessChallengeService.Issue(
+		r.Context(),
+		req.SessionID,
+		deviceIDHeader(r),
+		req.DeviceKeyID,
+		req.DevicePublicKey,
+		extractIP(r),
+		r.UserAgent(),
+	)
+	if err != nil {
+		h.handleErr(w, r, "issue liveness challenge failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, challenge)
+}
+
 // ProcessBiometric handles POST /v1/onboarding/biometric
+//
+// Decodes the evidence and hands it to the service. There is no part in this
+// request that states a result: the previous contract had `liveness_meta` with
+// `completed_actions`, which the client filled with a constant and the server
+// believed. `step_meta` here only orders the frames and timestamps them; the
+// server re-detects the pose in each frame itself.
 func (h *OnboardingHandler) ProcessBiometric(w http.ResponseWriter, r *http.Request) {
-	const maxBiometricUpload = 50 << 20 // 50 MB (face + frames)
+	const maxBiometricUpload = 50 << 20 // 50 MB (neutral frame + step frames)
 	r.Body = http.MaxBytesReader(w, r.Body, maxBiometricUpload)
 
 	if err := r.ParseMultipartForm(multipartMemory); err != nil {
@@ -449,59 +593,79 @@ func (h *OnboardingHandler) ProcessBiometric(w http.ResponseWriter, r *http.Requ
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
-
 	if !h.deviceOwnsSession(w, r, sessionID) {
 		return
 	}
 
-	// Read face_photo
-	faceFile, _, err := r.FormFile("face_photo")
-	if err != nil {
-		response.Err(w, r, apperr.ValidationError)
-		return
-	}
-	defer faceFile.Close()
-	faceData, err := io.ReadAll(faceFile)
+	neutralFrame, err := readUploadedFile(r, "neutral_frame")
 	if err != nil {
 		response.Err(w, r, apperr.ValidationError)
 		return
 	}
 
-	// Read liveness_frames (multiple files)
-	var livenessFrames [][]byte
-	if r.MultipartForm != nil && r.MultipartForm.File != nil {
-		for _, fh := range r.MultipartForm.File["liveness_frames"] {
-			// Stop at one past the domain's ceiling: the request is already
-			// doomed, and reading the rest only costs heap.
-			if len(livenessFrames) >= maxLivenessFramesRead {
-				break
-			}
-			f, err := fh.Open()
-			if err != nil {
-				continue
-			}
-			data, err := io.ReadAll(f)
-			f.Close()
-			if err != nil {
-				continue
-			}
-			livenessFrames = append(livenessFrames, data)
-		}
-	}
-
-	// Parse liveness_meta JSON
-	var meta onboarding.LivenessMeta
-	if metaStr := r.FormValue("liveness_meta"); metaStr != "" {
-		if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
+	var stepMeta []onboarding.LivenessStepMeta
+	if raw := r.FormValue("step_meta"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &stepMeta); err != nil {
 			response.Err(w, r, apperr.ValidationError)
 			return
 		}
 	}
 
-	clientIP := extractIP(r)
-	userAgent := r.UserAgent()
+	var risk onboarding.DeviceRiskSignals
+	if raw := r.FormValue("risk_signals"); raw != "" {
+		// Malformed risk signals do not fail the request: they are an input to
+		// review, not a decision, and an absent signal is handled the same way as
+		// a false one.
+		if err := json.Unmarshal([]byte(raw), &risk); err != nil {
+			slog.Warn("liveness risk_signals undecodable", "session_id", sessionID)
+		}
+	}
 
-	resp, err := h.biometricService.ProcessBiometric(r.Context(), sessionID, faceData, livenessFrames, meta, clientIP, userAgent)
+	frames := readLivenessFrames(r)
+	if len(frames) != len(stepMeta) {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	stepFrames := make([]onboarding.LivenessStepFrame, 0, len(frames))
+	for i, meta := range stepMeta {
+		if !meta.Action.Valid() {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+		stepFrames = append(stepFrames, onboarding.LivenessStepFrame{
+			Index:      meta.Index,
+			Action:     meta.Action,
+			CapturedAt: time.UnixMilli(meta.CapturedAtMillis).UTC(),
+			JPEG:       frames[i],
+		})
+	}
+
+	submission := &onboarding.LivenessSubmission{
+		SessionID:          sessionID,
+		ChallengeID:        r.FormValue("challenge_id"),
+		Nonce:              r.FormValue("nonce"),
+		DeviceID:           deviceIDHeader(r),
+		DeviceKeyID:        r.FormValue("device_key_id"),
+		DevicePublicKey:    r.FormValue("device_public_key"),
+		SignatureAlgorithm: r.FormValue("signature_algorithm"),
+		Signature:          r.FormValue("signature"),
+		NeutralFrame:       neutralFrame,
+		StepFrames:         stepFrames,
+		IntegrityToken:     r.FormValue("integrity_token"),
+		RiskSignals:        risk,
+	}
+
+	if submission.ChallengeID == "" || submission.Nonce == "" || submission.Signature == "" {
+		// All three are required. An unsigned submission is not verifiable, and
+		// accepting one "for now" is how the client-trusted path came back.
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	resp, err := h.biometricService.ProcessBiometric(
+		r.Context(), submission, extractIP(r), r.UserAgent(),
+	)
 	if err != nil {
 		h.handleErr(w, r, "process biometric failed", err)
 		return
@@ -509,6 +673,48 @@ func (h *OnboardingHandler) ProcessBiometric(w http.ResponseWriter, r *http.Requ
 
 	response.Success(w, r, http.StatusOK, resp)
 }
+
+// readUploadedFile reads one named file part fully into memory.
+func readUploadedFile(r *http.Request, field string) ([]byte, error) {
+	file, _, err := r.FormFile(field)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(file)
+}
+
+// readLivenessFrames reads the step frames in the order the client sent them.
+//
+// Order matters: it is what pairs each frame with its step_meta entry, and the
+// pairing is what the signature covers.
+func readLivenessFrames(r *http.Request) [][]byte {
+	if r.MultipartForm == nil || r.MultipartForm.File == nil {
+		return nil
+	}
+	var frames [][]byte
+	for _, fh := range r.MultipartForm.File["liveness_frames"] {
+		// Stop one past the ceiling: the request is already doomed, and reading
+		// the rest only costs heap.
+		if len(frames) >= maxLivenessFramesRead {
+			break
+		}
+		f, err := fh.Open()
+		if err != nil {
+			return nil
+		}
+		data, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			return nil
+		}
+		frames = append(frames, data)
+	}
+	return frames
+}
+
+// livenessSignatureAlgorithm is the only signature format this server verifies.
+const livenessSignatureAlgorithm = "EC-P256"
 
 // JoinVideoCallQueue handles POST /v1/onboarding/video-call/queue
 func (h *OnboardingHandler) JoinVideoCallQueue(w http.ResponseWriter, r *http.Request) {

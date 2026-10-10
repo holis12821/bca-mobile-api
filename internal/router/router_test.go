@@ -397,3 +397,142 @@ func TestOnboardingProductRoutes_BothRegistered(t *testing.T) {
 		t.Error("/products/{product_type} seharusnya tidak ada — lihat SKILL.md buka-rekening-produk")
 	}
 }
+
+// DoD Fase 6: rute admin katalog produk tidak terjangkau tanpa kunci sistem, dan tidak
+// terjangkau dengan kunci sistem saja.
+//
+// Dua lapis, dua kegagalan berbeda yang harus sama-sama ditutup: tanpa
+// X-Internal-API-Key, katalog yang tayang ke nasabah bisa diubah siapa pun yang bisa
+// menjangkau port-nya; dengan kunci sistem saja, perubahan setoran awal tidak bisa
+// ditanyakan ke orangnya karena satu secret yang sama dipakai seluruh integrasi CS.
+func TestAdminProductRoutes_RequireSystemKeyAndAgent(t *testing.T) {
+	const key = "s3cret-from-the-vault"
+	r := newTestRouter(t, productionLikeConfig(key))
+
+	const path = "/internal/v1/onboarding/products"
+
+	for _, method := range []string{http.MethodGet, http.MethodPut} {
+		t.Run(method+" tanpa kunci sistem", func(t *testing.T) {
+			req := httptest.NewRequest(method, path, strings.NewReader(`{"products":[]}`))
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != http.StatusForbidden {
+				t.Errorf("mau 403 tanpa X-Internal-API-Key, dapat %d", rr.Code)
+			}
+		})
+
+		t.Run(method+" dengan kunci sistem saja", func(t *testing.T) {
+			req := httptest.NewRequest(method, path, strings.NewReader(`{"products":[]}`))
+			req.Header.Set("X-Internal-API-Key", key)
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != http.StatusForbidden {
+				t.Errorf("mau 403 tanpa kredensial petugas, dapat %d", rr.Code)
+			}
+		})
+
+		t.Run(method+" dengan NPP yang tidak dibuktikan", func(t *testing.T) {
+			req := httptest.NewRequest(method, path, strings.NewReader(`{"products":[]}`))
+			req.Header.Set("X-Internal-API-Key", key)
+			req.Header.Set("X-Agent-Employee-ID", "OPS-2001")
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != http.StatusForbidden {
+				t.Errorf("mau 403 untuk NPP tanpa bukti, dapat %d", rr.Code)
+			}
+		})
+	}
+}
+
+// Jalur admin dan jalur nasabah hidup di PREFIX yang berbeda, dan keduanya harus benar
+// benar terdaftar.
+//
+// /v1/onboarding/products dan /internal/v1/onboarding/products punya path yang mirip
+// sampai prefix-nya, dan jawabannya berbeda bentuk — yang admin memuat is_active dan
+// tidak memuat copy halaman. Satu yang menelan yang lain berarti layar admin menyunting
+// bentuk nasabah, atau nasabah menerima kolom is_active yang bukan urusannya.
+func TestAdminProductRoutes_SeparateFromCustomerRoute(t *testing.T) {
+	r := newTestRouter(t, productionLikeConfig("s3cret-from-the-vault"))
+
+	mux, ok := r.(*chi.Mux)
+	if !ok {
+		t.Fatalf("router bukan *chi.Mux, dapat %T", r)
+	}
+
+	found := map[string]bool{}
+	err := chi.Walk(mux, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		found[method+" "+route] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk routes: %v", err)
+	}
+
+	for _, want := range []string{
+		"GET /v1/onboarding/products",
+		"GET /internal/v1/onboarding/products",
+		"PUT /internal/v1/onboarding/products",
+	} {
+		if !found[want] {
+			t.Errorf("rute %q tidak terdaftar", want)
+		}
+	}
+
+	// PUT di jalur NASABAH tidak boleh ada: katalog hanya bisa ditulis dari
+	// /internal/v1, dan sebuah PUT yang menyelip ke /v1 akan ikut terkena CORS dan
+	// rate limit nasabah — lalu bisa dipanggil dari aplikasi nasabah.
+	if found["PUT /v1/onboarding/products"] {
+		t.Error("PUT /v1/onboarding/products seharusnya tidak ada — penulisan katalog hanya lewat /internal/v1")
+	}
+}
+
+// Dua rute liveness ada di grup NASABAH, bukan di grup CS.
+//
+// Kalau salah satu tergeser ke belakang X-Internal-API-Key, aplikasi Android
+// kehilangan verifikasi wajah sepenuhnya — dan gejalanya di perangkat adalah
+// 403, persis seperti gerbang integritas yang menolak. Dua sebab yang sangat
+// berbeda dengan satu tampilan yang sama; test ini memisahkan keduanya.
+func TestLivenessRoutes_RegisteredOnTheCustomerSide(t *testing.T) {
+	r := newTestRouter(t, productionLikeConfig("s3cret-from-the-vault"))
+
+	mux, ok := r.(*chi.Mux)
+	if !ok {
+		t.Fatalf("router bukan *chi.Mux, dapat %T", r)
+	}
+
+	found := map[string]bool{}
+	err := chi.Walk(mux, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		if method == http.MethodPost {
+			found[route] = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk routes: %v", err)
+	}
+
+	for _, want := range []string{
+		"/v1/onboarding/liveness/challenge",
+		"/v1/onboarding/biometric",
+	} {
+		if !found[want] {
+			t.Errorf("rute POST %s tidak terdaftar", want)
+		}
+	}
+
+	// Dan terjangkau TANPA kunci sistem. Yang diperiksa di sini hanya itu:
+	// router test ini dibangun dengan Redis nil, jadi request menembus sampai
+	// rate limiter grup nasabah lalu jadi 500 — bukti bahwa ia memang melewati
+	// grup nasabah, bukan dipulangkan penjaga internal. 403 berarti rute
+	// tergeser ke grup CS; 404 berarti rute hilang atau tertelan rute lain.
+	req := httptest.NewRequest(http.MethodPost, "/v1/onboarding/liveness/challenge",
+		strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusForbidden || rr.Code == http.StatusNotFound {
+		t.Fatalf("liveness/challenge tidak terjangkau sisi nasabah: %d (%s)",
+			rr.Code, rr.Body.String())
+	}
+}

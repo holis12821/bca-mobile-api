@@ -32,6 +32,23 @@ func ParseKTPFromText(raw string) KTPData {
 		// Try to extract key-value pairs with ":" separator
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
+			// Province and city are HEADER lines on an e-KTP — "PROVINSI DKI
+			// JAKARTA", "KOTA JAKARTA SELATAN" — with no colon anywhere. Reading
+			// them only in the key-value branch below meant both fields came back
+			// empty for every real card, including one whose text plainly
+			// contained them.
+			switch {
+			case data.Provinsi == "" && strings.HasPrefix(upper, "PROVINSI"):
+				data.Provinsi = strings.TrimSpace(line[len("PROVINSI"):])
+				continue
+			case data.Kota == "" && strings.HasPrefix(upper, "KOTA"):
+				data.Kota = strings.TrimSpace(line[len("KOTA"):])
+				continue
+			case data.Kota == "" && strings.HasPrefix(upper, "KABUPATEN"):
+				data.Kota = strings.TrimSpace(line[len("KABUPATEN"):])
+				continue
+			}
+
 			// Fallback: look for NIK pattern anywhere in the line
 			if data.NIK == "" {
 				if nik := extractNIK(line); nik != "" {

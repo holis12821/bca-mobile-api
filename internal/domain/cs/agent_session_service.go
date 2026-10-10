@@ -540,3 +540,210 @@ func (s *AgentSessionService) RegisterAgent(ctx context.Context, req RegisterAge
 		RegisteredAt: now,
 	}, nil
 }
+
+// UpdateAgentRequest adalah body `PATCH /internal/v1/agents/{employee_id}`.
+//
+// Kedua bidang perubahan boleh kosong, dan kosong berarti TIDAK DIUBAH. Kalau keduanya
+// kosong permintaannya ditolak, bukan dijawab "berhasil tanpa perubahan": PATCH yang
+// tidak mengubah apa pun tapi dijawab 200 akan membuat klien yang salah menamai
+// bidangnya mengira perubahannya tersimpan.
+type UpdateAgentRequest struct {
+	// Scopes MENGGANTI seluruh daftar, bukan menambah. Dipilih begitu supaya pencabutan
+	// punya bentuk yang jelas: "kirim daftar barunya" bisa mencabut, sementara
+	// "tambahkan cakupan ini" tidak pernah bisa.
+	Scopes []string `json:"scopes"`
+
+	// IsActive pointer karena `false` dan "tidak disebut" adalah dua permintaan berbeda.
+	IsActive *bool `json:"is_active"`
+
+	// Otorisasi dual-control, sama dengan RegisterAgentRequest dan untuk alasan yang
+	// sama: yang ditandatangani adalah PERUBAHAN KEWENANGAN, bukan kesiapan loket si
+	// pengubah.
+	SupervisorID string `json:"supervisor_id"`
+	Token        string `json:"token"`
+}
+
+// UpdateAgentResponse adalah keadaan petugas SESUDAH perubahan, beserta selisihnya.
+//
+// Selisihnya disertakan supaya layar supervisor bisa menampilkan "CUSTOMER_PII dicabut"
+// tanpa menyimpan keadaan sebelumnya sendiri — dan supaya yang menekan tombolnya melihat
+// apa yang sebenarnya berubah, bukan hanya daftar akhir yang ia sendiri kirim.
+type UpdateAgentResponse struct {
+	EmployeeID string   `json:"employee_id"`
+	Name       string   `json:"name"`
+	Scopes     []string `json:"scopes"`
+	IsActive   bool     `json:"is_active"`
+
+	ScopesAdded   []string `json:"scopes_added"`
+	ScopesRemoved []string `json:"scopes_removed"`
+
+	UpdatedBy string    `json:"updated_by"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// UpdateAgent mengubah cakupan atau mencabut hak seorang petugas.
+//
+// Menutup selisih yang sebelumnya diselesaikan dengan SQL langsung: mendaftarkan petugas
+// sudah punya endpoint, mengubah kewenangannya belum — dan jalur yang hanya bisa
+// dijalankan lewat psql tidak menghasilkan jejak audit, tidak menuntut otorisasi
+// supervisor, dan tidak bisa diserahkan ke siapa pun di luar yang memegang kredensial
+// database.
+//
+// Urutan pemeriksaannya mengikuti RegisterAgent, dengan satu tambahan di depan:
+//
+//  1. Bentuk permintaan — ada yang diubah, dan otorisasinya disebut.
+//  2. Bukan diri sendiri. Diperiksa SEBELUM apa pun yang mahal, dan sebelum NPP-nya
+//     dicari: petugas yang menaikkan kewenangannya sendiri hanya butuh satu orang, dan
+//     mencabut haknya sendiri bisa dipakai menutup giliran tanpa jejak logout.
+//  3. Cakupan dikenal — kesalahan pemanggil, tidak perlu melibatkan Argon2id.
+//  4. Token supervisor benar — paling mahal, hanya untuk yang sudah lolos semuanya.
+//  5. Baris ditulis, selisihnya dicatat.
+func (s *AgentSessionService) UpdateAgent(
+	ctx context.Context, employeeID string, req UpdateAgentRequest, updater, ip, userAgent string,
+) (*UpdateAgentResponse, error) {
+	employeeID = strings.TrimSpace(employeeID)
+	supervisorID := strings.TrimSpace(req.SupervisorID)
+
+	if employeeID == "" || supervisorID == "" || req.Token == "" {
+		return nil, apperr.ValidationError
+	}
+	if req.Scopes == nil && req.IsActive == nil {
+		return nil, apperr.ValidationError
+	}
+	if s.registry == nil || s.supervisors == nil {
+		return nil, apperr.ProviderNotConfigured
+	}
+
+	if strings.EqualFold(employeeID, strings.TrimSpace(updater)) {
+		return nil, apperr.AgentSelfUpdate
+	}
+
+	// Cakupan dibersihkan di sini, bukan diserahkan ke CHECK skema, supaya penolakannya
+	// bisa menyebut cakupan MANA yang tidak dikenal.
+	var scopes []string
+	if req.Scopes != nil {
+		if len(req.Scopes) == 0 {
+			// Daftar kosong berbeda dari "tidak disebut": ia meminta petugas tanpa
+			// kewenangan apa pun — baris yang terlihat sah tapi ditolak di setiap jalur.
+			// Yang dimaksud hampir selalu `is_active: false`, dan itulah yang disarankan.
+			return nil, apperr.Error{
+				Status:  422,
+				Code:    "SCOPE_EMPTY",
+				Message: "Petugas harus punya minimal satu cakupan. Untuk mencabut hak, kirim is_active: false.",
+			}
+		}
+		scopes = make([]string, 0, len(req.Scopes))
+		seen := make(map[string]bool, len(req.Scopes))
+		for _, raw := range req.Scopes {
+			scope := strings.ToUpper(strings.TrimSpace(raw))
+			if !ValidScope(scope) {
+				return nil, apperr.Error{
+					Status:  422,
+					Code:    "SCOPE_UNKNOWN",
+					Message: "Cakupan kewenangan tidak dikenal.",
+					Details: map[string]any{"scope": scope, "allowed": AllScopes},
+				}
+			}
+			if !seen[scope] {
+				seen[scope] = true
+				scopes = append(scopes, scope)
+			}
+		}
+	}
+
+	supervisorName, ok, err := s.supervisors.Authenticate(ctx, supervisorID, req.Token)
+	if err != nil {
+		// Kegagalan infrastruktur, BUKAN penolakan — sama dengan RegisterAgent.
+		return nil, err
+	}
+	if !ok {
+		writeCSAudit(ctx, s.audit, s.clock(), EventSupervisorAuthFailed, "agent:"+updater, "",
+			nil, map[string]any{
+				"purpose":       "AGENT_UPDATE",
+				"supervisor_id": supervisorID,
+				"employee_id":   employeeID,
+			}, ip, userAgent)
+		return nil, apperr.SupervisorTokenInvalid
+	}
+
+	now := s.clock()
+	before, after, err := s.registry.Update(ctx, employeeID, AgentUpdate{
+		Scopes:   scopes,
+		IsActive: req.IsActive,
+	}, now)
+	if err != nil {
+		return nil, err
+	}
+
+	added, removed := diffScopes(before.Scopes, after.Scopes)
+
+	details := map[string]any{
+		"employee_id":     employeeID,
+		"supervisor_id":   supervisorID,
+		"supervisor_name": supervisorName,
+		"scopes_before":   before.Scopes,
+		"scopes_after":    after.Scopes,
+	}
+	// Selisih keaktifan hanya dicatat kalau memang berubah: jejak yang menyebut
+	// "is_active tetap true" pada setiap perubahan cakupan membuat pencabutan hak yang
+	// sungguhan lebih sulit ditemukan di antara baris yang tidak mengubah apa pun.
+	if before.IsActive != after.IsActive {
+		details["is_active_before"] = before.IsActive
+		details["is_active_after"] = after.IsActive
+	}
+	if len(added) > 0 {
+		details["scopes_added"] = added
+	}
+	if len(removed) > 0 {
+		details["scopes_removed"] = removed
+	}
+	writeCSAudit(ctx, s.audit, now, EventAgentUpdated, "agent:"+updater, "",
+		nil, details, ip, userAgent)
+
+	slog.Info("cs agent updated",
+		"employee_id", employeeID,
+		"scopes_added", added, "scopes_removed", removed,
+		"is_active", after.IsActive,
+		"updated_by", updater, "supervisor_id", supervisorID)
+
+	return &UpdateAgentResponse{
+		EmployeeID:    after.EmployeeID,
+		Name:          after.Name,
+		Scopes:        after.Scopes,
+		IsActive:      after.IsActive,
+		ScopesAdded:   added,
+		ScopesRemoved: removed,
+		UpdatedBy:     updater,
+		UpdatedAt:     after.UpdatedAt,
+	}, nil
+}
+
+// diffScopes melaporkan cakupan yang bertambah dan yang dicabut.
+//
+// Keduanya selalu irisan tak-nil, termasuk saat kosong: bidangnya di-encode ke JSON
+// tanpa `omitempty`, dan `null` di sana akan membuat klien melakukan `.length` pada nilai
+// yang bukan array.
+func diffScopes(before, after []string) (added, removed []string) {
+	inBefore := make(map[string]bool, len(before))
+	for _, s := range before {
+		inBefore[s] = true
+	}
+	inAfter := make(map[string]bool, len(after))
+	for _, s := range after {
+		inAfter[s] = true
+	}
+
+	added = make([]string, 0)
+	for _, s := range after {
+		if !inBefore[s] {
+			added = append(added, s)
+		}
+	}
+	removed = make([]string, 0)
+	for _, s := range before {
+		if !inAfter[s] {
+			removed = append(removed, s)
+		}
+	}
+	return added, removed
+}

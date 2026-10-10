@@ -48,13 +48,15 @@ untuk pekerjaan mendalam:
 | `buka-rekening-backend` | seluruh `/v1/onboarding/*` — OCR, Dukcapil, biometrik, kredensial, submit |
 | `buka-rekening-video-call-backend` | video call e-KYC — antrean, WebSocket signaling, siklus panggilan, sisi CS |
 | `buka-rekening-otp` | OTP onboarding — penerbitan, verifikasi, blokir, kirim ulang |
+| `liveness-403-forbidden` | verifikasi wajah ditolak server — urutan gerbang `ProcessBiometric`, triase 403/422/429/503, `liveness_attempts`, kebijakan Play Integrity |
+| `buka-rekening-ktp-ocr` | verifikasi foto e-KTP — sumber teks OCR, tiga lapisan validasi tanpa Dukcapil, `DUKCAPIL_MODE`, penyimpanan foto |
 | `buka-rekening-kartu` | katalog kartu + pemilihan kartu pada flow buka rekening |
 | `buka-rekening-produk` | katalog jenis rekening tabungan — `GET /v1/onboarding/products`, setoran awal minimum, fitur produk, copy layar Pilih Jenis Rekening |
 | `profil-saya-kartu-api` | kartu milik nasabah, `tier`, konten Pusat Bantuan & Kontak CS |
 | `push-notification-api` | `POST /account/device/push-token`, `internal/pkg/notify` + `push`, filter `type` notifikasi, transport FCM |
 | `twilio-sms-otp` | setup & integrasi provider SMS: kredensial Twilio, `SMS_*`, `internal/pkg/sms`, normalisasi E.164, menelusuri OTP yang tidak sampai |
-| `cs-desktop-api-integration` | kontrak 14 endpoint CS yang **sudah terbit** — auth tiga lapis, cakupan petugas, signaling, penyamaran PII |
-| `cs-desktop-workflow-backend` | **analisis selisih** untuk alur desktop CS 19 layar: identitas petugas, siklus hidup terminal, gerbang kesiapan, KPI, `NEED_REVIEW` — apa yang belum ada dan kontraknya |
+| `cs-desktop-api-integration` | kontrak 34 endpoint CS yang **sudah terbit** — auth empat lapis, enam cakupan, sesi petugas, terminal & gerbang kesiapan, eskalasi Tier 2, signaling, penyamaran PII |
+| `cs-desktop-workflow-backend` | alur desktop CS 19 layar: identitas petugas, siklus hidup terminal, gerbang kesiapan, KPI, `NEED_REVIEW` + penutupan eskalasi Tier 2 — **keputusan di balik yang sudah dibangun**, dan dua selisih yang tersisa |
 
 File ini hanya memuat yang **tidak** ada di skill: workflow harian, jebakan
 nyata di repo ini, dan aturan di atas.

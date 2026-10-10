@@ -285,7 +285,17 @@ Type:   String (JSON)
 TTL:    24 jam
 
 Invalidation:
-  - Mengubah katalog WAJIB diikuti DEL onboarding:products:v1:catalog.
+  - PUT /internal/v1/onboarding/products melakukan DEL-nya SENDIRI, di
+    ProductAdminService.invalidate, sesudah transaksi commit. Jalur admin
+    adalah cara yang benar mengubah katalog justru karena ini: dua langkah
+    yang mudah terlupakan jadi satu permintaan.
+    DEL yang gagal TIDAK menggagalkan penulisan — transaksinya sudah commit,
+    dan error di titik itu akan membuat pemanggil mengulang permintaan yang
+    sudah berhasil, menaikkan versi sekali lagi untuk perubahan yang sama.
+    Kegagalannya dicatat slog.Error beserta perintah DEL yang perlu dijalankan
+    manual. Itu satu-satunya keadaan yang menuntut tindakan operator.
+  - Mengubah katalog LEWAT SQL MANUAL tetap WAJIB diikuti
+    DEL onboarding:products:v1:catalog.
     Kenaikan onboarding_product_catalog_version.counter TIDAK cukup: entri
     :catalog menyimpan catalog_version LAMA di dalamnya, jadi tanpa DEL
     nasabah melihat setoran awal lama DAN ETag lama sampai TTL habis — dan
@@ -293,6 +303,9 @@ Invalidation:
     Yang terjadi hanyalah sehari penuh layar yang menampilkan angka keliru,
     dan setoran awal adalah komitmen 30 hari kalender (pasal 4 S&K).
     Keterbatasan yang sama dengan onboarding:tnc:v1:active.
+  - Kunci :catalog TIDAK memuat versinya, berbeda dari katalog kartu yang
+    kunci-nya memuat versi. Itu sebabnya DEL dibutuhkan di sini dan tidak di
+    sana: di katalog kartu, versi baru otomatis menghasilkan kunci baru.
   - Entri :ver:{version} tidak perlu di-DEL: isinya per versi dan versi lama
     tidak berubah lagi. Ia ada supaya product_catalog_version yang sudah
     tersimpan di baris sesi tetap punya isinya.
@@ -573,7 +586,7 @@ func (r *RedisRepo) InvalidateTransactionCaches(ctx context.Context, parties []A
 | `lock:account:*` | 30 menit | Lockout duration |
 | `idem:*` | 24 jam | Idempotency guarantee |
 | `dlock:*` | 30 detik | Auto-release lock |
-| `onboarding:products:v1:*` | 24 jam | Katalog produk; invalidasi WAJIB `DEL …:catalog` |
+| `onboarding:products:v1:*` | 24 jam | Katalog produk; `PUT /internal/v1/onboarding/products` meng-`DEL …:catalog` sendiri, perubahan SQL manual wajib melakukannya |
 | `inquiry:*` | 5 menit | Inquiry validity |
 
 ---

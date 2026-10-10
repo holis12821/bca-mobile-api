@@ -2,7 +2,8 @@
 name: buka-rekening-produk
 description: >-
   Katalog jenis rekening tabungan pada layar PERTAMA flow buka rekening —
-  endpoint GET /v1/onboarding/products, tabel onboarding_products +
+  endpoint GET /v1/onboarding/products dan administrasinya GET/PUT
+  /internal/v1/onboarding/products (cakupan CARD_ADMIN), tabel onboarding_products +
   onboarding_product_features + onboarding_product_page, setoran awal minimum,
   fitur per produk, badge "Paling Populer", copy halaman (heading, subtitle,
   kotak Persiapan Dokumen, kalimat S&K), cache Redis berbasis catalog_version,
@@ -12,7 +13,10 @@ description: >-
   Jenis Rekening. Trigger juga pada "katalog produk", "jenis rekening",
   "product_type", "Tahapan BCA", "Tahapan Xpresi", "TabunganKu",
   "setoran awal minimum", "min_initial_deposit", "Paling Populer",
-  "ONBOARDING_CATALOG_UNAVAILABLE", dan "Persiapan Dokumen". JANGAN gunakan
+  "ONBOARDING_CATALOG_UNAVAILABLE", "Persiapan Dokumen", "admin katalog produk",
+  "PUT /internal/v1/onboarding/products", "ONBOARDING_PRODUCT_INVALID_VALUE",
+  "ONBOARDING_PRODUCT_CATALOG_CONFLICT", "memindahkan badge Paling Populer", dan
+  "features null vs kosong". JANGAN gunakan
   untuk katalog KARTU Paspor dan step CARD_SELECTION (itu skill
   `buka-rekening-kartu`), untuk isi Syarat & Ketentuan (itu `GET /onboarding/tnc`
   di skill `buka-rekening-backend`), untuk OCR/biometrik/video call/submit (itu
@@ -105,7 +109,7 @@ menjawab butir-butir ini. Jangan mengisi tebakan; tanyakan.
 | 3 | Apakah ketiga produk benar boleh dibuka lewat aplikasi, dan batas umurnya | Menentukan baris mana `is_active` dan kapan `availability_status` bukan `AVAILABLE` | Risk / compliance |
 | 4 | Produk mana yang berbadge "Paling Populer", dan siapa yang boleh mengubahnya | Badge adalah dorongan pemasaran; sumbernya harus satu dan bisa diubah | Product owner |
 | 5 | Apakah penawaran produk berbeda per wilayah | Menentukan perlu-tidaknya `region_code` di katalog ini. **Default: tidak**, jangan tambahkan tanpa jawaban | Product owner |
-| 6 | Siapa yang boleh mengubah katalog produk dan lewat antarmuka apa | Menentukan perlu-tidaknya admin endpoint pada fase 6 | Engineering manager |
+| 6 | ~~Siapa yang boleh mengubah katalog produk dan lewat antarmuka apa~~ **TERJAWAB** | Petugas ber-cakupan `CARD_ADMIN`, lewat `GET/PUT /internal/v1/onboarding/products`. Fase 6 sudah dikerjakan | Engineering manager |
 
 Konteks teknis yang sudah pasti, **tidak perlu ditanyakan**:
 
@@ -270,9 +274,26 @@ dengan `/products/{product_type}/cards` milik skill kartu.
    matinya katalog **tidak boleh** mematikan `POST /sessions`.
 10. **Jangan mengubah urutan atau nama nilai `onboarding_product_type`.** Enum itu
     sudah dipakai tiga tabel dan dibandingkan sebagai string oleh client.
-11. **Isi katalog ikut migrasi, bukan seeder.** Seeder menolak jalan di luar
+11. **Nilai AWAL katalog ikut migrasi, bukan seeder.** Seeder menolak jalan di luar
     `APP_ENV=development`, jadi staging akan menjawab layar kosong. Pelajaran dari
-    `000025`.
+    `000025`. **Perubahan sesudahnya lewat `PUT /internal/v1/onboarding/products`**
+    (cakupan `CARD_ADMIN`), yang menulis dalam satu transaksi, menaikkan
+    `catalog_version` **sekali**, dan menghapus cache-nya sendiri.
+12. **Memindahkan badge "Paling Populer" wajib mengirim KEDUA produk** dalam satu
+    permintaan — yang kehilangan dan yang mendapat. `idx_onboarding_products_one_popular`
+    adalah unique index berekspresi dan **tidak bisa `DEFERRABLE`**, jadi pelanggarannya
+    terdeteksi pada statement itu juga. Di dalamnya penulisan berjalan dua langkah: semua
+    baris ditulis dengan kedua flag dipaksa `FALSE` lebih dulu, baru yang diminta
+    dinyalakan. Mengirim hanya yang mendapat dijawab
+    `409 ONBOARDING_PRODUCT_CATALOG_CONFLICT`.
+13. **`DEL onboarding:products:v1:catalog` adalah bagian dari setiap penulisan.** Kunci
+    itu **tidak** memuat versinya — berbeda dari katalog kartu — jadi `catalog_version`
+    yang naik tanpa `DEL` tetap menyajikan katalog lama sampai TTL 24 jam habis. API
+    admin melakukannya sendiri; perubahan lewat SQL manual harus melakukannya.
+14. **Jalur admin TIDAK membaca `FEATURE_ONBOARDING_PRODUCT_CATALOG`.** Katalog yang
+    dimatikan karena isinya salah adalah justru saat isinya paling perlu diubah. Itu
+    sebabnya `ProductAdminService` adalah service tersendiri, bukan method di
+    `ProductService`.
 
 ---
 

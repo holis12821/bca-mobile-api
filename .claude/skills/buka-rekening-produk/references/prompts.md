@@ -160,21 +160,82 @@ Yang **tidak** boleh berubah di fase ini:
 
 ---
 
-## Fase 6 — Admin write (hanya bila butir 6 terjawab)
+## Fase 6 — Admin write ✅ SELESAI
 
-Jangan kerjakan fase ini tanpa jawaban "siapa yang boleh mengubah katalog dan
-lewat antarmuka apa". Kalau jawabannya belum ada, selesai di fase 5 dan katalog
-diubah lewat migrasi.
+Butir 6 terjawab: **petugas ber-cakupan `CARD_ADMIN`**, lewat `/internal/v1`.
+`CARD_ADMIN` dan bukan cakupan kelima karena CHECK `cs_agents_scopes_valid` di migrasi
+`000027` mengunci daftar cakupan ke empat nilai, dan mengatur katalog kartu Paspor
+adalah pekerjaan administratif yang sama jenisnya.
 
-Kalau dikerjakan: endpoint di grup `/internal/v1` yang sudah ada (butuh
-`X-Internal-API-Key`, dan **tidak pernah** ikut APK nasabah), satu transaksi
-per penulisan, `catalog_version` dinaikkan **sekali per transaksi** — bukan per
-baris — lalu cache di-invalidasi.
+Yang terbangun:
 
-**Definition of Done**
-- Penulisan dua produk dalam satu transaksi menaikkan versi satu kali.
-- Rute tidak terjangkau tanpa `X-Internal-API-Key`.
-- `make check` hijau.
+```
+GET /internal/v1/onboarding/products   + petugas CARD_ADMIN
+PUT /internal/v1/onboarding/products   + petugas CARD_ADMIN
+```
+
+**Definition of Done — semuanya terbukti:**
+- ✅ Penulisan dua produk dalam satu transaksi menaikkan versi satu kali —
+  `TestWriteProducts_BumpsVersionOncePerTransaction` (database sungguhan) dan
+  `TestWriteProducts_TwoProductsBumpVersionOnce` (domain).
+- ✅ Rute tidak terjangkau tanpa `X-Internal-API-Key`, dan tidak terjangkau dengan
+  kunci sistem saja — `TestAdminProductRoutes_RequireSystemKeyAndAgent`.
+- ✅ `make check` hijau.
+
+### Empat keputusan yang dibuat saat mengerjakannya
+
+**1. Penulisan DUA LANGKAH, dan tanpa itu memindahkan badge mustahil.**
+
+Ini bug yang benar-benar terjadi dan hanya terlihat di database sungguhan.
+`idx_onboarding_products_one_popular` adalah unique index **berekspresi**, dan unique
+index tidak bisa `DEFERRABLE` — hanya unique *constraint* bisa, dan index parsial
+berekspresi tidak bisa menjadi constraint. Jadi pelanggarannya terdeteksi pada statement
+itu juga, bukan saat commit.
+
+Karena produk ditulis urut `product_type`, `TABUNGANKU` mendapat `is_popular` **sebelum**
+`TAHAPAN_BCA` melepasnya → `409` untuk permintaan yang seharusnya sah.
+
+Perbaikannya: langkah pertama menulis semua kolom dengan `is_popular` dan `is_default`
+dipaksa `FALSE`; langkah kedua menyalakan yang diminta. Regresinya dijaga
+`TestWriteProducts_MovesSingletonFlagInOneRequest` — dan **tidak bisa** dijaga mock,
+karena mock tidak punya unique index.
+
+**2. `features` punya TIGA arti, bukan dua.**
+
+`null` = jangan sentuh · `[]` = hapus semua · `[...]` = ganti berurut. Pointer ke slice,
+bukan slice biasa, supaya `"features": []` bisa dibedakan dari field yang tidak dikirim.
+Tanpa pembedaan itu, setiap penulisan harga akan menghapus teks fitur produknya.
+
+**3. Jalur admin TIDAK membaca `FEATURE_ONBOARDING_PRODUCT_CATALOG`.**
+
+Karena itu `ProductAdminService` adalah service tersendiri, bukan method di
+`ProductService`. Katalog yang dimatikan karena isinya salah adalah justru saat isinya
+paling perlu diubah; kalau admin menumpang service bernilai `enabled`, mematikan flag
+akan sekaligus mematikan kemampuan membetulkannya.
+
+**4. Invalidasi cache WAJIB `DEL`, berbeda dari katalog kartu.**
+
+Kunci katalog kartu **memuat versinya**, jadi versi baru otomatis menghasilkan kunci
+baru dan entri lama kedaluwarsa sendiri. Kunci katalog produk
+(`onboarding:products:v1:catalog`) **tidak** memuat versi dan ber-TTL 24 jam, jadi
+`catalog_version` yang naik tanpa `DEL` akan tetap menyajikan katalog lama sampai sehari
+penuh.
+
+`DEL` yang gagal **tidak** menggagalkan penulisan: transaksinya sudah commit, dan error
+di titik itu akan membuat pemanggil mengulang permintaan yang sudah berhasil — menaikkan
+versi sekali lagi untuk perubahan yang sama. Dicatat `slog.Error` beserta perintah `DEL`
+yang perlu dijalankan manual.
+
+### Yang masih terbuka sesudah Fase 6
+
+- **Tidak ada tabel jejak audit** seperti `card_catalog_audit_log`. Aktor
+  (`X-Admin-Actor`, jatuh ke NPP petugas) dan IP hanya masuk `slog`. Perubahan setoran
+  awal adalah hal yang akan disengketakan, jadi ini pekerjaan yang masih perlu — dan ia
+  menuntut migrasi tersendiri.
+- **Copy halaman (`onboarding_product_page`) belum bisa ditulis lewat API.** Masih SQL
+  + `DEL` manual.
+- **Tidak ada `POST` produk baru.** Hanya `UPDATE`: produk baru menuntut nilai enum
+  `onboarding_product_type` baru, dan nilai enum baru menuntut migrasi.
 
 ---
 

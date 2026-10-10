@@ -489,8 +489,25 @@ func seedCSAgents(ctx context.Context, pool *pgxpool.Pool, hash func(string) str
 		// Penyelia memegang beberapa cakupan sekaligus. Ada di seed supaya jalur
 		// multi-scope ikut terlatih: petugas satu-cakupan tidak pernah membuktikan
 		// bahwa pemeriksaannya benar untuk yang memegang lebih dari satu.
+		//
+		// AUDIT_READ dan ESCALATION_REVIEW (migrasi 000041) hanya di sini, bukan di
+		// CS-1042: keduanya kewenangan pengawas. AUDIT_READ membuka jejak REKAN
+		// SEKERJA, dan ESCALATION_REVIEW menutup perkara yang Tier 1 ajukan — memberi
+		// keduanya kepada petugas panggilan akan membuat gerbangnya ada tapi tidak
+		// memisahkan apa pun.
 		{"SPV-3001", "Rina Kusuma", "dev-spv-key",
-			[]string{"VIDEO_CALL", "CUSTOMER_PII", "TICKET"}},
+			[]string{"VIDEO_CALL", "CUSTOMER_PII", "TICKET", "AUDIT_READ", "ESCALATION_REVIEW"}},
+
+		// Peninjau Tier 2 KEDUA, tanpa VIDEO_CALL. Dua alasan ia ada:
+		//
+		//   - Four-eyes hanya bisa diuji dengan dua orang. Perkara yang diajukan CS-1042
+		//     ditutup SPV-3001; perkara yang diajukan SPV-3001 ditutup yang ini.
+		//   - ESCALATION_CLAIMED_BY_OTHER mustahil dipicu oleh satu peninjau.
+		//
+		// Tanpa VIDEO_CALL dengan sengaja: ia membuktikan bahwa menutup perkara TIDAK
+		// menuntut kewenangan mengambil panggilan.
+		{"SPV-3002", "Dewi Lestari", "dev-tier2-key",
+			[]string{"CUSTOMER_PII", "ESCALATION_REVIEW"}},
 	}
 
 	for _, a := range agents {
@@ -904,7 +921,7 @@ func seedCSWorkstations(ctx context.Context, pool *pgxpool.Pool, hash func(strin
 	// lebih pendek akan membuat seed menanam baris yang endpoint-nya sendiri menolak.
 	const devAgentPassword = "KataSandiPanjang2026"
 
-	for _, employeeID := range []string{"CS-1042", "OPS-2001", "SPV-3001"} {
+	for _, employeeID := range []string{"CS-1042", "OPS-2001", "SPV-3001", "SPV-3002"} {
 		_, err := pool.Exec(ctx, `
 			UPDATE cs_agents
 			SET password_hash         = $2,
@@ -919,5 +936,5 @@ func seedCSWorkstations(ctx context.Context, pool *pgxpool.Pool, hash func(strin
 			log.Fatalf("seed cs agent password: %v", err)
 		}
 	}
-	log.Printf("cs agent password (CS-1042, OPS-2001, SPV-3001): %s", devAgentPassword)
+	log.Printf("cs agent password (CS-1042, OPS-2001, SPV-3001, SPV-3002): %s", devAgentPassword)
 }

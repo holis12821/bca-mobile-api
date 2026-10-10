@@ -77,6 +77,23 @@ const (
 
 	// ScopeTicket: membaca dan menulis tiket layanan.
 	ScopeTicket = "TICKET"
+
+	// ScopeAuditRead: membaca jejak audit petugas dan terminal.
+	//
+	// Dipisah dari identitas petugas biasa karena `GET /cs/audit-events` menjawab
+	// TENTANG REKAN SEKERJA: jam login, loket, dan setiap otorisasi supervisor yang
+	// pernah gagal atas nama seseorang. Sebelum cakupan ini ada, setiap petugas
+	// terautentikasi bisa membacanya — jejak yang terbuka bagi semua yang diawasinya
+	// bukan pembatas kewenangan.
+	ScopeAuditRead = "AUDIT_READ"
+
+	// ScopeEscalationReview: menutup perkara NEED_REVIEW (Tier 2).
+	//
+	// Sengaja BUKAN ScopeVideoCall. Petugas yang mengaku tidak sanggup memutuskan sebuah
+	// verifikasi tidak semestinya jadi orang yang menutup perkaranya; larangan
+	// menutup-sendiri ditegakkan di service, tapi cakupan terpisah inilah yang membuat
+	// petugas panggilan biasa tidak bisa menyentuh jalurnya sama sekali.
+	ScopeEscalationReview = "ESCALATION_REVIEW"
 )
 
 type agentCtxKey struct{}

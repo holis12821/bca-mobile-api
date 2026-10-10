@@ -102,3 +102,24 @@ func (c *OnboardingProductCache) SetCatalog(ctx context.Context, catalog *onboar
 	}
 	return nil
 }
+
+// InvalidateCatalog menghapus entri katalog aktif setelah katalog ditulis.
+//
+// HANYA kunci `catalog`, bukan snapshot per versi. Snapshot-nya justru yang melayani
+// client yang masih memegang ETag versi lama dan baris sesi yang sudah menyimpan versi
+// itu; menghapusnya akan membuat jejak "katalog apa yang dilihat nasabah" kehilangan
+// isinya.
+//
+// Tanpa pemanggilan ini, penulisan admin tertunda sampai TTL 24 jam habis. Itu bukan
+// hipotesis: kunci katalog produk TIDAK memuat versinya — berbeda dari katalog kartu —
+// jadi catalog_version yang naik tidak mengubah kunci yang dibaca GetCatalog.
+//
+// Kunci yang sudah tidak ada BUKAN error: Del mengembalikan 0 dan itu hasil yang benar.
+// Penulisan kedua dalam satu menit, atau penulisan saat cache memang kosong, tidak boleh
+// terbaca sebagai kegagalan.
+func (c *OnboardingProductCache) InvalidateCatalog(ctx context.Context) error {
+	if err := c.client.Del(ctx, productCatalogKey).Err(); err != nil {
+		return fmt.Errorf("invalidate product catalog cache: %w", err)
+	}
+	return nil
+}

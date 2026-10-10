@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -236,4 +237,76 @@ func (r *CSAgentRegistryRepo) Register(ctx context.Context, employeeID, name, ap
 		return fmt.Errorf("insert cs agent: %w", err)
 	}
 	return nil
+}
+
+// Update mengubah cakupan dan/atau keaktifan petugas yang sudah terdaftar.
+//
+// Satu transaksi dengan SELECT … FOR UPDATE lebih dulu, dan itu bukan kehati-hatian
+// berlebihan: jejak audit perubahan kewenangan menyebut cakupan yang DICABUT, jadi
+// keadaan "sebelum" harus dibaca di bawah kunci yang sama dengan penulisnya. Dibaca di
+// luar transaksi, dua PATCH bersamaan akan menghasilkan dua jejak yang masing-masing
+// mengklaim mencabut cakupan yang sebenarnya sudah dicabut yang lain.
+//
+// COALESCE dengan cast eksplisit: bidang yang tidak disebut pemanggil dikirim NULL, dan
+// `COALESCE($2, scopes)` tanpa `::TEXT[]` membuat Postgres tidak bisa menyimpulkan tipe
+// parameter yang selalu NULL.
+func (r *CSAgentRegistryRepo) Update(
+	ctx context.Context, employeeID string, upd cs.AgentUpdate, at time.Time,
+) (*cs.AgentRecord, *cs.AgentRecord, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin update cs agent: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var before cs.AgentRecord
+	err = tx.QueryRow(ctx, `
+		SELECT employee_id, name, scopes, is_active, updated_at
+		FROM cs_agents
+		WHERE employee_id = $1
+		FOR UPDATE`, employeeID,
+	).Scan(&before.EmployeeID, &before.Name, &before.Scopes, &before.IsActive, &before.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, apperr.AgentNotFound
+		}
+		return nil, nil, fmt.Errorf("lock cs agent: %w", err)
+	}
+
+	// Nil, bukan irisan kosong: `[]string{}` lolos ke Postgres sebagai array kosong dan
+	// menabrak `cardinality(scopes) > 0`, yang akan terbaca sebagai kesalahan skema
+	// padahal pemanggilnya hanya tidak menyebut cakupan.
+	var scopesArg any
+	if upd.Scopes != nil {
+		scopesArg = upd.Scopes
+	}
+
+	var after cs.AgentRecord
+	err = tx.QueryRow(ctx, `
+		UPDATE cs_agents
+		SET scopes     = COALESCE($2::TEXT[], scopes),
+		    is_active  = COALESCE($3::BOOLEAN, is_active),
+		    updated_at = $4
+		WHERE employee_id = $1
+		RETURNING employee_id, name, scopes, is_active, updated_at`,
+		employeeID, scopesArg, upd.IsActive, at,
+	).Scan(&after.EmployeeID, &after.Name, &after.Scopes, &after.IsActive, &after.UpdatedAt)
+	if err != nil {
+		// 23514 = pelanggaran CHECK. Satu-satunya yang bisa kena di sini adalah
+		// cs_agents_scopes_valid, dan service sudah memeriksanya lebih dulu supaya
+		// pesannya bisa menyebut cakupan MANA yang salah. Kalau tetap sampai ke sini,
+		// itu kesalahan perakitan — dicatat, bukan dibocorkan sebagai 500 tanpa jejak.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23514" {
+			slog.Error("cs agent update violated a schema check",
+				"employee_id", employeeID, "constraint", pgErr.ConstraintName)
+			return nil, nil, apperr.ValidationError
+		}
+		return nil, nil, fmt.Errorf("update cs agent: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("commit update cs agent: %w", err)
+	}
+	return &before, &after, nil
 }

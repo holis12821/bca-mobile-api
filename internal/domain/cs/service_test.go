@@ -670,7 +670,10 @@ func TestValidScope(t *testing.T) {
 			t.Errorf("%q harus sah", s)
 		}
 	}
-	for _, s := range []string{"", "AUDIT_READ", "video_call", "ADMIN"} {
+	// AUDIT_READ dan ESCALATION_REVIEW dulu ada di daftar ini sebagai contoh cakupan
+	// yang BELUM ada; migrasi 000041 membuka keduanya. Yang dipakai sekarang adalah
+	// nama yang memang tidak pernah ada, bukan nama yang kebetulan belum ada.
+	for _, s := range []string{"", "PRODUCT_ADMIN", "video_call", "ADMIN"} {
 		if ValidScope(s) {
 			t.Errorf("%q tidak boleh sah", s)
 		}
@@ -695,7 +698,12 @@ func (stubPasswordHasher) Verify(_ context.Context, plaintext, encoded string) (
 type mockAgentRegistry struct {
 	registered map[string][]string
 	hashes     map[string]string
-	err        error
+
+	// inactive melacak is_active = false. Peta tersendiri, bukan field di `registered`,
+	// supaya penambahannya tidak mengubah bentuk yang dipakai test pendaftaran.
+	inactive map[string]bool
+
+	err error
 }
 
 func newMockAgentRegistry() *mockAgentRegistry {
@@ -715,6 +723,49 @@ func (m *mockAgentRegistry) Register(_ context.Context, employeeID, _, apiKeyHas
 	m.registered[employeeID] = scopes
 	m.hashes[employeeID] = apiKeyHash
 	return nil
+}
+
+// Update meniru jalur Postgres: keadaan SEBELUM dan SESUDAH dari satu pembacaan, dan
+// kosong berarti TIDAK DIUBAH.
+//
+// Petugas nonaktif dilacak tersendiri karena `registered` hanya memetakan NPP ke cakupan;
+// tanpa itu test pencabutan hak tidak bisa membedakan "dinonaktifkan" dari "tidak pernah
+// ada".
+func (m *mockAgentRegistry) Update(_ context.Context, employeeID string, upd AgentUpdate, at time.Time) (*AgentRecord, *AgentRecord, error) {
+	if m.err != nil {
+		return nil, nil, m.err
+	}
+	scopes, exists := m.registered[employeeID]
+	if !exists {
+		return nil, nil, apperr.AgentNotFound
+	}
+	if m.inactive == nil {
+		m.inactive = make(map[string]bool)
+	}
+
+	before := &AgentRecord{
+		EmployeeID: employeeID,
+		Name:       employeeID,
+		Scopes:     append([]string(nil), scopes...),
+		IsActive:   !m.inactive[employeeID],
+		UpdatedAt:  at,
+	}
+
+	if upd.Scopes != nil {
+		m.registered[employeeID] = append([]string(nil), upd.Scopes...)
+	}
+	if upd.IsActive != nil {
+		m.inactive[employeeID] = !*upd.IsActive
+	}
+
+	after := &AgentRecord{
+		EmployeeID: employeeID,
+		Name:       employeeID,
+		Scopes:     append([]string(nil), m.registered[employeeID]...),
+		IsActive:   !m.inactive[employeeID],
+		UpdatedAt:  at,
+	}
+	return before, after, nil
 }
 
 type mockSupervisorRepo struct {
@@ -922,7 +973,7 @@ func TestRegisterAgent_UnknownScopeNamesIt(t *testing.T) {
 	svc, _, _, _ := setupRegistration()
 
 	req := validRegistration()
-	req.Scopes = []string{"VIDEO_CALL", "AUDIT_READ"}
+	req.Scopes = []string{"VIDEO_CALL", "PRODUCT_ADMIN"}
 
 	_, err := svc.RegisterAgent(context.Background(), req, "OPS-2001", "127.0.0.1", "test")
 	appErr := apperr.From(err)
@@ -933,8 +984,8 @@ func TestRegisterAgent_UnknownScopeNamesIt(t *testing.T) {
 	if !ok {
 		t.Fatalf("details bukan map: %T", appErr.Details)
 	}
-	if details["scope"] != "AUDIT_READ" {
-		t.Errorf("details.scope = %v, mau AUDIT_READ", details["scope"])
+	if details["scope"] != "PRODUCT_ADMIN" {
+		t.Errorf("details.scope = %v, mau PRODUCT_ADMIN", details["scope"])
 	}
 }
 

@@ -2,6 +2,7 @@ package onboarding
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -319,16 +320,44 @@ type DeviceCaptureMeta struct {
 	SharpnessScore  *float64 `json:"sharpness_score,omitempty"`  // 0-100, higher is sharper
 	GlareScore      *float64 `json:"glare_score,omitempty"`      // 0-100, higher means more glare
 	CornersDetected *int     `json:"corners_detected,omitempty"` // how many of the 4 KTP corners were found
+
+	// ClientOCRText is the raw text the device's own recognizer read from this
+	// photo, before uploading it.
+	//
+	// It exists because the client already runs ML Kit text recognition on the
+	// captured frame — that result used to be shown on screen and then thrown
+	// away, while the server answered from a hardcoded string. Sending it means
+	// the extracted identity comes from the actual card.
+	//
+	// It is INPUT, never a verdict: the server parses it, checks the e-KTP
+	// layout, validates the NIK and cross-checks the NIK against the parsed
+	// birth date and sex. A client that sends arbitrary text still has to make
+	// that text pass as a consistent e-KTP, and the audit trail records that the
+	// text came from the device rather than from a server-side engine.
+	ClientOCRText string `json:"client_ocr_text,omitempty"`
 }
 
 // OCRResponse is returned on POST /v1/onboarding/ocr.
 type OCRResponse struct {
-	OCRID         string       `json:"ocr_id"`
-	AccuracyPct   float64      `json:"accuracy_percent"`
-	Extracted     KTPData      `json:"extracted"`
-	DukcapilMatch bool         `json:"dukcapil_match"`
-	PhotoQuality  PhotoQuality `json:"photo_quality"`
-	CurrentStep   Step         `json:"current_step"`
+	OCRID       string  `json:"ocr_id"`
+	AccuracyPct float64 `json:"accuracy_percent"`
+	Extracted   KTPData `json:"extracted"`
+
+	// DukcapilMatch is meaningful only when DukcapilChecked is true.
+	DukcapilMatch bool `json:"dukcapil_match"`
+
+	// DukcapilChecked reports whether a population registry was consulted at all.
+	//
+	// Added because dukcapil_match=true was being returned for sessions where no
+	// registry existed: a nil client was read as "assume match". The client gated
+	// its "Lanjutkan" button on that flag, so the flag had to stay true for the
+	// flow to work — which is exactly how a convenient untruth becomes load
+	// bearing. With the two fields separate, "not verified" can be both honest
+	// and non-blocking.
+	DukcapilChecked bool `json:"dukcapil_checked"`
+
+	PhotoQuality PhotoQuality `json:"photo_quality"`
+	CurrentStep  Step         `json:"current_step"`
 }
 
 // AuditEventType is the type of event recorded in the audit log.
@@ -372,6 +401,19 @@ const (
 	// Penjadwalan ulang video call oleh nasabah.
 	AuditVideoCallScheduled         AuditEventType = "VIDEO_CALL_SCHEDULED"
 	AuditVideoCallScheduleCancelled AuditEventType = "VIDEO_CALL_SCHEDULE_CANCELLED"
+
+	// Tindakan Tier 2 atas perkara NEED_REVIEW.
+	//
+	// Masuk onboarding_audit_logs, BUKAN cs_audit_events: keduanya tentang sesi seorang
+	// NASABAH, jadi tempatnya di jejak yang ber-kunci session_id — itulah yang dibaca
+	// `GET /v1/onboarding/sessions/{id}/audit`, dan satu-satunya tempat lini masa
+	// pengajuan sebuah rekening bisa dibaca utuh. Perubahan kewenangan petugas justru
+	// sebaliknya; lihat cs.EventAgentUpdated.
+	//
+	// event_type di tabel itu TIDAK ber-CHECK (migrasi 000010, VARCHAR(64) biasa), jadi
+	// kedua nilai ini tidak menuntut migrasi.
+	AuditVideoCallEscalationClaimed  AuditEventType = "VIDEO_CALL_ESCALATION_CLAIMED"
+	AuditVideoCallEscalationResolved AuditEventType = "VIDEO_CALL_ESCALATION_RESOLVED"
 )
 
 // AuditLog represents an onboarding audit entry.
@@ -716,32 +758,32 @@ type BiometricResult struct {
 	LivenessScore     float64   `json:"liveness_score"`
 	FaceMatchVerified bool      `json:"face_match_with_ktp"`
 	FaceMatchScore    float64   `json:"face_match_score"`
-	ISOCompliant      bool      `json:"iso_30107_compliant"`
-	SpoofDetected     bool      `json:"-"`
-	FrameCount        int       `json:"-"`
-	CreatedAt         time.Time `json:"created_at"`
-	AutoDeleteAt      time.Time `json:"-"`
+
+	// ISOCompliant exists only because onboarding_biometrics.iso_compliant is
+	// NOT NULL. It is never set and never serialised: nothing in this service can
+	// establish ISO/IEC 30107-3 compliance, so writing anything but false would be
+	// a fabricated claim sitting in the account file. The column itself should be
+	// dropped in a follow-up migration.
+	ISOCompliant  bool      `json:"-"`
+	SpoofDetected bool      `json:"-"`
+	FrameCount    int       `json:"-"`
+	CreatedAt     time.Time `json:"created_at"`
+	AutoDeleteAt  time.Time `json:"-"`
 }
 
 // BiometricResponse is returned on POST /v1/onboarding/biometric.
+//
+// There is deliberately no iso_30107_compliant field. It used to be here, filled
+// by a mock engine that returned true for any input, and the Android screen showed
+// it to the customer as a certification claim. ISO/IEC 30107-3 certification comes
+// only from testing by an accredited lab (Phase 2 decision Q4). Do not add it back.
 type BiometricResponse struct {
 	BiometricID      string  `json:"biometric_id"`
 	LivenessVerified bool    `json:"liveness_verified"`
 	LivenessScore    float64 `json:"liveness_score"`
 	FaceMatchWithKTP bool    `json:"face_match_with_ktp"`
 	FaceMatchScore   float64 `json:"face_match_score"`
-	ISOCompliant     bool    `json:"iso_30107_compliant"`
 	CurrentStep      Step    `json:"current_step"`
-}
-
-// FaceAnalysisResult is returned by the biometric engine.
-type FaceAnalysisResult struct {
-	FaceCount      int
-	LivenessScore  float64
-	FaceMatchScore float64
-	ISOCompliant   bool
-	SpoofDetected  bool
-	Quality        string // "HIGH", "MEDIUM", "LOW"
 }
 
 // --- Video Call Types ---
@@ -820,17 +862,171 @@ func ValidEscalationQueue(q string) bool {
 	return false
 }
 
+// Status perkara eskalasi. Cocok dengan CHECK vc_escalations_status_valid di migrasi
+// 000038.
+//
+// CANCELLED ada di skema tapi TIDAK ada jalur API yang menulisnya, dan itu disengaja:
+// Tier 2 yang tidak sanggup memutuskan menolak dengan INCOMPLETE_INFORMATION — yang
+// menahan nasabah di VIDEO_CALL dan membebaskannya mengantre lagi, jadi tidak ada
+// kebutuhan untuk keluaran ketiga. Membangunnya akan menambah status yang tidak punya
+// kolom pelaku maupun waktu, yaitu penutupan perkara tanpa pertanggungjawaban.
+const (
+	EscalationStatusPending   = "PENDING"
+	EscalationStatusInReview  = "IN_REVIEW"
+	EscalationStatusResolved  = "RESOLVED"
+	EscalationStatusCancelled = "CANCELLED"
+)
+
+// ValidEscalationStatus melaporkan apakah sebuah status dikenal.
+//
+// Dipakai menolak filter `?status=` yang salah ketik: nol perkara karena `IN_REVIEW_`
+// tidak bisa dibedakan dari nol perkara karena antreannya memang sedang bersih, dan yang
+// kedua adalah kesimpulan yang diambil petugas Tier 2 untuk pulang.
+func ValidEscalationStatus(s string) bool {
+	switch s {
+	case EscalationStatusPending, EscalationStatusInReview,
+		EscalationStatusResolved, EscalationStatusCancelled:
+		return true
+	}
+	return false
+}
+
+// Keputusan Tier 2 atas sebuah perkara.
+//
+// Dua nilai saja, dan keduanya BERBEDA artinya dari status perkaranya: status menjawab
+// "perkaranya masih terbuka?", resolution menjawab "nasabahnya lolos verifikasi?".
+// Menyatukannya akan membuat perkara yang ditolak terlihat seperti perkara yang belum
+// selesai.
+const (
+	EscalationResolutionApproved = "APPROVED"
+	EscalationResolutionRejected = "REJECTED"
+)
+
+// ValidEscalationResolution melaporkan apakah sebuah keputusan Tier 2 dikenal.
+//
+// NEED_REVIEW sengaja TIDAK termasuk: tidak ada Tier 3 di sistem ini, jadi perkara yang
+// boleh dieskalasi lagi adalah perkara yang bisa berputar di antara dua antrean tanpa
+// pernah diputus. Tier 2 yang keterangannya kurang menolak dengan
+// INCOMPLETE_INFORMATION — yang menahan nasabah di VIDEO_CALL dan membebaskannya
+// mengantre lagi dari awal.
+func ValidEscalationResolution(r string) bool {
+	switch r {
+	case EscalationResolutionApproved, EscalationResolutionRejected:
+		return true
+	}
+	return false
+}
+
+// Tindakan yang boleh dilakukan Tier 2 pada sebuah perkara.
+//
+// Kata kerja, bukan status tujuan: `{"status":"IN_REVIEW"}` membuat pemanggil harus tahu
+// mesin statusnya untuk memakai endpoint-nya, dan membuat setiap status yang nanti
+// ditambahkan terlihat seperti tindakan yang sah diminta klien.
+const (
+	EscalationActionClaim   = "CLAIM"
+	EscalationActionResolve = "RESOLVE"
+)
+
 // VideoCallEscalation adalah satu perkara yang dieskalasi dari hasil NEED_REVIEW.
+//
+// HANYA untuk jalur operator. `Reason` dan `ResolutionNotes` adalah catatan petugas
+// tentang nasabah, bukan pesan untuk nasabah — yang dilihat nasabah adalah pesan tetap
+// pada apperr.VideoCallUnderReview. Jangan sertakan tipe ini di response jalur /v1.
 type VideoCallEscalation struct {
-	EscalationID    string     `json:"escalation_id"`
-	SessionID       string     `json:"session_id"`
-	QueueID         string     `json:"queue_id"`
-	EscalationQueue string     `json:"escalation_queue"`
-	Status          string     `json:"status"`
-	Reason          string     `json:"reason"`
-	RaisedByAgent   string     `json:"raised_by_agent"`
-	RaisedAt        time.Time  `json:"raised_at"`
+	EscalationID    string    `json:"escalation_id"`
+	SessionID       string    `json:"session_id"`
+	QueueID         string    `json:"queue_id"`
+	EscalationQueue string    `json:"escalation_queue"`
+	Status          string    `json:"status"`
+	Reason          string    `json:"reason"`
+	RaisedByAgent   string    `json:"raised_by_agent"`
+	RaisedAt        time.Time `json:"raised_at"`
+
+	// Pemegang perkara selama IN_REVIEW. Ada supaya layar Tier 2 bisa menjawab "sedang
+	// ditangani siapa" — tanpanya dua peninjau mengerjakan perkara yang sama tanpa
+	// seorang pun tahu.
+	ClaimedByAgent string     `json:"claimed_by_agent,omitempty"`
+	ClaimedAt      *time.Time `json:"claimed_at,omitempty"`
+
+	ResolvedByAgent string     `json:"resolved_by_agent,omitempty"`
 	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
+	Resolution      string     `json:"resolution,omitempty"`
+
+	// ResolutionReason memakai enum RejectionReason yang SAMA dengan penolakan Tier 1,
+	// dan wajib saat Resolution REJECTED. Dua daftar alasan untuk tindakan yang sama
+	// akan membuat satu laporan harus menjumlahkan dua kategori untuk satu hal.
+	ResolutionReason string `json:"resolution_reason,omitempty"`
+	ResolutionNotes  string `json:"resolution_notes,omitempty"`
+
+	// WaitedSeconds DITURUNKAN dari RaisedAt saat dibaca, tidak disimpan — seperti
+	// `priority` di daftar antrean. Tier 2 mengurutkan kerjanya dari ini; kolom tersimpan
+	// akan basi sejak baris berikutnya dibaca.
+	//
+	// Tidak ada ambang `priority` di sini: tinjauan Tier 2 memang berjam-jam, dan ambang
+	// sepuluh menit milik antrean panggilan akan menandai SEMUA perkara HIGH sejak menit
+	// kesebelas — label yang selalu menyala bukan label.
+	WaitedSeconds int `json:"waited_seconds"`
+}
+
+// ListEscalationsFilter menyaring antrean kerja Tier 2.
+type ListEscalationsFilter struct {
+	// Queue adalah salah satu dari EscalationTier2/Fraud/Compliance. Kosong = semua.
+	Queue string
+
+	// Status kosong berarti yang TERBUKA saja (PENDING + IN_REVIEW) — bukan semua.
+	// Bawaannya sengaja antrean kerja, bukan arsip: layar yang terbuka tiap pagi
+	// menanyakan "apa yang harus saya kerjakan", dan arsip yang tercampur ke dalamnya
+	// akan membuat perkara baru terbenam di bawah perkara tahun lalu.
+	Status string
+
+	// ClaimedBy mempersempit ke perkara yang dipegang seorang peninjau.
+	ClaimedBy string
+
+	SessionID string
+
+	Limit int
+}
+
+// EscalationResolution adalah keputusan yang ditulis ke sebuah perkara.
+type EscalationResolution struct {
+	ResolvedByAgent  string
+	Resolution       string
+	ResolutionReason string
+	Notes            string
+}
+
+// UpdateEscalationRequest adalah body PATCH /internal/v1/escalations/{escalation_id}.
+type UpdateEscalationRequest struct {
+	// Action: CLAIM atau RESOLVE.
+	Action string `json:"action"`
+
+	// Resolution WAJIB saat Action RESOLVE.
+	Resolution string `json:"resolution"`
+
+	// RejectionReason WAJIB saat Resolution REJECTED, ber-enum RejectionReason.
+	RejectionReason string `json:"rejection_reason"`
+
+	// Notes WAJIB saat RESOLVE, teks bebas. Cermin dari kewajiban `notes` pada
+	// NEED_REVIEW: Tier 1 wajib menerangkan supaya Tier 2 tidak mengulang panggilannya,
+	// dan Tier 2 wajib menerangkan supaya pemeriksaan berikutnya tahu atas dasar apa
+	// sebuah rekening akhirnya dibuka atau ditolak.
+	Notes string `json:"notes"`
+}
+
+// UpdateEscalationResponse mengembalikan perkara sesudah tindakan, beserta langkah sesi.
+//
+// CurrentStep disertakan untuk alasan yang sama dengan SubmitVideoCallResultResponse:
+// aplikasi desktop menampilkan "nasabah dilanjutkan ke pembuatan kredensial" tanpa harus
+// memanggil endpoint sesi lagi.
+type UpdateEscalationResponse struct {
+	Escalation *VideoCallEscalation `json:"escalation"`
+
+	// CurrentStep dihilangkan saat sesinya tidak terbaca — omitempty, bukan string
+	// kosong: klien yang menerima `"current_step": ""` akan membandingkannya dengan
+	// daftar langkah dan menyimpulkan langkah yang tidak dikenal, sementara field yang
+	// absen terbaca sebagai "tidak dilaporkan". Penutupan perkaranya sendiri sudah
+	// berhasil pada titik itu.
+	CurrentStep Step `json:"current_step,omitempty"`
 }
 
 // VideoCall represents a video call session stored in the DB.
@@ -1988,4 +2184,489 @@ type ProductConsent struct {
 	Prefix string `json:"prefix"`
 	Link   string `json:"link"`
 	Suffix string `json:"suffix"`
+}
+
+// --- Admin katalog produk (Fase 6) ---
+
+// AdminProductCatalog adalah jawaban GET /internal/v1/onboarding/products.
+//
+// Bukan SavingsProductCatalog: yang ini memuat is_active dan tidak memuat copy halaman.
+// Layar admin menyunting baris, bukan menampilkan layar nasabah, dan mengirim bentuk
+// nasabah ke layar admin akan menyembunyikan satu-satunya kolom yang menentukan sebuah
+// produk masih ditawarkan atau tidak.
+type AdminProductCatalog struct {
+	CatalogVersion string            `json:"catalog_version"`
+	Products       []AdminProductRow `json:"products"`
+}
+
+// AdminProductRow adalah satu baris onboarding_products, apa adanya.
+type AdminProductRow struct {
+	ProductType ProductType `json:"product_type"`
+
+	Name        string `json:"name"`
+	Description string `json:"description"`
+
+	MinInitialDeposit int64  `json:"min_initial_deposit"`
+	Currency          string `json:"currency"`
+
+	IconKey  string   `json:"icon_key"`
+	Style    string   `json:"style"`
+	BadgeKey *string  `json:"badge_key"`
+	Features []string `json:"features"`
+
+	IsPopular bool `json:"is_popular"`
+	IsDefault bool `json:"is_default"`
+
+	// IsActive FALSE berarti produk dihentikan dan tidak ikut dilayani ke nasabah.
+	// Barisnya tetap ada karena onboarding_sessions.product_type menunjuk ke sini.
+	IsActive bool `json:"is_active"`
+
+	DisplayOrder int `json:"display_order"`
+
+	AvailabilityStatus    string  `json:"availability_status"`
+	AvailabilityReasonKey *string `json:"availability_reason_key"`
+
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ProductWrite adalah satu produk pada badan PUT /internal/v1/onboarding/products.
+//
+// Seluruh kolom WAJIB, tidak ada patch sebagian. Alasannya: PUT sebagian pada katalog
+// yang tayang ke nasabah membuat field yang lupa dikirim diam-diam menjadi nilai
+// default — "is_ative" yang terabaikan menonaktifkan produk tanpa ada yang meminta,
+// dan handler-nya memang memakai DisallowUnknownFields justru untuk itu.
+//
+// Satu-satunya pengecualian adalah Features; lihat komentarnya.
+type ProductWrite struct {
+	ProductType ProductType `json:"product_type"`
+
+	Name        string `json:"name"`
+	Description string `json:"description"`
+
+	MinInitialDeposit int64  `json:"min_initial_deposit"`
+	Currency          string `json:"currency"`
+
+	IconKey  string  `json:"icon_key"`
+	Style    string  `json:"style"`
+	BadgeKey *string `json:"badge_key"`
+
+	// Features nil berarti JANGAN SENTUH fitur produk ini; slice (termasuk yang kosong)
+	// MENGGANTI seluruh daftarnya.
+	//
+	// Pointer, bukan slice biasa, karena keduanya harus bisa dibedakan: `"features": []`
+	// adalah permintaan menghapus semua fitur, dan field yang tidak dikirim bukan.
+	// Tanpa pembedaan itu, setiap penulisan harga akan menghapus teks fitur produknya.
+	Features *[]string `json:"features"`
+
+	IsPopular bool `json:"is_popular"`
+	IsDefault bool `json:"is_default"`
+	IsActive  bool `json:"is_active"`
+
+	DisplayOrder int `json:"display_order"`
+
+	AvailabilityStatus    string  `json:"availability_status"`
+	AvailabilityReasonKey *string `json:"availability_reason_key"`
+}
+
+// ProductCatalogWriteRequest adalah badan PUT /internal/v1/onboarding/products.
+//
+// Selalu daftar, bahkan untuk satu produk. Dua produk yang diubah bersamaan adalah satu
+// keputusan product owner, dan endpoint per-produk memaksa pemanggil melakukan dua
+// permintaan yang bisa gagal di tengah — meninggalkan katalog dalam keadaan yang tidak
+// pernah diputuskan siapa pun, dengan dua versi untuk satu perubahan.
+type ProductCatalogWriteRequest struct {
+	Products []ProductWrite `json:"products"`
+}
+
+// ProductCatalogWriteResult adalah jawaban penulisan katalog.
+type ProductCatalogWriteResult struct {
+	// CatalogVersion naik SEKALI untuk seluruh penulisan ini.
+	CatalogVersion string `json:"catalog_version"`
+
+	// Updated menyebut produk yang ditulis, berurutan seperti yang dieksekusi — bukan
+	// seperti yang dikirim. Pemanggil yang mengirim dua produk perlu bisa memastikan
+	// keduanya benar-benar tertulis.
+	Updated []ProductType `json:"updated"`
+
+	// FeaturesReplaced menyebut produk yang daftar fiturnya DIGANTI. Produk yang
+	// mengirim features: null tidak muncul di sini.
+	FeaturesReplaced []ProductType `json:"features_replaced"`
+}
+
+// Nilai yang sah untuk penulisan katalog produk. Cermin dari CHECK constraint di
+// migrasi 000039 — didaftar di sini supaya penolakannya menyebut field dan nilai yang
+// diizinkan, bukan melempar pelanggaran constraint Postgres sebagai 500.
+var (
+	validProductIconKeys = []string{ProductIconWallet, ProductIconCard, ProductIconSavings}
+	validProductStyles   = []string{ProductStylePrimary, ProductStyleSecondary, ProductStyleNeutral}
+	validProductBadges   = []string{ProductBadgeMostPopular}
+	validProductStatuses = []string{ProductAvailable, ProductDisabled, ProductComingSoon}
+	validProductReasons  = []string{
+		ProductReasonTemporarilyDisabled, ProductReasonMaintenance, ProductReasonComingSoon,
+	}
+)
+
+// Validate memeriksa seluruh badan penulisan katalog.
+//
+// Diperiksa sebagai SATU kesatuan, bukan per produk, karena dua invarian hanya bisa
+// dilihat dari daftar utuhnya: maksimum satu is_popular dan maksimum satu is_default.
+// Database menegakkan keduanya lewat unique index berekspresi, tapi penolakan di sini
+// bisa menyebut kedua produk yang bertabrakan — pelanggaran unique index hanya menyebut
+// nama indeksnya.
+func (r ProductCatalogWriteRequest) Validate() error {
+	if len(r.Products) == 0 {
+		return invalidProductField("products", "tidak ada produk yang ditulis", nil)
+	}
+
+	seen := make(map[ProductType]struct{}, len(r.Products))
+	var popular, dflt []string
+
+	for i := range r.Products {
+		w := r.Products[i]
+		if err := w.Validate(); err != nil {
+			return err
+		}
+
+		// Produk yang sama dua kali dalam satu badan: ditolak, bukan diambil yang
+		// terakhir. Dua nilai berbeda untuk satu produk dalam satu permintaan berarti
+		// pemanggilnya tidak tahu mana yang dimaksudnya, dan menebaknya diam-diam akan
+		// menulis angka setoran awal yang tidak diputuskan siapa pun.
+		if _, dup := seen[w.ProductType]; dup {
+			return invalidProductField("product_type",
+				"produk "+string(w.ProductType)+" disebut lebih dari sekali", nil)
+		}
+		seen[w.ProductType] = struct{}{}
+
+		if w.IsPopular {
+			popular = append(popular, string(w.ProductType))
+		}
+		if w.IsDefault {
+			dflt = append(dflt, string(w.ProductType))
+		}
+	}
+
+	if len(popular) > 1 {
+		return invalidProductField("is_popular",
+			"maksimum satu produk boleh is_popular", popular)
+	}
+	if len(dflt) > 1 {
+		return invalidProductField("is_default",
+			"maksimum satu produk boleh is_default", dflt)
+	}
+	return nil
+}
+
+// Validate memeriksa satu produk.
+func (w ProductWrite) Validate() error {
+	if !w.ProductType.Valid() {
+		return apperr.OnboardingProductUnknown
+	}
+	if strings.TrimSpace(w.Name) == "" {
+		return invalidProductField("name", "nama produk wajib diisi", nil)
+	}
+	if strings.TrimSpace(w.Description) == "" {
+		return invalidProductField("description", "deskripsi produk wajib diisi", nil)
+	}
+
+	// Cermin CHECK min_initial_deposit >= 0. Nol DIIZINKAN: produk tanpa setoran awal
+	// adalah produk yang mungkin ada, dan menolaknya di sini akan menolak keadaan yang
+	// database justru menerima.
+	if w.MinInitialDeposit < 0 {
+		return invalidProductField("min_initial_deposit",
+			"setoran awal tidak boleh negatif", nil)
+	}
+	if len(strings.TrimSpace(w.Currency)) != 3 {
+		return invalidProductField("currency", "currency harus tiga huruf, mis. IDR", nil)
+	}
+	if !containsString(validProductIconKeys, w.IconKey) {
+		return invalidProductField("icon_key", "icon_key tidak dikenal", validProductIconKeys)
+	}
+	if !containsString(validProductStyles, w.Style) {
+		return invalidProductField("style", "style tidak dikenal", validProductStyles)
+	}
+	if w.BadgeKey != nil && !containsString(validProductBadges, *w.BadgeKey) {
+		return invalidProductField("badge_key", "badge_key tidak dikenal", validProductBadges)
+	}
+
+	// display_order WAJIB positif, lebih ketat daripada kolomnya yang hanya NOT NULL.
+	// Nol dan negatif akan tetap tersimpan dan tetap mengurut, tapi seed memakai 1..3
+	// dan urutan yang bercampur nol membuat "produk pertama" bergantung pemecah seri.
+	if w.DisplayOrder < 1 {
+		return invalidProductField("display_order", "display_order minimal 1", nil)
+	}
+
+	if !containsString(validProductStatuses, w.AvailabilityStatus) {
+		return invalidProductField("availability_status",
+			"availability_status tidak dikenal", validProductStatuses)
+	}
+	if w.AvailabilityReasonKey != nil &&
+		!containsString(validProductReasons, *w.AvailabilityReasonKey) {
+		return invalidProductField("availability_reason_key",
+			"availability_reason_key tidak dikenal", validProductReasons)
+	}
+
+	// Cermin CONSTRAINT onboarding_products_reason_required di migrasi 000039. Ditolak
+	// di sini supaya pesannya menyebut field-nya, bukan melempar pelanggaran constraint
+	// Postgres sebagai 500.
+	if w.AvailabilityStatus != ProductAvailable &&
+		(w.AvailabilityReasonKey == nil || strings.TrimSpace(*w.AvailabilityReasonKey) == "") {
+		return invalidProductField("availability_reason_key",
+			"status selain AVAILABLE wajib menyebut alasannya", validProductReasons)
+	}
+
+	// Produk yang tidak bisa dipilih tidak boleh sekaligus menjadi default: layar akan
+	// membuka diri dengan kartu terpilih yang tombol lanjutnya mati, dan nasabah tidak
+	// punya petunjuk harus mengubah apa. Aturan yang sama dengan ProductCardWrite.
+	if w.IsDefault && w.AvailabilityStatus != ProductAvailable {
+		return invalidProductField("is_default",
+			"produk yang tidak AVAILABLE tidak boleh menjadi default", nil)
+	}
+
+	// Produk yang dihentikan tidak boleh memegang badge atau default: ia tidak ikut
+	// dilayani ke nasabah sama sekali, jadi is_popular yang tertinggal di sana akan
+	// MENGHABISKAN satu-satunya slot popular tanpa pernah tampil.
+	if !w.IsActive && (w.IsPopular || w.IsDefault) {
+		return invalidProductField("is_active",
+			"produk is_active = false tidak boleh is_popular atau is_default", nil)
+	}
+
+	if w.Features != nil {
+		for i, f := range *w.Features {
+			if strings.TrimSpace(f) == "" {
+				return invalidProductField("features",
+					"fitur ke-"+strconv.Itoa(i+1)+" kosong", nil)
+			}
+		}
+	}
+	return nil
+}
+
+// invalidProductField menyusun 422 yang menyebut field-nya. Pola yang sama dengan
+// invalidCardField, dengan kode error tersendiri supaya klien admin bisa membedakan
+// katalog mana yang ditolaknya.
+func invalidProductField(field, message string, allowed []string) error {
+	details := map[string]any{"field": field}
+	if len(allowed) > 0 {
+		details["allowed_values"] = allowed
+	}
+	return apperr.Error{
+		Status:  apperr.OnboardingProductInvalidValue.Status,
+		Code:    apperr.OnboardingProductInvalidValue.Code,
+		Message: message,
+		Details: details,
+	}
+}
+
+// --- Liveness Types ---
+
+// LivenessAction is one movement the server asks for inside a challenge.
+//
+// The set is fixed; which three are asked for, and in what order, is decided per
+// challenge by the server. The client only renders and detects what it is given.
+// A predictable order — the old client always ran blink then one head turn — is
+// defeated by a single pre-recorded video.
+type LivenessAction string
+
+const (
+	ActionTurnLeft  LivenessAction = "TURN_LEFT"
+	ActionTurnRight LivenessAction = "TURN_RIGHT"
+	ActionLookUp    LivenessAction = "LOOK_UP"
+	ActionLookDown  LivenessAction = "LOOK_DOWN"
+	ActionBlink     LivenessAction = "BLINK"
+)
+
+// HeadActions are the poses BLINK is combined with. BLINK is always included and
+// is never drawn from this slice.
+var HeadActions = []LivenessAction{
+	ActionTurnLeft,
+	ActionTurnRight,
+	ActionLookUp,
+	ActionLookDown,
+}
+
+func (a LivenessAction) Valid() bool {
+	switch a {
+	case ActionTurnLeft, ActionTurnRight, ActionLookUp, ActionLookDown, ActionBlink:
+		return true
+	}
+	return false
+}
+
+// IsHeadPose reports whether the action is a head movement, which must return to
+// neutral before the next step.
+func (a LivenessAction) IsHeadPose() bool { return a.Valid() && a != ActionBlink }
+
+// LivenessChallenge is what the server issues and later verifies against.
+//
+// DeviceID and DeviceKeyID are stored with it so verification can reject a
+// submission that arrives from a different device or signed by a different key,
+// without trusting anything the submission itself claims.
+type LivenessChallenge struct {
+	ChallengeID     string           `json:"challenge_id"`
+	Nonce           string           `json:"nonce"`
+	SessionID       string           `json:"session_id"`
+	DeviceID        string           `json:"device_id"`
+	DeviceKeyID     string           `json:"device_key_id"`
+	DevicePublicKey string           `json:"device_public_key"`
+	Actions         []LivenessAction `json:"actions"`
+	IssuedAt        time.Time        `json:"issued_at"`
+	ExpiresAt       time.Time        `json:"expires_at"`
+}
+
+// IssuedChallenge is the response body. It deliberately omits the device fields:
+// the client already knows them, and echoing them back only widens what a leaked
+// response reveals.
+type IssuedChallenge struct {
+	ChallengeID string           `json:"challenge_id"`
+	Nonce       string           `json:"nonce"`
+	Actions     []LivenessAction `json:"actions"`
+	ExpiresAt   time.Time        `json:"expires_at"`
+}
+
+// LivenessStepMeta is one entry of the client's step_meta part. It orders the
+// frames and records when each was taken; it is never read as proof that the step
+// succeeded. The server re-detects the pose in the frame itself.
+type LivenessStepMeta struct {
+	Index            int            `json:"index"`
+	Action           LivenessAction `json:"action"`
+	CapturedAtMillis int64          `json:"captured_at"`
+}
+
+// LivenessStepFrame pairs one step's metadata with its frame bytes.
+type LivenessStepFrame struct {
+	Index      int
+	Action     LivenessAction
+	CapturedAt time.Time
+	JPEG       []byte
+}
+
+// DeviceRiskSignals are client-reported inputs, never decisions.
+//
+// Anything that can defeat an on-device root check can also lie in these fields.
+// They are useful only alongside the Play Integrity verdict, which is verified
+// server-side rather than believed.
+type DeviceRiskSignals struct {
+	EmulatorLikely   bool `json:"emulator_likely"`
+	RootArtifacts    bool `json:"root_artifacts"`
+	DebuggerAttached bool `json:"debugger_attached"`
+}
+
+// LivenessSubmission is the raw evidence from one attempt.
+//
+// Note what is absent: there is no field in which the client states that liveness
+// passed. The previous contract had three (`completed_actions`, `precision_score`,
+// `challenge_type`), all filled with constants by the client and all believed.
+type LivenessSubmission struct {
+	SessionID          string
+	ChallengeID        string
+	Nonce              string
+	DeviceID           string
+	DeviceKeyID        string
+	DevicePublicKey    string
+	SignatureAlgorithm string
+	Signature          string
+	NeutralFrame       []byte
+	StepFrames         []LivenessStepFrame
+	IntegrityToken     string
+	RiskSignals        DeviceRiskSignals
+}
+
+// LivenessVerdict is the server's decision. Only this decides a pass.
+type LivenessVerdict struct {
+	Passed          bool
+	LivenessScore   float64
+	FaceMatchPassed bool
+	FaceMatchScore  float64
+
+	// Reason is for the audit trail, not for the customer. It names which check
+	// refused, which is exactly what must not be told to whoever is probing.
+	Reason string
+
+	// Unavailable marks a verdict that failed because a layer could not run at
+	// all — no ML model configured, inference service down. Kept separate from an
+	// ordinary refusal so the audit trail does not read as if a spoof was caught.
+	Unavailable bool
+
+	// IntegrityOK is the VERIFIED Play Integrity result, carried here so the audit
+	// row records what the verdict actually was.
+	//
+	// It used to be derived from whether a token was attached at all, which
+	// produced audit rows reading reason=integrity_failed alongside
+	// integrity_ok=true — precisely misleading to whoever is investigating.
+	IntegrityOK bool
+}
+
+// FrameFaceAnalysis is what the ML layer reports about one frame.
+type FrameFaceAnalysis struct {
+	FaceCount          int
+	YawDegrees         float64
+	PitchDegrees       float64
+	RollDegrees        float64
+	EyeOpenProbability float64
+
+	// Embedding is used for same-person continuity across frames and for the
+	// face match against the KYC reference.
+	Embedding []float32
+}
+
+// IntegrityVerdict is the decoded Play Integrity result.
+type IntegrityVerdict struct {
+	MeetsDeviceIntegrity bool
+	PackageMatches       bool
+	NonceMatches         bool
+
+	// Verdicts carries the raw verdict names for the audit trail.
+	Verdicts []string
+}
+
+// Acceptable reports whether the verdict satisfies the production policy.
+func (v *IntegrityVerdict) Acceptable() bool {
+	return v != nil && v.MeetsDeviceIntegrity && v.PackageMatches && v.NonceMatches
+}
+
+// LivenessAttemptOutcome is the audited result of one attempt.
+type LivenessAttemptOutcome string
+
+const (
+	LivenessOutcomePassed    LivenessAttemptOutcome = "PASSED"
+	LivenessOutcomeFailed    LivenessAttemptOutcome = "FAILED"
+	LivenessOutcomeBlocked   LivenessAttemptOutcome = "BLOCKED"
+	LivenessOutcomeEscalated LivenessAttemptOutcome = "ESCALATED"
+)
+
+// LivenessAttempt is one audit row. It holds no frames.
+//
+// Frames are not persisted at all: there is no retention policy for raw biometric
+// frames in this project, and §"no face images on disk" of the Phase 2 decisions
+// says not to invent one. What is kept is enough to investigate an attempt without
+// keeping the face.
+type LivenessAttempt struct {
+	ID             uuid.UUID
+	SessionID      string
+	ChallengeID    string
+	DeviceID       string
+	Outcome        LivenessAttemptOutcome
+	Reason         string
+	LivenessScore  float64
+	FaceMatchScore float64
+	FrameCount     int
+	IntegrityOK    bool
+	RiskSignals    DeviceRiskSignals
+	IPAddress      string
+	UserAgent      string
+	CreatedAt      time.Time
+}
+
+// LivenessAttemptStatus is the server-side counter state the client displays.
+type LivenessAttemptStatus struct {
+	// Failures within the current cooldown round.
+	Failures int
+
+	// CooldownRounds completed in the rolling 24-hour window.
+	CooldownRounds int
+
+	RetryAfter time.Duration
+
+	// Blocked means self-service liveness is over for this onboarding session.
+	Blocked bool
 }

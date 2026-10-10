@@ -1097,21 +1097,251 @@ func (r *OnboardingVideoCallEscalationRepo) Create(ctx context.Context, esc *onb
 // ditahan index, penjaga JoinQueue akan meluluskan nasabah yang Create-nya justru akan
 // ditolak index — nasabah mengantre, lalu petugas tidak bisa menuntaskan perkaranya.
 func (r *OnboardingVideoCallEscalationRepo) FindOpenBySessionID(ctx context.Context, sessionID string) (*onboarding.VideoCallEscalation, error) {
-	var esc onboarding.VideoCallEscalation
+	row := r.pool.QueryRow(ctx, selectEscalation+`
+		WHERE session_id = $1 AND status IN ('PENDING', 'IN_REVIEW')`, sessionID)
 
-	err := r.pool.QueryRow(ctx, `
-		SELECT escalation_id, session_id, queue_id, escalation_queue,
-		       status, reason, raised_by_agent, raised_at, resolved_at
-		FROM onboarding_video_call_escalations
-		WHERE session_id = $1 AND status IN ('PENDING', 'IN_REVIEW')`, sessionID,
-	).Scan(&esc.EscalationID, &esc.SessionID, &esc.QueueID, &esc.EscalationQueue,
-		&esc.Status, &esc.Reason, &esc.RaisedByAgent, &esc.RaisedAt, &esc.ResolvedAt)
+	esc, err := scanEscalation(row)
+	if err != nil {
+		return nil, fmt.Errorf("find open video call escalation: %w", err)
+	}
+	return esc, nil
+}
+
+// selectEscalation adalah SATU daftar kolom untuk ketiga jalur baca perkara eskalasi.
+//
+// Satu tempat supaya urutan Scan tidak pernah berbeda antar query — penyebab paling
+// sering kolom tertukar di repository yang punya beberapa pembaca untuk satu tipe. Pola
+// yang sama dengan selectCustomer di cs_repo.go.
+//
+// COALESCE pada kolom teks yang nullable: perkara yang belum dipegang dan belum ditutup
+// punya NULL di lima kolom terakhir, dan Scan ke string biasa akan gagal. Kosong adalah
+// jawaban yang benar untuk "belum ada", dan entitasnya memakai omitempty.
+const selectEscalation = `
+	SELECT escalation_id, session_id, queue_id, escalation_queue,
+	       status, reason, raised_by_agent, raised_at,
+	       COALESCE(claimed_by_agent, '')   AS claimed_by_agent,
+	       claimed_at,
+	       COALESCE(resolved_by_agent, '')  AS resolved_by_agent,
+	       resolved_at,
+	       COALESCE(resolution, '')         AS resolution,
+	       COALESCE(resolution_reason, '')  AS resolution_reason,
+	       COALESCE(resolution_notes, '')   AS resolution_notes
+	FROM onboarding_video_call_escalations`
+
+// scanEscalation mengembalikan nil, nil saat tidak ada baris — miss BUKAN error, sama
+// seperti pembaca lain di berkas ini.
+func scanEscalation(row pgx.Row) (*onboarding.VideoCallEscalation, error) {
+	var esc onboarding.VideoCallEscalation
+	err := row.Scan(
+		&esc.EscalationID, &esc.SessionID, &esc.QueueID, &esc.EscalationQueue,
+		&esc.Status, &esc.Reason, &esc.RaisedByAgent, &esc.RaisedAt,
+		&esc.ClaimedByAgent, &esc.ClaimedAt,
+		&esc.ResolvedByAgent, &esc.ResolvedAt,
+		&esc.Resolution, &esc.ResolutionReason, &esc.ResolutionNotes,
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("find open video call escalation: %w", err)
+		return nil, fmt.Errorf("scan video call escalation: %w", err)
+	}
+	return &esc, nil
+}
+
+// FindByID membaca satu perkara APA PUN statusnya.
+func (r *OnboardingVideoCallEscalationRepo) FindByID(ctx context.Context, escalationID string) (*onboarding.VideoCallEscalation, error) {
+	row := r.pool.QueryRow(ctx, selectEscalation+`
+		WHERE escalation_id = $1`, escalationID)
+
+	esc, err := scanEscalation(row)
+	if err != nil {
+		return nil, fmt.Errorf("find video call escalation: %w", err)
+	}
+	return esc, nil
+}
+
+// List membaca antrean kerja Tier 2, terlama dulu.
+//
+// Status kosong berarti yang TERBUKA saja, dan daftar statusnya SAMA dengan predikat
+// idx_vc_escalations_one_open serta dengan FindOpenBySessionID. Tiga daftar yang boleh
+// berbeda akan berbeda, dan yang berbeda di sini berarti perkara yang menahan nasabah
+// tidak muncul di layar siapa pun.
+func (r *OnboardingVideoCallEscalationRepo) List(ctx context.Context, filter onboarding.ListEscalationsFilter) ([]onboarding.VideoCallEscalation, error) {
+	args := []any{}
+	where := ""
+	add := func(clause string, arg any) {
+		args = append(args, arg)
+		where += fmt.Sprintf(" AND %s$%d", clause, len(args))
 	}
 
-	return &esc, nil
+	if filter.Status != "" {
+		add("status = ", filter.Status)
+	} else {
+		where += " AND status IN ('PENDING', 'IN_REVIEW')"
+	}
+	if filter.Queue != "" {
+		add("escalation_queue = ", filter.Queue)
+	}
+	if filter.ClaimedBy != "" {
+		add("claimed_by_agent = ", filter.ClaimedBy)
+	}
+	if filter.SessionID != "" {
+		add("session_id = ", filter.SessionID)
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	args = append(args, limit)
+
+	// WHERE TRUE supaya setiap penyaring di atas bisa menempel sebagai " AND ..." tanpa
+	// seseorang harus melacak mana yang pertama. Rencana kuerinya tidak terpengaruh.
+	rows, err := r.pool.Query(ctx, selectEscalation+`
+		WHERE TRUE`+where+`
+		ORDER BY raised_at ASC
+		LIMIT $`+fmt.Sprint(len(args)), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list video call escalations: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]onboarding.VideoCallEscalation, 0, limit)
+	for rows.Next() {
+		esc, err := scanEscalation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *esc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate video call escalations: %w", err)
+	}
+	return out, nil
+}
+
+// Claim memindahkan PENDING → IN_REVIEW.
+//
+// Status PENDING ada DI DALAM kondisi UPDATE, bukan diperiksa lebih dulu di aplikasi:
+// dua peninjau yang menekan tombolnya pada detik yang sama akan sama-sama melihat
+// "masih PENDING", dan yang kedua menimpa nama pemegang yang pertama — lalu keduanya
+// mengerjakan perkara yang sama sambil masing-masing yakin memegangnya.
+func (r *OnboardingVideoCallEscalationRepo) Claim(ctx context.Context, escalationID, agentID string, at time.Time) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE onboarding_video_call_escalations
+		SET status = 'IN_REVIEW', claimed_by_agent = $2, claimed_at = $3
+		WHERE escalation_id = $1 AND status = 'PENDING'`,
+		escalationID, agentID, at,
+	)
+	if err != nil {
+		return false, fmt.Errorf("claim video call escalation: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// Resolve menutup perkara.
+//
+// Dua kondisi yang keduanya penting:
+//
+//   - status IN ('PENDING','IN_REVIEW') — perkara yang sudah ditutup tidak boleh
+//     ditutup ulang dengan keputusan yang berbeda.
+//   - claimed_by_agent IS NULL OR = penutupnya — perkara yang sedang dipegang orang
+//     hanya boleh ditutup pemegangnya. Service sudah memeriksanya untuk bisa menjawab
+//     409 dengan pesan yang tepat, tapi pemeriksaan di aplikasi saja akan dilewati oleh
+//     dua permintaan yang berlomba.
+//
+// resolution_reason dikirim NULL saat kosong, bukan ”: CHECK
+// vc_escalations_resolution_reason_valid hanya mengizinkan NULL atau salah satu dari
+// enam alasan, dan ” bukan salah satunya.
+func (r *OnboardingVideoCallEscalationRepo) Resolve(ctx context.Context, escalationID string, res onboarding.EscalationResolution, at time.Time) (bool, error) {
+	var reason *string
+	if res.ResolutionReason != "" {
+		reason = &res.ResolutionReason
+	}
+
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE onboarding_video_call_escalations
+		SET status            = 'RESOLVED',
+		    resolved_by_agent = $2,
+		    resolved_at       = $3,
+		    resolution        = $4,
+		    resolution_reason = $5,
+		    resolution_notes  = $6
+		WHERE escalation_id = $1
+		  AND status IN ('PENDING', 'IN_REVIEW')
+		  AND (claimed_by_agent IS NULL OR claimed_by_agent = $2)`,
+		escalationID, res.ResolvedByAgent, at, res.Resolution, reason, res.Notes,
+	)
+	if err != nil {
+		return false, fmt.Errorf("resolve video call escalation: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// --- Liveness attempts ---
+
+// OnboardingLivenessAttemptRepo writes the per-attempt audit trail.
+type OnboardingLivenessAttemptRepo struct {
+	pool *pgxpool.Pool
+}
+
+func NewOnboardingLivenessAttemptRepo(pool *pgxpool.Pool) *OnboardingLivenessAttemptRepo {
+	return &OnboardingLivenessAttemptRepo{pool: pool}
+}
+
+// Insert appends one attempt row.
+//
+// No frames are written — see the comment on the migration. What goes in is the
+// decision, the reason label, and the signals, which is enough to review an
+// attempt without keeping the face.
+func (r *OnboardingLivenessAttemptRepo) Insert(
+	ctx context.Context,
+	attempt *onboarding.LivenessAttempt,
+) error {
+	signals, err := json.Marshal(attempt.RiskSignals)
+	if err != nil {
+		return fmt.Errorf("marshal liveness risk signals: %w", err)
+	}
+
+	query := `
+		INSERT INTO liveness_attempts
+			(id, session_id, challenge_id, device_id, outcome, reason,
+			 liveness_score, face_match_score, frame_count, integrity_ok,
+			 risk_signals, ip_address, user_agent, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`
+
+	_, err = r.pool.Exec(ctx, query,
+		attempt.ID, attempt.SessionID, attempt.ChallengeID, attempt.DeviceID,
+		string(attempt.Outcome), attempt.Reason,
+		attempt.LivenessScore, attempt.FaceMatchScore, attempt.FrameCount,
+		attempt.IntegrityOK, signals,
+		attempt.IPAddress, attempt.UserAgent, attempt.CreatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert liveness attempt: %w", err)
+	}
+	return nil
+}
+
+// CountFailuresSince backs the 24-hour window when Redis has been flushed.
+//
+// Escalated attempts count as failures: the applicant was routed to an agent
+// precisely because self-service liveness did not succeed.
+func (r *OnboardingLivenessAttemptRepo) CountFailuresSince(
+	ctx context.Context,
+	sessionID string,
+	since time.Time,
+) (int, error) {
+	query := `
+		SELECT COUNT(*)
+		FROM liveness_attempts
+		WHERE session_id = $1
+		  AND created_at >= $2
+		  AND outcome IN ('FAILED', 'BLOCKED', 'ESCALATED')`
+
+	var count int
+	if err := r.pool.QueryRow(ctx, query, sessionID, since).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count liveness failures: %w", err)
+	}
+	return count, nil
 }

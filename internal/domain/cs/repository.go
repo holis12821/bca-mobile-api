@@ -164,6 +164,42 @@ type AgentRegistry interface {
 	// pelanggaran primary key, bukan SELECT lebih dulu: dua pendaftaran bersamaan akan
 	// sama-sama melihat "NPP belum ada".
 	Register(ctx context.Context, employeeID, name, apiKeyHash string, scopes []string, at time.Time) error
+
+	// Update mengubah cakupan dan/atau keaktifan seorang petugas yang sudah terdaftar.
+	//
+	// Mengembalikan keadaan SEBELUM dan SESUDAH dalam satu panggilan, keduanya dibaca di
+	// satu transaksi ber-FOR UPDATE. Bukan kerapian: jejak audit perubahan kewenangan
+	// harus menyebut cakupan yang DICABUT, dan keadaan sebelum yang dibaca di luar
+	// transaksi bisa sudah ditimpa perubahan lain — jejaknya lalu menyebut pencabutan
+	// yang tidak pernah terjadi.
+	//
+	// Mengembalikan apperr.AgentNotFound kalau NPP-nya tidak ada. Kunci API dan kata
+	// sandinya tidak disentuh: rotasi kunci adalah jalur tersendiri yang belum ada.
+	Update(ctx context.Context, employeeID string, upd AgentUpdate, at time.Time) (before, after *AgentRecord, err error)
+}
+
+// AgentUpdate adalah perubahan yang diminta `PATCH /internal/v1/agents/{employee_id}`.
+//
+// Kedua bidang bisa kosong, dan kosong berarti TIDAK DIUBAH — bukan "kosongkan". Itu
+// sebabnya IsActive sebuah pointer: `false` dan "tidak disebut" adalah dua permintaan
+// yang berbeda, dan sebuah bool biasa membuat setiap PATCH yang hanya mengubah cakupan
+// diam-diam menonaktifkan petugasnya.
+type AgentUpdate struct {
+	Scopes   []string
+	IsActive *bool
+}
+
+// AgentRecord adalah baris cs_agents yang boleh ditampilkan.
+//
+// Tanpa api_key_hash dan password_hash. Keduanya tidak ikut dibaca repository, bukan
+// hanya dihilangkan dari JSON: nilai yang tidak pernah masuk memori tidak bisa bocor ke
+// log lewat sebuah `slog.Info("...", "agent", rec)`.
+type AgentRecord struct {
+	EmployeeID string    `json:"employee_id"`
+	Name       string    `json:"name"`
+	Scopes     []string  `json:"scopes"`
+	IsActive   bool      `json:"is_active"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // AuditEventRepository menulis dan mencari jejak petugas/terminal.

@@ -198,8 +198,27 @@ var (
 var (
 	OnboardingSessionExpired     = Error{http.StatusUnprocessableEntity, "ONBOARDING_SESSION_EXPIRED", "Sesi onboarding sudah kedaluwarsa (24 jam).", nil}
 	OnboardingProductUnavailable = Error{http.StatusUnprocessableEntity, "ONBOARDING_PRODUCT_UNAVAILABLE", "Produk tidak tersedia.", nil}
-	OnboardingSessionLimit       = Error{http.StatusTooManyRequests, "ONBOARDING_SESSION_LIMIT", "Maksimal 3 sesi aktif per perangkat.", nil}
-	OnboardingIncomplete         = Error{http.StatusUnprocessableEntity, "ONBOARDING_INCOMPLETE", "Belum semua langkah selesai.", nil}
+
+	// OnboardingProductInvalidValue dipakai admin API katalog produk: nilai di luar
+	// enum, field wajib yang kosong, atau badan yang melanggar invarian katalog.
+	// Kode tersendiri, bukan CARD_CATALOG_INVALID_VALUE, supaya klien admin yang
+	// mengelola dua katalog tahu katalog MANA yang menolak permintaannya.
+	// details.field menyebut field-nya; details.allowed_values menyebut nilai yang sah
+	// kalau fieldnya ber-enum.
+	OnboardingProductInvalidValue = Error{http.StatusUnprocessableEntity, "ONBOARDING_PRODUCT_INVALID_VALUE", "Nilai katalog produk tidak valid.", nil}
+
+	// OnboardingProductCatalogConflict 409: penulisan ditolak database karena
+	// bertabrakan dengan baris yang TIDAK ikut ditulis.
+	//
+	// Kasus nyatanya: menandai TABUNGANKU is_popular sementara TAHAPAN_BCA masih
+	// memegangnya dan tidak disebut di badan permintaan. Validasi di domain hanya bisa
+	// melihat daftar yang dikirim, jadi tabrakan dengan baris lain baru terbaca sebagai
+	// pelanggaran unique index. 409, bukan 500: permintaannya sah, keadaan katalognya
+	// yang menolak — dan pemanggil bisa membereskannya dengan mengirim kedua produk
+	// dalam satu permintaan.
+	OnboardingProductCatalogConflict = Error{http.StatusConflict, "ONBOARDING_PRODUCT_CATALOG_CONFLICT", "Perubahan bertabrakan dengan produk lain. Kirim kedua produk dalam satu permintaan.", nil}
+	OnboardingSessionLimit           = Error{http.StatusTooManyRequests, "ONBOARDING_SESSION_LIMIT", "Maksimal 3 sesi aktif per perangkat.", nil}
+	OnboardingIncomplete             = Error{http.StatusUnprocessableEntity, "ONBOARDING_INCOMPLETE", "Belum semua langkah selesai.", nil}
 )
 
 // --- Petugas & terminal CS ---
@@ -253,6 +272,18 @@ var (
 	EmployeeInactive = Error{http.StatusUnprocessableEntity, "EMPLOYEE_INACTIVE", "Status kepegawaian NPP ini tidak aktif.", nil}
 
 	AgentAlreadyRegistered = Error{http.StatusConflict, "AGENT_ALREADY_REGISTERED", "NPP ini sudah terdaftar sebagai petugas.", nil}
+
+	// Dibedakan dari EMPLOYEE_NOT_FOUND: yang itu berarti NPP-nya tidak ada di direktori
+	// pegawai, yang ini berarti pegawainya ada tapi belum pernah didaftarkan sebagai
+	// petugas CS. Jalan keluarnya berbeda — yang pertama salah ketik, yang kedua
+	// `POST /internal/v1/agents`.
+	AgentNotFound = Error{http.StatusNotFound, "AGENT_NOT_FOUND", "NPP ini belum terdaftar sebagai petugas.", nil}
+
+	// Four-eyes pada perubahan kewenangan. Petugas tidak boleh mengubah cakupannya
+	// sendiri maupun mencabut haknya sendiri: yang pertama adalah kenaikan kewenangan
+	// yang hanya butuh satu orang, dan yang kedua membuat pencabutan bisa dipakai
+	// menghapus jejak giliran sendiri.
+	AgentSelfUpdate = Error{http.StatusForbidden, "AGENT_SELF_UPDATE", "Kewenangan Anda sendiri harus diubah petugas lain.", nil}
 )
 
 // --- 422 (eskalasi verifikasi) ---
@@ -263,6 +294,20 @@ var (
 	VideoCallUnderReview = Error{http.StatusUnprocessableEntity, "VIDEO_CALL_UNDER_REVIEW", "Verifikasi Anda sedang ditinjau petugas. Mohon tunggu, kami akan menghubungi Anda.", nil}
 
 	VideoCallEscalationExists = Error{http.StatusConflict, "VIDEO_CALL_ESCALATION_EXISTS", "Sesi ini sudah dalam peninjauan.", nil}
+
+	EscalationNotFound = Error{http.StatusNotFound, "ESCALATION_NOT_FOUND", "Perkara eskalasi tidak ditemukan.", nil}
+
+	// Perkara yang sudah RESOLVED atau CANCELLED tidak bisa diputus lagi. 409, bukan
+	// 422: permintaannya sah bentuknya, keadaan perkaranya yang sudah berubah — dan
+	// petugas Tier 2 yang melihat daftar basi perlu tahu bedanya supaya ia memuat ulang
+	// daftarnya, bukan memperbaiki isi formulirnya.
+	EscalationAlreadyClosed = Error{http.StatusConflict, "ESCALATION_ALREADY_CLOSED", "Perkara ini sudah ditutup petugas lain.", nil}
+
+	// Four-eyes. Petugas yang MENGAJUKAN eskalasi tidak boleh menutupnya sendiri:
+	// NEED_REVIEW adalah pernyataan bahwa ia tidak sanggup memutuskan, dan membiarkannya
+	// memutus sendiri sesudahnya mengubah eskalasi menjadi jalan memutar yang
+	// menghasilkan keputusan yang persis sama tanpa diperiksa siapa pun.
+	EscalationSelfResolve = Error{http.StatusForbidden, "ESCALATION_SELF_RESOLVE", "Perkara yang Anda ajukan harus diputus petugas lain.", nil}
 )
 
 // --- 422 (penjadwalan video call) ---
@@ -320,6 +365,42 @@ var (
 	BioMultipleFaces  = Error{http.StatusUnprocessableEntity, "BIO_MULTIPLE_FACES", "Lebih dari satu wajah terdeteksi. Pastikan hanya wajah Anda yang terlihat.", nil}
 	BioLowQuality     = Error{http.StatusUnprocessableEntity, "BIO_LOW_QUALITY", "Kualitas foto tidak memadai. Pastikan pencahayaan baik.", nil}
 	BioSpoofDetected  = Error{http.StatusUnprocessableEntity, "BIO_SPOOF_DETECTED", "Terdeteksi dugaan pemalsuan. Gunakan wajah asli tanpa foto/layar.", nil}
+)
+
+// --- Liveness aktif ---
+
+var (
+	// LivenessChallengeInvalid covers an unknown, expired, already-consumed, or
+	// wrong-device nonce. Deliberately ONE code for all four: telling the caller
+	// which of them applied is telling whoever is probing how to probe next.
+	LivenessChallengeInvalid = Error{http.StatusUnprocessableEntity, "LIVENESS_CHALLENGE_INVALID", "Verifikasi wajah sudah tidak berlaku. Silakan mulai ulang.", nil}
+
+	// LivenessSignatureInvalid: the payload was not signed by the key registered
+	// with the challenge, or the frames do not match the digests it covers.
+	LivenessSignatureInvalid = Error{http.StatusUnprocessableEntity, "LIVENESS_SIGNATURE_INVALID", "Bukti verifikasi wajah tidak sah. Silakan mulai ulang.", nil}
+
+	LivenessDeviceKeyInvalid = Error{http.StatusUnprocessableEntity, "LIVENESS_DEVICE_KEY_INVALID", "Kunci perangkat tidak didukung. Perbarui aplikasi lalu coba lagi.", nil}
+
+	// LivenessIntegrityFailed is the production policy for a Play Integrity
+	// verdict that does not meet device integrity (decision Q3).
+	LivenessIntegrityFailed = Error{http.StatusForbidden, "LIVENESS_INTEGRITY_FAILED", "Perangkat ini belum dapat digunakan untuk verifikasi wajah.", nil}
+
+	// LivenessCooldown is 429 and carries details.retry_after_seconds — the same
+	// shape as the OTP rate limit, so the client reads it with existing code.
+	LivenessCooldown = Error{http.StatusTooManyRequests, "LIVENESS_COOLDOWN", "Terlalu banyak percobaan. Silakan coba lagi nanti.", nil}
+
+	// LivenessBlocked: self-service liveness is over for this onboarding session
+	// (decision Q6 step 2), and the recovery is not to retry.
+	LivenessBlocked = Error{http.StatusUnprocessableEntity, "LIVENESS_BLOCKED", "Verifikasi wajah mandiri dihentikan untuk pengajuan ini. Identitas Anda akan diverifikasi petugas melalui video call.", nil}
+
+	// LivenessEscalated is the same situation when a video-call queue entry was
+	// created, so the client can send the customer straight there.
+	LivenessEscalated = Error{http.StatusUnprocessableEntity, "LIVENESS_ESCALATED_TO_VIDEO_CALL", "Verifikasi wajah dilanjutkan bersama petugas melalui video call.", nil}
+
+	// LivenessProviderUnavailable is the fail-closed answer: no liveness provider
+	// is configured, or the one configured could not run. 503 and NOT a pass —
+	// §1b of the Phase 2 decisions. A provider that cannot judge must refuse.
+	LivenessProviderUnavailable = Error{http.StatusServiceUnavailable, "LIVENESS_PROVIDER_UNAVAILABLE", "Verifikasi wajah belum tersedia. Silakan hubungi Halo BCA.", nil}
 )
 
 // --- 422 (submit / account creation) ---

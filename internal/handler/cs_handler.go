@@ -128,14 +128,17 @@ func (h *CSHandler) handleErr(w http.ResponseWriter, r *http.Request, msg string
 
 // ListAuditEvents handles GET /internal/v1/cs/audit-events
 //
-// Penjaganya kunci sistem + identitas petugas, BUKAN sebuah cakupan tersendiri. Itu
-// mengikuti preseden `GET /v1/onboarding/sessions/{id}/audit`, dan sekaligus batasan
-// nyata: CHECK `cs_agents_scopes_valid` di migrasi 000027 mengunci daftar cakupan ke
-// empat nilai, jadi cakupan `AUDIT_READ` menuntut migrasi tersendiri.
+// Penjaganya kunci sistem + cakupan `AUDIT_READ`, dan cakupan itu BARU ADA sejak migrasi
+// 000041 melebarkan CHECK `cs_agents_scopes_valid`. Sebelumnya penjaganya hanya identitas
+// petugas — satu-satunya pilihan selama daftar cakupan terkunci ke empat nilai — jadi
+// setiap petugas terautentikasi bisa membaca jejak rekannya: jam login, loket, dan setiap
+// otorisasi supervisor yang pernah gagal atas namanya.
 //
-// Akibatnya setiap petugas terautentikasi bisa membaca jejak rekannya. Itu lebih longgar
-// daripada yang semestinya untuk kewenangan pengawas — lihat catatan di
-// docs/01-API-SPECIFICATION.md §11.
+// Pengetatannya MEMUTUS pemanggil lama dengan sengaja: tidak ada baris cs_agents yang
+// diberi AUDIT_READ oleh migrasinya, jadi endpoint ini menjawab 403 sampai seseorang
+// diberi cakupan itu lewat `PATCH /internal/v1/agents/{employee_id}`. Migrasi yang
+// diam-diam memberi kewenangan pengawas kepada semua petugas yang sudah ada akan
+// melakukan persis hal yang pemisahan ini ada untuk mencegahnya.
 func (h *CSHandler) ListAuditEvents(w http.ResponseWriter, r *http.Request) {
 	if h.audit == nil {
 		slog.Error("audit-events reached without an audit query service", "path", r.URL.Path)

@@ -1770,12 +1770,26 @@ tidak bisa terpasang tanpa menyatakan kewenangan yang dituntutnya.
 |---|---|
 | `VIDEO_CALL` | ambil panggilan, submit hasil, antrean, daftar sesi onboarding |
 | `CUSTOMER_PII` | detail sesi berisi data pribadi, pencarian & profil nasabah |
-| `CARD_ADMIN` | administrasi katalog kartu Paspor |
+| `CARD_ADMIN` | administrasi katalog kartu Paspor dan katalog produk tabungan |
 | `TICKET` | tiket layanan |
+| `AUDIT_READ` | jejak audit petugas & terminal (`GET /cs/audit-events`) |
+| `ESCALATION_REVIEW` | antrean kerja Tier 2 dan penutupan perkara `NEED_REVIEW` |
 
 `CUSTOMER_PII` **dipisah** dari `VIDEO_CALL` meski aplikasi desktop yang sama memakai
 keduanya: melayani panggilan menampilkan nasabah yang *sedang* bicara, sementara membuka
 data pribadi menjangkau nasabah mana pun yang pernah mendaftar.
+
+Dua cakupan terakhir dibuka **migrasi 000041**, dan keduanya menutup gerbang yang
+sebelumnya tidak ada:
+
+- `AUDIT_READ` — sebelum ini `GET /cs/audit-events` hanya menuntut identitas petugas,
+  jadi setiap petugas terautentikasi bisa membaca jejak **rekannya**: jam login, loket,
+  dan setiap otorisasi supervisor yang pernah gagal atas nama seseorang. **Pemanggil lama
+  yang tidak memegang cakupan ini sekarang dijawab `403`.**
+- `ESCALATION_REVIEW` — sengaja bukan `VIDEO_CALL`. Sebuah `APPROVED` di jalur eskalasi
+  memindahkan nasabah ke `CREDENTIALS`, yaitu keputusan sebesar keputusan panggilannya
+  sendiri; cakupan yang sama dengan panggilan akan memberikan tepat itu kepada setiap
+  petugas Tier 1 — termasuk kepada yang mengaku tidak sanggup memutuskannya.
 
 Kunci sistem salah **dan** kewenangan kurang keduanya dijawab `403 FORBIDDEN` dengan
 pesan identik — disengaja, supaya penyerang tidak bisa menebak kunci mana yang sudah
@@ -1837,7 +1851,7 @@ kredensial petugas lebih dulu akan membuatnya harus sudah masuk untuk bisa masuk
     "terminal_id": "WKS-SMG-0842",
     "terminal_status": "REGISTERED",
     "started_at": "2026-10-07T01:02:11Z",
-    "expires_at": "2026-10-07T09:02:11Z",
+    "expires_at": "2026-10-07T10:02:11Z",
     "next_step": "TERMINAL_READINESS"
   }
 }
@@ -1873,7 +1887,7 @@ Header: kunci sistem + kedua header petugas. Menjawab **tentang pemanggilnya**.
       "terminal_id": "WKS-SMG-0842",
       "shift": "PAGI",
       "started_at": "2026-10-07T08:02:11+07:00",
-      "expires_at": "2026-10-07T16:02:11+07:00"
+      "expires_at": "2026-10-07T17:02:11+07:00"
     }
   }
 }
@@ -2169,7 +2183,7 @@ endpoint yang bisa mengembalikannya lagi — sama dengan `session_token` di `aut
 | NPP ada di HRIS tapi statusnya dicabut | `422 EMPLOYEE_INACTIVE` |
 | NPP bukan NPP siapa pun | `404 EMPLOYEE_NOT_FOUND` |
 | Token supervisor salah | `401 SUPERVISOR_TOKEN_INVALID` |
-| Cakupan di luar empat yang ada | `422 SCOPE_UNKNOWN`, `details.scope` menyebut yang mana |
+| Cakupan di luar enam yang ada | `422 SCOPE_UNKNOWN`, `details.scope` menyebut yang mana, `details.allowed` daftarnya |
 | Direktori pegawai tidak terpasang | `503 HRIS_UNAVAILABLE` |
 
 Cakupan ganda **dibuang, bukan ditolak**: `["TICKET","TICKET"]` adalah permintaan yang
@@ -2178,6 +2192,84 @@ maksudnya jelas. Penulisannya dinormalkan ke huruf besar.
 Dua peristiwa audit: `AGENT_REGISTERED` saat berhasil, dan `SUPERVISOR_AUTH_FAILED` saat
 tokennya salah. Yang kedua dicatat dengan sengaja — percobaan pemberian kewenangan yang
 ditolak adalah hal yang justru paling perlu terbaca di jejak.
+
+### `PATCH /internal/v1/agents/{employee_id}`
+
+Mengubah cakupan atau mencabut hak petugas yang **sudah** terdaftar. Header dan
+dual-control-nya sama dengan `POST /agents`, dan untuk alasan yang sama: yang
+ditandatangani adalah pemberian — atau pencabutan — kewenangan.
+
+Sebelum endpoint ini, keduanya hanya bisa lewat SQL langsung: jalur yang tidak
+menghasilkan jejak audit, tidak menuntut otorisasi supervisor, dan tidak bisa diserahkan
+ke siapa pun di luar pemegang kredensial database.
+
+```json
+{
+  "scopes": ["VIDEO_CALL", "TICKET", "AUDIT_READ"],
+  "is_active": true,
+  "supervisor_id": "SPV-0021",
+  "token": "123456"
+}
+```
+
+| Bidang | Arti |
+|---|---|
+| `scopes` | **MENGGANTI** seluruh daftar, bukan menambah. Dihilangkan = tidak diubah |
+| `is_active` | `false` mencabut hak petugas. Dihilangkan = tidak diubah |
+
+Keduanya dihilangkan → `400 VALIDATION_ERROR`. PATCH yang tidak mengubah apa pun tapi
+dijawab `200` akan membuat klien yang salah menamai bidangnya mengira perubahannya
+tersimpan.
+
+`"scopes": []` ditolak `422 SCOPE_EMPTY`, **bukan** diperlakukan sebagai pencabutan:
+petugas tanpa cakupan adalah baris yang terlihat sah tapi ditolak di setiap jalur. Yang
+dimaksud hampir selalu `is_active: false`, dan pesannya menyebutkan itu.
+
+NPP ada di **path**, bukan di body: ia menyebut sasaran perubahan, dan sasaran yang
+datang dari body membuat satu URL bisa mengubah petugas mana pun — termasuk saat
+permintaannya tercatat di log proxy sebagai `PATCH /agents/CS-1042` yang menyentuh orang
+lain.
+
+#### Response `200 OK`
+```json
+{
+  "data": {
+    "employee_id": "CS-1042",
+    "name": "Sarah Adisti",
+    "scopes": ["VIDEO_CALL", "TICKET"],
+    "is_active": true,
+    "scopes_added": ["TICKET"],
+    "scopes_removed": [],
+    "updated_by": "OPS-2001",
+    "updated_at": "2026-10-10T07:11:36Z"
+  }
+}
+```
+
+`scopes_added` dan `scopes_removed` disertakan supaya layar supervisor bisa menampilkan
+"CUSTOMER_PII dicabut" tanpa menyimpan keadaan sebelumnya sendiri — dan supaya yang
+menekan tombolnya melihat apa yang **sebenarnya** berubah, bukan hanya daftar akhir yang
+ia kirim sendiri. Keduanya selalu array, tidak pernah `null`.
+
+| Keadaan | Jawaban |
+|---|---|
+| NPP belum terdaftar sebagai petugas | `404 AGENT_NOT_FOUND` |
+| Petugas mengubah kewenangannya **sendiri** | `403 AGENT_SELF_UPDATE` |
+| Cakupan di luar enam yang ada | `422 SCOPE_UNKNOWN` |
+| `"scopes": []` | `422 SCOPE_EMPTY` |
+| Token supervisor salah | `401 SUPERVISOR_TOKEN_INVALID`, dicatat `SUPERVISOR_AUTH_FAILED` |
+
+`AGENT_SELF_UPDATE` adalah four-eyes dan diperiksa **sebelum** apa pun yang mahal:
+menaikkan kewenangan sendiri hanya butuh satu orang, dan mencabut hak sendiri bisa
+dipakai menutup giliran tanpa jejak logout.
+
+Peristiwa audit `AGENT_UPDATED` (migrasi 000041) memuat `scopes_before`, `scopes_after`,
+selisihnya, dan supervisor yang menandatanganinya. `is_active_before/after` hanya ikut
+kalau keaktifannya memang berubah — jejak yang menyebut "is_active tetap true" pada
+setiap perubahan cakupan membuat pencabutan hak yang sungguhan lebih sulit ditemukan.
+
+Kunci API dan kata sandi **tidak** disentuh endpoint ini. Rotasi kunci petugas adalah
+jalur tersendiri yang belum ada.
 
 ### `GET /internal/v1/cs/dashboard`
 
@@ -2305,15 +2397,177 @@ panggilan dimulai, panggilan berakhir, dan keputusan verifikasi sudah tercatat d
 `cs_access_logs`. Menuliskannya dua kali akan membuat setiap pemeriksaan harus memutuskan
 sumber mana yang benar.
 
-> **Penjaganya lebih longgar daripada semestinya.** Endpoint ini hanya menuntut kunci
-> sistem + identitas petugas, jadi **setiap petugas terautentikasi bisa membaca jejak
-> rekannya** — padahal ini kewenangan pengawas. Preseden yang diikuti adalah
-> `GET /v1/onboarding/sessions/{id}/audit`, yang juga tidak menuntut cakupan.
+> **Menuntut cakupan `AUDIT_READ`, dan ini perubahan yang memutus pemanggil lama.**
+> Sebelumnya endpoint ini hanya menuntut kunci sistem + identitas petugas, jadi setiap
+> petugas terautentikasi bisa membaca jejak **rekannya**: jam login, loket, dan setiap
+> otorisasi supervisor yang pernah gagal atas nama seseorang. Jejak pengawasan yang
+> terbuka bagi semua yang diawasinya bukan pembatas kewenangan — ia hanya terlihat
+> seperti pembatas.
 >
-> Penyebabnya batasan nyata: CHECK `cs_agents_scopes_valid` di migrasi 000027 mengunci
-> `cs_agents.scopes` ke empat nilai, jadi cakupan `AUDIT_READ` menuntut migrasi yang
-> mengubah constraint itu. Sampai migrasi itu ada, jangan anggap endpoint ini sebagai
-> pembatas kewenangan.
+> Cakupannya dibuka migrasi 000041, yang melebarkan CHECK `cs_agents_scopes_valid` dari
+> 000027. Petugas yang sebelumnya memakai endpoint ini perlu `AUDIT_READ` ditambahkan
+> lewat `PATCH /internal/v1/agents/{employee_id}`; tanpa itu jawabannya `403 FORBIDDEN`.
+>
+> `GET /cs/dashboard` **tetap** hanya menuntut identitas petugas, dan bedanya disengaja:
+> beranda menjawab tentang pekerjaan petugas sendiri, jejak audit menjawab tentang
+> pekerjaan orang lain.
+
+### Eskalasi Tier 2 — `/internal/v1/escalations`
+
+Scope **`ESCALATION_REVIEW`** untuk keduanya. Perkaranya lahir dari
+`POST /v1/onboarding/video-call/result` dengan `result: "NEED_REVIEW"` (§5c); di sini ia
+dikerjakan dan ditutup.
+
+Yang ditutupnya bukan kerapian: baris eskalasi menahan nasabah dari antrean lewat
+`422 VIDEO_CALL_UNDER_REVIEW`, jadi perkara yang tidak pernah ditutup berarti nasabah
+yang **tidak bisa mengantre lagi, selamanya**. Sebelum endpoint ini, menutupnya hanya
+bisa lewat `UPDATE` di database.
+
+#### `GET /internal/v1/escalations`
+
+| Query | Arti |
+|---|---|
+| `status` | `PENDING` · `IN_REVIEW` · `RESOLVED` · `CANCELLED`. **Kosong = yang TERBUKA saja** (`PENDING` + `IN_REVIEW`) |
+| `queue` | `TIER_2_VERIFICATION` · `FRAUD_REVIEW` · `COMPLIANCE_REVIEW`. Kosong = semua |
+| `claimed_by` | NPP peninjau — "perkara yang sedang saya pegang" |
+| `session_id` | satu sesi nasabah |
+| `limit` | bawaan 50, maksimum 200 |
+
+```json
+{
+  "data": {
+    "escalations": [
+      {
+        "escalation_id": "esc_9f8e7d6c5b4a3b2c",
+        "session_id": "onb_9f8e7d6c5b4a",
+        "queue_id": "q_abc123",
+        "escalation_queue": "TIER_2_VERIFICATION",
+        "status": "PENDING",
+        "reason": "Wajah mirip tapi e-KTP tampak dilaminasi ulang.",
+        "raised_by_agent": "CS-1042",
+        "raised_at": "2026-10-10T06:12:03Z",
+        "waited_seconds": 10800
+      }
+    ],
+    "count": 1
+  }
+}
+```
+
+- **Terlama dulu** (`raised_at` naik), berbeda dari setiap daftar lain di API ini yang
+  terbaru dulu. Ini antrean kerja, bukan lini masa: perkara yang paling lama menunggu
+  adalah nasabah yang paling lama tidak bisa mengantre.
+- `waited_seconds` **diturunkan** dari `raised_at`, tidak disimpan — seperti `priority` di
+  `GET /video-call/queued`. Perkara yang sudah ditutup berhenti menghitung di waktu
+  penutupannya. Tidak ada ambang `priority` di sini: tinjauan Tier 2 memang berjam-jam,
+  dan ambang sepuluh menit milik antrean panggilan akan menandai semua perkara `HIGH`
+  sejak menit kesebelas.
+- Bawaan tanpa `status` adalah antrean kerja, bukan arsip: layar yang dibuka setiap pagi
+  menanyakan "apa yang harus saya kerjakan", dan arsip yang tercampur akan membenamkan
+  perkara baru di bawah perkara tahun lalu.
+- Nilai `queue` atau `status` yang tidak dikenal → `422 ESCALATION_QUEUE_UNKNOWN` /
+  `422 ESCALATION_STATUS_UNKNOWN`, **bukan** daftar kosong. Nol perkara karena salah
+  ketik tidak bisa dibedakan dari antrean yang memang bersih, dan yang kedua adalah
+  kesimpulan yang membuat orang pulang.
+- Tanpa kursor, berbeda dari `GET /internal/v1/onboarding/sessions`. Antrean terbuka
+  Tier 2 berukuran puluhan; kalau ia sampai butuh halaman kedua, yang perlu diperbaiki
+  adalah jumlah peninjaunya.
+
+#### `PATCH /internal/v1/escalations/{escalation_id}`
+
+```json
+{
+  "action": "RESOLVE",
+  "resolution": "APPROVED",
+  "notes": "Dokumen fisik diperiksa ulang bersama penyelia cabang."
+}
+```
+
+| Bidang | Arti |
+|---|---|
+| `action` | `CLAIM` memegang perkaranya (`PENDING` → `IN_REVIEW`); `RESOLVE` menutupnya |
+| `resolution` | **wajib pada `RESOLVE`**: `APPROVED` · `REJECTED` |
+| `rejection_reason` | **wajib saat `REJECTED`**, enum yang SAMA dengan penolakan Tier 1 |
+| `notes` | **wajib pada `RESOLVE`**, teks bebas |
+
+`action` adalah **kata kerja, bukan status tujuan**. `{"status":"IN_REVIEW"}` akan memaksa
+aplikasi desktop tahu mesin statusnya untuk bisa memakai endpoint-nya, dan membuat setiap
+status yang nanti ditambahkan terlihat seperti tindakan yang sah diminta klien.
+
+`rejection_reason` memakai enam nilai yang sama dengan `POST /video-call/result`
+(`IDENTITY_MISMATCH`, `INVALID_DOCUMENT`, `FACE_MISMATCH`, `SUSPICIOUS_ACTIVITY`,
+`INCOMPLETE_INFORMATION`, `OTHER`). Dua daftar alasan untuk tindakan yang sama akan
+membuat satu laporan harus menjumlahkan dua kategori untuk satu hal.
+
+`notes` wajib, dan itu cermin dari kewajiban `notes` pada `NEED_REVIEW`: Tier 1 wajib
+menerangkan supaya Tier 2 tidak mengulang seluruh panggilan, dan Tier 2 wajib menerangkan
+supaya pemeriksaan berikutnya — atau nasabah yang menyengketakan hasilnya — tahu atas
+dasar apa rekeningnya akhirnya dibuka atau ditolak.
+
+#### Response `200 OK`
+```json
+{
+  "data": {
+    "escalation": {
+      "escalation_id": "esc_9f8e7d6c5b4a3b2c",
+      "session_id": "onb_9f8e7d6c5b4a",
+      "escalation_queue": "TIER_2_VERIFICATION",
+      "status": "RESOLVED",
+      "raised_by_agent": "CS-1042",
+      "raised_at": "2026-10-10T06:12:03Z",
+      "claimed_by_agent": "SPV-3001",
+      "claimed_at": "2026-10-10T08:55:00Z",
+      "resolved_by_agent": "SPV-3001",
+      "resolved_at": "2026-10-10T09:01:12Z",
+      "resolution": "APPROVED",
+      "resolution_notes": "Dokumen fisik diperiksa ulang bersama penyelia cabang."
+    },
+    "current_step": "CREDENTIALS"
+  }
+}
+```
+
+- **`APPROVED` memindahkan nasabah ke `CREDENTIALS`**, persis seperti `APPROVED` Tier 1 —
+  bukan membuat rekening. Rekeningnya lahir di `POST /submit`.
+- **`REJECTED` tidak memindahkan langkah.** Nasabah tetap di `VIDEO_CALL`, dan karena
+  perkaranya sudah tertutup ia **boleh mengantre lagi**.
+- `current_step` disertakan supaya layar petugas tidak perlu memanggil endpoint sesi
+  lagi — alasan yang sama dengan response `POST /video-call/result`.
+- Tidak ada `call_ended` di sini: panggilannya sudah lama berakhir, dan nasabahnya tidak
+  sedang menunggu di socket mana pun. Yang dilihatnya berubah adalah `current_step` saat
+  ia membuka aplikasinya lagi.
+
+| Keadaan | Jawaban |
+|---|---|
+| `escalation_id` tidak dikenal | `404 ESCALATION_NOT_FOUND` |
+| Perkara sudah `RESOLVED`/`CANCELLED` | `409 ESCALATION_ALREADY_CLOSED` |
+| **Penutup = pengaju perkaranya** | `403 ESCALATION_SELF_RESOLVE` |
+| Perkara `IN_REVIEW` dipegang petugas lain | `409 ESCALATION_CLAIMED_BY_OTHER`, `details.claimed_by_agent` |
+| `action` tak dikenal, atau `RESOLVE` tak lengkap | `400 VALIDATION_ERROR` |
+| Repo eskalasi tidak terpasang | `503 PROVIDER_NOT_CONFIGURED` |
+
+**`ESCALATION_SELF_RESOLVE` adalah four-eyes, dan berlaku pada `CLAIM` juga.**
+`NEED_REVIEW` adalah pernyataan bahwa petugas itu tidak sanggup memutuskan perkaranya;
+membiarkannya memutus sendiri sesudahnya mengubah eskalasi menjadi jalan memutar yang
+menghasilkan keputusan yang persis sama tanpa diperiksa siapa pun. Melarangnya hanya di
+`RESOLVE` akan membuat pengaju boleh memegang perkaranya lebih dulu lalu ditolak di
+langkah terakhir — perkara yang kemudian tertahan atas namanya.
+
+`CLAIM` atas perkara yang sudah dipegang **diri sendiri** dijawab apa adanya, bukan
+`409`: layar yang dibuka ulang akan memanggilnya lagi.
+
+**Sesi nasabah yang kedaluwarsa tidak menggagalkan penutupan.** Perkaranya tetap ditutup
+dan `current_step` menjawab langkah yang ada; yang tidak dilakukan adalah memajukan
+langkah sesi yang sudah mati. Perkara yang gagal ditutup karena sesinya basi adalah
+perkara yang menahan nasabahnya selamanya — persis keadaan yang endpoint ini ada untuk
+mengakhiri.
+
+Dua peristiwa audit, keduanya ke **`onboarding_audit_logs`** (ber-kunci `session_id`,
+terbaca lewat `GET /v1/onboarding/sessions/{id}/audit`):
+`VIDEO_CALL_ESCALATION_CLAIMED` dan `VIDEO_CALL_ESCALATION_RESOLVED`. Bukan ke
+`cs_audit_events`: pertanyaan yang dijawabnya adalah "mengapa pembukaan rekening orang
+ini tertahan, dan siapa yang melepaskannya" — pertanyaan tentang sesi, bukan tentang
+giliran kerja petugas.
 
 ### `GET /internal/v1/onboarding/sessions`
 
@@ -2492,6 +2746,30 @@ petugas video call bisa mengubah biaya dan limit kartu untuk seluruh nasabah. Li
 > mengirim `X-Internal-API-Key` sekarang dijawab `403`. Tambahkan kedua header petugas,
 > dan pastikan barisnya di `cs_agents` punya scope `CARD_ADMIN`.
 
+### `GET/PUT /internal/v1/onboarding/products` — administrasi katalog produk
+
+Scope **`CARD_ADMIN`** juga, bukan cakupan kelima: mengatur katalog kartu Paspor dan
+mengatur katalog jenis rekening tabungan adalah pekerjaan administratif yang sama
+jenisnya, dan CHECK `cs_agents_scopes_valid` di migrasi `000027` mengunci daftar cakupan
+ke empat nilai.
+
+Kontrak lengkapnya di `docs/06-BUKA-REKENING-API-SPEC.md` bagian *Administrasi katalog
+produk*. Empat hal yang perlu diketahui sebelum memanggilnya:
+
+- **`PUT` selalu menerima DAFTAR**, dan `catalog_version` naik **sekali** per permintaan
+  — bukan per produk.
+- **Field yang tidak dikenal ditolak `400`**, tidak diabaikan. `"is_ative"` yang
+  terabaikan akan menonaktifkan produk yang tayang ke nasabah tanpa ada yang meminta.
+- **`features: null` berarti jangan sentuh**, `features: []` berarti hapus semua. Tanpa
+  pembedaan itu, setiap penulisan harga menghapus teks fitur produknya.
+- **Memindahkan badge "Paling Populer" wajib mengirim kedua produk** dalam satu
+  permintaan. Hanya yang mendapat → `409 ONBOARDING_PRODUCT_CATALOG_CONFLICT`.
+
+Jalur admin **tidak membaca** `FEATURE_ONBOARDING_PRODUCT_CATALOG`: katalog yang
+dimatikan karena isinya salah adalah justru saat isinya paling perlu diubah.
+
+Belum ada tabel jejak audit untuk katalog ini — aktor dan IP masuk `slog` saja.
+
 ---
 
 ## 12. Penjadwalan ulang video call (sisi nasabah)
@@ -2593,6 +2871,8 @@ dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
 | `AGENT_SESSION_NOT_FOUND` | 404 | Tidak ada sesi petugas yang aktif |
 | `AGENT_ALREADY_REGISTERED` | 409 | NPP itu sudah terdaftar sebagai petugas |
 | `AGENT_CALL_IN_PROGRESS` | 409 | Petugas masih menangani panggilan lain |
+| `AGENT_NOT_FOUND` | 404 | NPP ada di HRIS tapi belum pernah didaftarkan sebagai petugas CS. Dibedakan dari `EMPLOYEE_NOT_FOUND` — jalan keluarnya `POST /internal/v1/agents`, bukan koreksi ejaan |
+| `AGENT_SELF_UPDATE` | 403 | Petugas mencoba mengubah cakupan atau mencabut hak dirinya sendiri. Four-eyes: kenaikan kewenangan tidak boleh cukup satu orang |
 | `TERMINAL_NOT_FOUND` | 404 | Terminal tidak terdaftar |
 | `TERMINAL_ALREADY_REGISTERED` | 409 | Terminal dengan ID itu sudah terdaftar |
 | `TERMINAL_NOT_READY` | 422 | Aktivasi ditolak: salah satu dari tiga gerbang kesiapan belum lolos. Pesannya menyebut gerbang mana |
@@ -2602,11 +2882,18 @@ dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
 | `SUPERVISOR_TOKEN_INVALID` | 401 | Token otorisasi dual-control supervisor tidak sah |
 | `VIDEO_CALL_UNDER_REVIEW` | 422 | Sesi punya eskalasi `NEED_REVIEW` yang belum selesai — nasabah ditahan dari antrean sampai Tier 2 memutus |
 | `VIDEO_CALL_ESCALATION_EXISTS` | 409 | Sesi ini sudah dalam peninjauan |
+| `ESCALATION_NOT_FOUND` | 404 | `escalation_id` tidak dikenal |
+| `ESCALATION_ALREADY_CLOSED` | 409 | Perkara sudah `RESOLVED`/`CANCELLED` — muat ulang daftarnya, jangan perbaiki formulirnya |
+| `ESCALATION_SELF_RESOLVE` | 403 | Petugas yang MENGAJUKAN eskalasi mencoba memegang atau menutupnya sendiri |
+| `ESCALATION_CLAIMED_BY_OTHER` | 409 | Perkara `IN_REVIEW` dipegang peninjau lain. `details.claimed_by_agent` menyebut siapa |
+| `ESCALATION_QUEUE_UNKNOWN` | 422 | `?queue=` di luar tiga antrean eskalasi. `details.allowed` memuat daftarnya |
+| `ESCALATION_STATUS_UNKNOWN` | 422 | `?status=` di luar empat status perkara |
 | `VIDEO_CALL_NOT_ACTIVE` | 422 | Hasil disubmit untuk panggilan yang belum diambil petugas (`QUEUED`) atau sudah `CANCELLED` |
 | `VIDEO_CALL_AGENT_MISMATCH` | 409 | Hasil disubmit oleh petugas yang bukan pengambil panggilannya |
 | `EMPLOYEE_NOT_FOUND` | 404 | NPP tidak ada di direktori pegawai HRIS |
 | `EMPLOYEE_INACTIVE` | 422 | NPP ada di HRIS tapi status kepegawaiannya dicabut — bukan salah ketik |
 | `HRIS_UNAVAILABLE` | 503 | Direktori pegawai tidak bisa dihubungi, atau belum terpasang di environment ini. Bukan penolakan — boleh dicoba lagi |
-| `SCOPE_UNKNOWN` | 422 | Cakupan kewenangan di luar `VIDEO_CALL`/`CARD_ADMIN`/`CUSTOMER_PII`/`TICKET`. `details.scope` menyebut yang mana |
+| `SCOPE_UNKNOWN` | 422 | Cakupan kewenangan di luar `VIDEO_CALL`/`CARD_ADMIN`/`CUSTOMER_PII`/`TICKET`/`AUDIT_READ`/`ESCALATION_REVIEW`. `details.scope` menyebut yang mana, `details.allowed` daftar lengkapnya |
+| `SCOPE_EMPTY` | 422 | `PATCH /agents/{npp}` dengan `"scopes": []`. Petugas tanpa cakupan adalah baris yang terlihat sah tapi ditolak di setiap jalur — untuk mencabut hak, kirim `is_active: false` |
 | `ONBOARDING_CATALOG_UNAVAILABLE` | 503 | Katalog jenis rekening tidak bisa dilayani: tidak ada produk aktif, atau `FEATURE_ONBOARDING_PRODUCT_CATALOG=false`. Client jatuh ke daftar bawaannya. Dipisah dari `ONBOARDING_PRODUCT_UNKNOWN`/`UNAVAILABLE` yang tentang SATU produk |
 | `INTERNAL_ERROR` | 500 | Kesalahan internal server |

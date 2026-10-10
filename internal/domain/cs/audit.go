@@ -18,7 +18,17 @@ import (
 // tercatat di `cs_access_logs`. Menuliskannya dua kali akan membuat setiap pemeriksaan
 // harus memutuskan sumber mana yang benar.
 const (
-	EventAgentRegistered  = "AGENT_REGISTERED"
+	EventAgentRegistered = "AGENT_REGISTERED"
+
+	// EventAgentUpdated: cakupan petugas diubah atau haknya dicabut
+	// (`PATCH /internal/v1/agents/{employee_id}`). Ditambahkan migrasi 000041.
+	//
+	// Terpisah dari AGENT_REGISTERED meski keduanya menulis baris cs_agents: pendaftaran
+	// adalah pemberian kewenangan pertama, perubahan adalah pelebaran atau pencabutan
+	// kewenangan yang sudah berjalan — dan yang kedua itulah yang dicari pemeriksaan
+	// ketika seseorang ternyata bisa melakukan sesuatu yang semestinya tidak bisa.
+	EventAgentUpdated = "AGENT_UPDATED"
+
 	EventAgentLogin       = "AGENT_LOGIN"
 	EventAgentLoginFailed = "AGENT_LOGIN_FAILED"
 	EventAgentLogout      = "AGENT_LOGOUT"
@@ -121,7 +131,8 @@ const (
 // menyimpulkan yang kedua dari yang pertama akan salah mengambil kesimpulan.
 func ValidAuditEventType(t string) bool {
 	switch t {
-	case EventAgentRegistered, EventAgentLogin, EventAgentLoginFailed,
+	case EventAgentRegistered, EventAgentUpdated,
+		EventAgentLogin, EventAgentLoginFailed,
 		EventAgentLogout, EventAgentPasswordSet,
 		EventSupervisorAuthorized, EventSupervisorAuthFailed,
 		EventDeviceHealthcheck, EventPIIAcknowledged,

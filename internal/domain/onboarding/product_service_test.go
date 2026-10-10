@@ -3,6 +3,7 @@ package onboarding
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
@@ -27,11 +28,13 @@ func (m *mockProductRepo) ActiveCatalog(_ context.Context) (*SavingsProductCatal
 type mockProductCache struct {
 	stored *SavingsProductCatalog
 
-	getErr error
-	setErr error
+	getErr        error
+	setErr        error
+	invalidateErr error
 
-	gets int
-	sets int
+	gets        int
+	sets        int
+	invalidates int
 }
 
 func (m *mockProductCache) GetCatalog(_ context.Context) (*SavingsProductCatalog, error) {
@@ -48,6 +51,15 @@ func (m *mockProductCache) SetCatalog(_ context.Context, c *SavingsProductCatalo
 		return m.setErr
 	}
 	m.stored = c
+	return nil
+}
+
+func (m *mockProductCache) InvalidateCatalog(_ context.Context) error {
+	m.invalidates++
+	if m.invalidateErr != nil {
+		return m.invalidateErr
+	}
+	m.stored = nil
 	return nil
 }
 
@@ -434,5 +446,322 @@ func TestDepositShownFor_UnknownProduct(t *testing.T) {
 
 	if _, _, ok := svc.DepositShownFor(context.Background(), ProductTabunganku); ok {
 		t.Fatal("produk di luar katalog harus melaporkan tidak ketemu")
+	}
+}
+
+// --- Admin katalog produk (Fase 6) ---
+
+// mockProductAdminRepo mencatat bentuk penulisan yang diterimanya, termasuk BERAPA KALI
+// versi dinaikkan — itu invarian yang paling mudah rusak dan paling sulit terlihat.
+type mockProductAdminRepo struct {
+	catalog *AdminProductCatalog
+	listErr error
+
+	writeErr error
+
+	// writeCalls dan versionBumps dihitung terpisah: satu pemanggilan WriteProducts
+	// yang menulis dua produk harus menghasilkan SATU kenaikan versi, dan dua angka
+	// yang sama tidak bisa membuktikan itu.
+	writeCalls   int
+	versionBumps int
+
+	lastWrites []ProductWrite
+	lastActor  string
+	lastIP     string
+}
+
+func (m *mockProductAdminRepo) ListAllProducts(_ context.Context) (*AdminProductCatalog, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	return m.catalog, nil
+}
+
+func (m *mockProductAdminRepo) WriteProducts(_ context.Context, writes []ProductWrite, actor, ip string) (*ProductCatalogWriteResult, error) {
+	m.writeCalls++
+	m.lastWrites = writes
+	m.lastActor = actor
+	m.lastIP = ip
+
+	if m.writeErr != nil {
+		return nil, m.writeErr
+	}
+
+	// Satu kenaikan per pemanggilan, meniru UPDATE tunggal di akhir transaksi.
+	m.versionBumps++
+
+	result := &ProductCatalogWriteResult{
+		CatalogVersion:   "2026-10-08." + strconv.Itoa(m.versionBumps),
+		Updated:          make([]ProductType, 0, len(writes)),
+		FeaturesReplaced: make([]ProductType, 0, len(writes)),
+	}
+	for _, w := range writes {
+		result.Updated = append(result.Updated, w.ProductType)
+		if w.Features != nil {
+			result.FeaturesReplaced = append(result.FeaturesReplaced, w.ProductType)
+		}
+	}
+	return result, nil
+}
+
+// validProductWrite menyusun badan penulisan yang sah untuk satu produk.
+func validProductWrite(pt ProductType, order int) ProductWrite {
+	return ProductWrite{
+		ProductType:        pt,
+		Name:               "Nama Produk",
+		Description:        "Deskripsi produk.",
+		MinInitialDeposit:  500000,
+		Currency:           "IDR",
+		IconKey:            ProductIconWallet,
+		Style:              ProductStylePrimary,
+		DisplayOrder:       order,
+		IsActive:           true,
+		AvailabilityStatus: ProductAvailable,
+	}
+}
+
+// DoD Fase 6: penulisan dua produk dalam satu transaksi menaikkan versi SATU KALI.
+//
+// Dua versi untuk satu keputusan berarti ETag berganti dua kali padahal tidak ada
+// katalog perantara yang pernah tayang, dan client yang menyimpan versi di antaranya
+// menyimpan versi yang tidak pernah dilayani.
+func TestWriteProducts_TwoProductsBumpVersionOnce(t *testing.T) {
+	repo := &mockProductAdminRepo{}
+	cache := &mockProductCache{stored: sampleProductCatalog()}
+	svc := NewProductAdminService(repo, cache)
+
+	result, err := svc.WriteProducts(context.Background(), ProductCatalogWriteRequest{
+		Products: []ProductWrite{
+			validProductWrite(ProductTahapanBCA, 1),
+			validProductWrite(ProductTabunganku, 2),
+		},
+	}, "ops-1", "10.0.0.1")
+	if err != nil {
+		t.Fatalf("penulisan dua produk harus berhasil: %v", err)
+	}
+
+	if repo.writeCalls != 1 {
+		t.Errorf("mau 1 pemanggilan repo, dapat %d", repo.writeCalls)
+	}
+	if repo.versionBumps != 1 {
+		t.Errorf("mau versi naik 1 kali, dapat %d", repo.versionBumps)
+	}
+	if len(result.Updated) != 2 {
+		t.Errorf("mau 2 produk tertulis, dapat %d", len(result.Updated))
+	}
+	if result.CatalogVersion != "2026-10-08.1" {
+		t.Errorf("mau versi 2026-10-08.1, dapat %q", result.CatalogVersion)
+	}
+}
+
+// Cache katalog aktif WAJIB dihapus setelah penulisan. Tanpa itu, kunci tetap
+// onboarding:products:v1:catalog menyajikan katalog lama sampai TTL 24 jam habis —
+// nasabah melihat setoran awal yang sudah diubah product owner.
+func TestWriteProducts_InvalidatesCatalogCache(t *testing.T) {
+	repo := &mockProductAdminRepo{}
+	cache := &mockProductCache{stored: sampleProductCatalog()}
+	svc := NewProductAdminService(repo, cache)
+
+	if _, err := svc.WriteProducts(context.Background(), ProductCatalogWriteRequest{
+		Products: []ProductWrite{validProductWrite(ProductTahapanBCA, 1)},
+	}, "ops-1", "10.0.0.1"); err != nil {
+		t.Fatalf("penulisan harus berhasil: %v", err)
+	}
+
+	if cache.invalidates != 1 {
+		t.Errorf("mau cache dihapus 1 kali, dapat %d", cache.invalidates)
+	}
+	if cache.stored != nil {
+		t.Error("entri katalog lama masih ada di cache setelah penulisan")
+	}
+}
+
+// Cache yang gagal dihapus TIDAK menggagalkan penulisan: transaksinya sudah commit, dan
+// error di titik ini akan membuat pemanggil mengulang permintaan yang sudah berhasil —
+// menaikkan versi sekali lagi untuk perubahan yang sama.
+func TestWriteProducts_CacheFailureDoesNotFailWrite(t *testing.T) {
+	repo := &mockProductAdminRepo{}
+	cache := &mockProductCache{invalidateErr: errors.New("redis tersendat")}
+	svc := NewProductAdminService(repo, cache)
+
+	result, err := svc.WriteProducts(context.Background(), ProductCatalogWriteRequest{
+		Products: []ProductWrite{validProductWrite(ProductTahapanBCA, 1)},
+	}, "ops-1", "10.0.0.1")
+	if err != nil {
+		t.Fatalf("galat cache tidak boleh menggagalkan penulisan: %v", err)
+	}
+	if result.CatalogVersion == "" {
+		t.Error("versi katalog harus tetap dilaporkan")
+	}
+}
+
+// Cache nil adalah deployment yang sah — tanpa Redis, pembacaan berikutnya memang sudah
+// langsung ke database.
+func TestWriteProducts_NilCacheIsFine(t *testing.T) {
+	svc := NewProductAdminService(&mockProductAdminRepo{}, nil)
+
+	if _, err := svc.WriteProducts(context.Background(), ProductCatalogWriteRequest{
+		Products: []ProductWrite{validProductWrite(ProductTahapanBCA, 1)},
+	}, "ops-1", ""); err != nil {
+		t.Fatalf("cache nil harus tetap bisa menulis: %v", err)
+	}
+}
+
+// Badan yang ditolak validasi TIDAK boleh menyentuh repository sama sekali: penulisan
+// yang gagal di tengah transaksi lebih mahal daripada penolakan sebelum transaksi lahir.
+func TestWriteProducts_ValidationRejectsBeforeRepo(t *testing.T) {
+	disabled := validProductWrite(ProductTahapanBCA, 1)
+	disabled.AvailabilityStatus = ProductDisabled // tanpa reason_key
+
+	popularA := validProductWrite(ProductTahapanBCA, 1)
+	popularA.IsPopular = true
+	popularB := validProductWrite(ProductTabunganku, 2)
+	popularB.IsPopular = true
+
+	defaultDisabled := validProductWrite(ProductTahapanBCA, 1)
+	defaultDisabled.IsDefault = true
+	defaultDisabled.AvailabilityStatus = ProductComingSoon
+	reason := ProductReasonComingSoon
+	defaultDisabled.AvailabilityReasonKey = &reason
+
+	inactivePopular := validProductWrite(ProductTahapanBCA, 1)
+	inactivePopular.IsActive = false
+	inactivePopular.IsPopular = true
+
+	badIcon := validProductWrite(ProductTahapanBCA, 1)
+	badIcon.IconKey = "GRADIENT_BLUE"
+
+	zeroOrder := validProductWrite(ProductTahapanBCA, 0)
+
+	negativeDeposit := validProductWrite(ProductTahapanBCA, 1)
+	negativeDeposit.MinInitialDeposit = -1
+
+	emptyFeature := validProductWrite(ProductTahapanBCA, 1)
+	features := []string{"Gratis tarik tunai", "   "}
+	emptyFeature.Features = &features
+
+	cases := map[string][]ProductWrite{
+		"daftar kosong":                {},
+		"DISABLED tanpa alasan":        {disabled},
+		"dua is_popular":               {popularA, popularB},
+		"default tapi tidak AVAILABLE": {defaultDisabled},
+		"tidak aktif tapi is_popular":  {inactivePopular},
+		"icon_key di luar enum":        {badIcon},
+		"display_order nol":            {zeroOrder},
+		"setoran awal negatif":         {negativeDeposit},
+		"fitur kosong":                 {emptyFeature},
+		"produk disebut dua kali":      {validProductWrite(ProductTahapanBCA, 1), validProductWrite(ProductTahapanBCA, 2)},
+		"product_type di luar enum":    {validProductWrite(ProductType("DEPOSITO"), 1)},
+	}
+
+	for name, writes := range cases {
+		repo := &mockProductAdminRepo{}
+		svc := NewProductAdminService(repo, nil)
+
+		_, err := svc.WriteProducts(context.Background(),
+			ProductCatalogWriteRequest{Products: writes}, "ops-1", "")
+		if err == nil {
+			t.Errorf("%s: harus ditolak", name)
+			continue
+		}
+		if repo.writeCalls != 0 {
+			t.Errorf("%s: repository tidak boleh dipanggil, dipanggil %d kali", name, repo.writeCalls)
+		}
+	}
+}
+
+// features: null berarti JANGAN SENTUH; features: [] berarti HAPUS SEMUA. Keduanya harus
+// bisa dibedakan — tanpa itu, setiap penulisan harga akan menghapus teks fitur produknya.
+func TestWriteProducts_FeaturesNilVersusEmpty(t *testing.T) {
+	untouched := validProductWrite(ProductTahapanBCA, 1)
+	// Features sengaja dibiarkan nil.
+
+	cleared := validProductWrite(ProductTabunganku, 2)
+	empty := []string{}
+	cleared.Features = &empty
+
+	repo := &mockProductAdminRepo{}
+	svc := NewProductAdminService(repo, nil)
+
+	result, err := svc.WriteProducts(context.Background(), ProductCatalogWriteRequest{
+		Products: []ProductWrite{untouched, cleared},
+	}, "ops-1", "")
+	if err != nil {
+		t.Fatalf("penulisan harus berhasil: %v", err)
+	}
+
+	if len(result.FeaturesReplaced) != 1 {
+		t.Fatalf("mau 1 produk yang fiturnya diganti, dapat %d", len(result.FeaturesReplaced))
+	}
+	if result.FeaturesReplaced[0] != ProductTabunganku {
+		t.Errorf("mau TABUNGANKU yang fiturnya diganti, dapat %s", result.FeaturesReplaced[0])
+	}
+}
+
+// Aktor dan IP diteruskan ke repository: perubahan setoran awal harus bisa ditanyakan ke
+// orangnya, dan jejaknya hari ini adalah log terstruktur.
+func TestWriteProducts_PassesActorAndIP(t *testing.T) {
+	repo := &mockProductAdminRepo{}
+	svc := NewProductAdminService(repo, nil)
+
+	if _, err := svc.WriteProducts(context.Background(), ProductCatalogWriteRequest{
+		Products: []ProductWrite{validProductWrite(ProductTahapanBCA, 1)},
+	}, "OPS-2001", "10.1.2.3"); err != nil {
+		t.Fatalf("penulisan harus berhasil: %v", err)
+	}
+
+	if repo.lastActor != "OPS-2001" {
+		t.Errorf("mau aktor OPS-2001, dapat %q", repo.lastActor)
+	}
+	if repo.lastIP != "10.1.2.3" {
+		t.Errorf("mau IP 10.1.2.3, dapat %q", repo.lastIP)
+	}
+}
+
+// Jalur admin TIDAK membaca feature flag katalog: katalog yang dimatikan karena isinya
+// salah adalah justru saat isinya paling perlu diubah.
+//
+// Dibuktikan dengan membandingkannya langsung ke jalur nasabah pada keadaan yang sama.
+func TestProductAdmin_IgnoresFeatureFlag(t *testing.T) {
+	customer := NewProductService(ProductServiceConfig{
+		Repo:    &mockProductRepo{catalog: sampleProductCatalog()},
+		Enabled: false,
+	})
+	if _, err := customer.Catalog(context.Background()); err == nil {
+		t.Fatal("jalur nasabah harus menolak saat flag mati")
+	}
+
+	admin := NewProductAdminService(&mockProductAdminRepo{
+		catalog: &AdminProductCatalog{CatalogVersion: "2026-10-08.1"},
+	}, nil)
+
+	if _, err := admin.ListProducts(context.Background()); err != nil {
+		t.Errorf("jalur admin harus tetap melayani saat flag mati: %v", err)
+	}
+	if _, err := admin.WriteProducts(context.Background(), ProductCatalogWriteRequest{
+		Products: []ProductWrite{validProductWrite(ProductTahapanBCA, 1)},
+	}, "ops-1", ""); err != nil {
+		t.Errorf("jalur admin harus tetap bisa menulis saat flag mati: %v", err)
+	}
+}
+
+// Katalog kosong untuk ADMIN adalah array kosong, bukan 503: layar admin yang melihat
+// daftar kosong sedang melihat keadaan database yang sebenarnya.
+func TestListProducts_EmptyIsNotAnError(t *testing.T) {
+	for name, repo := range map[string]*mockProductAdminRepo{
+		"katalog nil":   {catalog: nil},
+		"produk nil":    {catalog: &AdminProductCatalog{CatalogVersion: "2026-10-08.1"}},
+		"produk kosong": {catalog: &AdminProductCatalog{Products: []AdminProductRow{}}},
+	} {
+		svc := NewProductAdminService(repo, nil)
+
+		catalog, err := svc.ListProducts(context.Background())
+		if err != nil {
+			t.Errorf("%s: tidak boleh error, dapat %v", name, err)
+			continue
+		}
+		if catalog.Products == nil {
+			t.Errorf("%s: products harus array kosong, bukan nil", name)
+		}
 	}
 }

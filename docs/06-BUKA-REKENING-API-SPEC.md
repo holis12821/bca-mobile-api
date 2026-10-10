@@ -20,7 +20,7 @@ bisa dilanjutkan dari ponsel mana pun.
 - Berlaku untuk **semua** endpoint yang menerima `session_id`:
   `GET`/`DELETE /sessions/{id}`, `PUT /sessions/{id}/card`, `POST /ocr`,
   `GET /ocr/{session_id}`, `POST /personal-data`, `POST /verify-otp`,
-  `POST /resend-otp`, `POST /biometric`, `POST /video-call/queue`,
+  `POST /resend-otp`, `POST /liveness/challenge`, `POST /biometric`, `POST /video-call/queue`,
   `POST /credentials`, `POST /submit`.
 - **Header yang tidak dikirim tetap lolos.** Menjawab 403 ke semua build yang
   sudah ada di tangan tester akan mengubah langkah pengamanan menjadi gangguan
@@ -64,7 +64,8 @@ POST /onboarding/ocr               ← upload foto KTP
 POST /onboarding/personal-data     ← simpan data pribadi
 POST /onboarding/verify-otp        ← verifikasi OTP
 POST /onboarding/resend-otp        ← kirim ulang OTP
-POST /onboarding/biometric         ← upload face + liveness
+POST /onboarding/liveness/challenge ← server menerbitkan aksi + nonce
+POST /onboarding/biometric         ← kirim bukti; server yang memutuskan
 POST /onboarding/video-call/queue  ← join antrean video call
 WS   /onboarding/video-call/signal ← WebRTC signaling
 GET  /onboarding/video-call/queued ← daftar antrean yang menunggu (internal)
@@ -296,11 +297,12 @@ pernah menuntut baris `onboarding_products` ada.
 
 ### Mengubah katalog
 
-Isi katalog ikut **migrasi**, bukan seeder: seeder menolak jalan di luar
+**Nilai awalnya** ikut migrasi, bukan seeder: seeder menolak jalan di luar
 `APP_ENV=development`, jadi staging akan menjawab layar kosong. Pelajaran dari `000025`.
 
-Sesudah mengubahnya, naikkan `onboarding_product_catalog_version.counter` **dan** hapus
-kunci cache aktifnya:
+**Perubahan sesudahnya lewat API admin** — lihat bagian berikut. Jalur SQL manual di
+bawah tetap didokumentasikan untuk keadaan tanpa petugas ber-cakupan `CARD_ADMIN`, tapi
+ia menuntut dua langkah yang mudah terlupakan dan API admin melakukan keduanya sendiri.
 
 ```sql
 UPDATE onboarding_product_catalog_version
@@ -316,6 +318,181 @@ redis-cli -n 0 DEL onboarding:products:v1:catalog
 tapi entri `onboarding:products:v1:catalog` punya TTL 24 jam dan akan terus melayani isi
 lama sampai TTL-nya habis — termasuk `catalog_version` lamanya. Keterbatasan yang sama
 dengan `onboarding:tnc:v1:active`.
+
+---
+
+## Administrasi katalog produk (`/internal/v1`)
+
+Dua endpoint, di belakang `X-Internal-API-Key` **dan** petugas ber-cakupan `CARD_ADMIN`.
+**Tidak pernah** ikut APK nasabah.
+
+```
+GET /internal/v1/onboarding/products
+PUT /internal/v1/onboarding/products
+```
+
+`CARD_ADMIN`, bukan cakupan kelima: mengatur katalog kartu Paspor dan mengatur katalog
+produk tabungan adalah pekerjaan administratif yang sama jenisnya, dan CHECK
+`cs_agents_scopes_valid` di migrasi `000027` mengunci daftar cakupan ke empat nilai —
+`PRODUCT_ADMIN` menuntut migrasi yang mengubah constraint itu.
+
+Jalur admin **tidak membaca** `FEATURE_ONBOARDING_PRODUCT_CATALOG`. Katalog yang
+dimatikan karena isinya salah adalah justru saat isinya paling perlu diubah; yang berhenti
+dilayani saat flag mati hanya endpoint nasabah.
+
+### `GET /internal/v1/onboarding/products`
+
+Bentuknya **berbeda** dari jalur nasabah: memuat `is_active` dan `updated_at`, tidak
+memuat `page`.
+
+```json
+{
+  "data": {
+    "catalog_version": "2026-10-08.1",
+    "products": [
+      {
+        "product_type": "TAHAPAN_BCA",
+        "name": "Tahapan BCA",
+        "description": "Tabungan utama untuk kemudahan transaksi harian…",
+        "min_initial_deposit": 500000,
+        "currency": "IDR",
+        "icon_key": "WALLET",
+        "style": "PRIMARY",
+        "badge_key": "MOST_POPULAR",
+        "features": ["Debit Mastercard", "m-BCA & KlikBCA", "Bebas tarik tunai…"],
+        "is_popular": true,
+        "is_default": true,
+        "is_active": true,
+        "display_order": 1,
+        "availability_status": "AVAILABLE",
+        "availability_reason_key": null,
+        "updated_at": "2026-10-08T10:56:45+07:00"
+      }
+    ]
+  }
+}
+```
+
+Produk `is_active = false` **IKUT** dikembalikan, berbeda dari jalur nasabah: baris produk
+tidak pernah dihapus, dan admin yang menyalakannya kembali harus bisa melihat barisnya
+beserta teks fiturnya — supaya ia tidak menulis ulang teks yang sudah ada.
+
+**Tidak ada `ETag` dan tidak ada `Cache-Control`.** Layar admin yang menerima `304` akan
+menyunting salinan yang mungkin dibuat sebelum penulisan terakhir, lalu mengirimkannya
+kembali — menulis ulang perubahan orang lain tanpa ada yang tahu. Jalur ini juga tidak
+menuntut `X-Device-Id`.
+
+### `PUT /internal/v1/onboarding/products`
+
+**Selalu daftar**, bahkan untuk satu produk. Seluruh kolom WAJIB — tidak ada patch
+sebagian, dan field yang tidak dikenal **ditolak** `400`, bukan diabaikan: `"is_ative"`
+yang terabaikan akan menulis `is_active = false` ke katalog yang tayang ke nasabah.
+
+```json
+{
+  "products": [
+    {
+      "product_type": "TABUNGANKU",
+      "name": "TabunganKu",
+      "description": "Tabungan perorangan dengan persyaratan sangat mudah…",
+      "min_initial_deposit": 25000,
+      "currency": "IDR",
+      "icon_key": "SAVINGS",
+      "style": "NEUTRAL",
+      "badge_key": null,
+      "features": ["Tanpa biaya administrasi bulanan", "Bunga kompetitif"],
+      "is_popular": false,
+      "is_default": false,
+      "is_active": true,
+      "display_order": 3,
+      "availability_status": "AVAILABLE",
+      "availability_reason_key": null
+    }
+  ]
+}
+```
+
+Response `200 OK`:
+
+```json
+{
+  "data": {
+    "catalog_version": "2026-10-08.2",
+    "updated": ["TABUNGANKU", "TAHAPAN_XPRESI"],
+    "features_replaced": ["TABUNGANKU"]
+  }
+}
+```
+
+**`features` punya tiga arti, dan ketiganya berbeda:**
+
+| Dikirim | Artinya |
+|---|---|
+| `null` atau tidak dikirim | **jangan sentuh** fitur produk ini |
+| `[]` | hapus **semua** fiturnya |
+| `["a", "b"]` | ganti seluruhnya, urutan di array = urutan tayang |
+
+Dibedakan karena tanpa itu setiap penulisan harga akan menghapus teks fitur produknya.
+`features_replaced` di response menyebut produk mana yang fiturnya benar-benar diganti.
+
+**`catalog_version` naik SEKALI per permintaan**, bukan per produk. Dua produk yang
+diubah bersamaan adalah satu keputusan product owner, dan dua versi untuk satu keputusan
+membuat `ETag` berganti dua kali padahal tidak ada katalog perantara yang pernah tayang.
+
+Cache katalog aktif **dihapus otomatis** sesudah penulisan. Kegagalan penghapusan
+**tidak** menggagalkan penulisan — transaksinya sudah commit, dan error di titik itu akan
+membuat pemanggil mengulang permintaan yang sudah berhasil. Yang terjadi dicatat
+`slog.Error` beserta perintah `DEL` yang perlu dijalankan manual.
+
+#### Memindahkan badge "Paling Populer"
+
+Maksimum satu produk boleh `is_popular`, dan maksimum satu boleh `is_default`.
+Memindahkannya **wajib mengirim kedua produk dalam satu permintaan** — yang kehilangan
+dan yang mendapat:
+
+```json
+{"products": [
+  {"product_type": "TAHAPAN_BCA", "is_popular": false, "badge_key": null,  ...},
+  {"product_type": "TABUNGANKU",  "is_popular": true,  "badge_key": "MOST_POPULAR", ...}
+]}
+```
+
+Mengirim hanya yang mendapat dijawab `409 ONBOARDING_PRODUCT_CATALOG_CONFLICT`: pemegang
+lama tidak disentuh permintaan itu, jadi menurunkan flag-nya berarti mengubah baris yang
+tidak diminta siapa pun.
+
+Di dalamnya penulisan berjalan **dua langkah** — semua baris ditulis dengan kedua flag
+dipaksa `FALSE` lebih dulu, baru yang diminta dinyalakan. Tanpa itu pemindahan badge
+mustahil: `idx_onboarding_products_one_popular` adalah unique index berekspresi dan tidak
+bisa `DEFERRABLE`, jadi pelanggarannya terdeteksi pada statement itu juga — dan produk
+ditulis urut `product_type`, sehingga penerima baru bisa mendapat flag sebelum pemegang
+lama melepasnya.
+
+### Error Codes — admin katalog produk
+
+| Kode | Status | Kapan |
+|---|---|---|
+| `FORBIDDEN` | 403 | kunci sistem salah/kosong, **atau** cakupan petugas bukan `CARD_ADMIN`. Keduanya tidak terbedakan — disengaja |
+| `VALIDATION_ERROR` | 400 | badan tidak bisa dibaca, **atau** memuat field yang tidak dikenal |
+| `ONBOARDING_PRODUCT_INVALID_VALUE` | 422 | nilai di luar enum, field wajib kosong, `DISABLED` tanpa `availability_reason_key`, dua `is_popular` dalam satu badan, produk disebut dua kali. `details.field` menyebut field-nya; `details.allowed_values` menyebut nilai yang sah |
+| `ONBOARDING_PRODUCT_UNKNOWN` | 404 | `product_type` di luar enum `onboarding_product_type` |
+| `ONBOARDING_PRODUCT_CATALOG_CONFLICT` | 409 | bertabrakan dengan produk yang **tidak** ikut dikirim — kirim keduanya dalam satu permintaan |
+| `ONBOARDING_CATALOG_UNAVAILABLE` | 503 | service admin tidak terpasang pada perakitan rute |
+
+Penulisan yang ditolak **tidak meninggalkan apa pun**: satu transaksi, dan versi katalog
+tidak naik. Katalog setengah tertulis adalah keadaan yang tidak diputuskan siapa pun —
+nasabah akan melihat harga baru pada satu produk dan harga lama pada produk yang
+seharusnya berubah bersamaan.
+
+### Yang BELUM ada
+
+**Tidak ada tabel jejak audit** seperti `card_catalog_audit_log` untuk katalog produk.
+Aktor (`X-Admin-Actor`, jatuh ke NPP petugas) dan IP dicatat ke `slog` saja. Perubahan
+setoran awal adalah hal yang akan disengketakan, jadi tabel jejaknya adalah pekerjaan
+yang masih terbuka — dan ia menuntut migrasi tersendiri.
+
+**Copy halaman (`onboarding_product_page`) belum bisa ditulis lewat API.** Mengubah
+judul, label setoran, atau isi kotak Persiapan Dokumen masih lewat SQL + `DEL` manual.
 
 > **Angka setoran awal di database saat ini adalah DATA DESAIN**, disalin apa adanya dari
 > `strings.xml` repo Android (500.000 / 50.000 / 20.000) supaya nasabah tidak melihat
@@ -590,7 +767,9 @@ di `REVIEW` tetap di `REVIEW`. Client menavigasi mengikuti nilai ini. Boleh dipa
 
 ## 2. OCR — Upload Foto KTP
 
-Upload foto e-KTP, server extract data via OCR engine, validasi ke Dukcapil.
+Upload foto e-KTP. Server mengambil teksnya, memastikan teks itu memang berasal
+dari e-KTP, memvalidasi NIK, lalu mencocokkan NIK ke Dukcapil **bila** registri
+dikonfigurasi (`DUKCAPIL_MODE`).
 
 ```
 POST /v1/onboarding/ocr
@@ -608,10 +787,35 @@ Content-Type: multipart/form-data
 | `sharpness_score` | float 0-100 (opsional) | Skor ketajaman dari capture SDK. < 60 → `OCR_PHOTO_BLURRY` |
 | `glare_score` | float 0-100 (opsional) | Skor pantulan cahaya. ≥ 50 → `OCR_GLARE_DETECTED` |
 | `corners_detected` | int 0-4 (opsional) | Jumlah sudut KTP terdeteksi. < 4 → `OCR_CORNERS_MISSING` |
+| `client_ocr_text` | string (opsional) | Teks mentah hasil OCR on-device (ML Kit) atas foto ini |
 
-Tiga field terakhir bersifat opsional: bila client tidak mengirimnya, sinyal itu
+Tiga field kualitas bersifat opsional: bila client tidak mengirimnya, sinyal itu
 dianggap "tidak dilaporkan" dan tidak menggugurkan capture. Yang tetap dinilai
-server adalah resolusi dan confidence dari OCR engine (< 75 → `OCR_PHOTO_BLURRY`).
+server adalah resolusi.
+
+`client_ocr_text` adalah **sumber teks** saat tidak ada mesin OCR sisi server.
+Urutannya: mesin server bila ada, kalau tidak teks dari client, dan kalau keduanya
+tidak ada → `OCR_NOT_KTP`. Tidak ada jalur yang mengarang hasil.
+
+Teks itu **input, bukan putusan**. Apa pun sumbernya, server menjalankan:
+
+1. **Tata letak e-KTP** — minimal 5 dari 16 label kartu (`NIK`, `Nama`,
+   `Tempat/Tgl Lahir`, `Jenis Kelamin`, `Alamat`, `RT/RW`, `Kel/Desa`,
+   `Kecamatan`, `Agama`, `Status Perkawinan`, `Kewarganegaraan`,
+   `Berlaku Hingga`, `Pekerjaan`, `Gol. Darah`, `PROVINSI`, nama negara) harus
+   terbaca. Yang dicari label, bukan nilainya: label sama di setiap kartu.
+2. **Bentuk NIK** — 16 digit, kode provinsi yang benar-benar terdaftar (38
+   provinsi), nomor urut ≠ `0000`, tanggal di dalam NIK valid.
+3. **Konsistensi internal** — NIK memuat tanggal lahir (digit 7–12) dan jenis
+   kelamin (tanggal +40 = perempuan), jadi keduanya dicocokkan dengan hasil OCR.
+   Begitu juga kode provinsi terhadap header `PROVINSI`. Field yang **kosong**
+   dilewati; yang ditolak hanya nilai yang terbaca dan berbeda.
+
+Konsekuensinya: satu digit NIK yang salah baca tertangkap di sini, dan dokumen
+lain (struk, SIM) ditolak meski memuat 16 digit. Semuanya **tanpa Dukcapil**.
+
+`provinsi` dan `jenis_kelamin` yang gagal dibaca OCR diisi dari NIK, karena NIK
+adalah sumber yang lebih andal untuk keduanya.
 
 ### Response `200 OK`
 ```json
@@ -619,7 +823,7 @@ server adalah resolusi dan confidence dari OCR engine (< 75 → `OCR_PHOTO_BLURR
   "status": "success",
   "data": {
     "ocr_id": "ocr_a1b2c3d4",
-    "accuracy_percent": 99.4,
+    "accuracy_percent": 81.25,
     "extracted": {
       "nik": "3174082104950001",
       "nama_lengkap": "MUHAMMAD ARDAN PRAYOGI",
@@ -635,7 +839,8 @@ server adalah resolusi dan confidence dari OCR engine (< 75 → `OCR_PHOTO_BLURR
       "agama": "Islam",
       "status_perkawinan": "Belum Kawin"
     },
-    "dukcapil_match": true,
+    "dukcapil_match": false,
+    "dukcapil_checked": false,
     "photo_quality": {
       "sharpness": "HIGH",
       "glare_detected": false,
@@ -646,13 +851,23 @@ server adalah resolusi dan confidence dari OCR engine (< 75 → `OCR_PHOTO_BLURR
 }
 ```
 
+`accuracy_percent` adalah **rasio label e-KTP yang terbaca** (0–100), bukan
+laporan-diri mesin OCR. Nilai sebelumnya selalu `99.4` karena berasal dari mesin
+tiruan yang tidak membaca gambarnya sama sekali.
+
+`dukcapil_match` hanya berarti bila `dukcapil_checked` **true**. Dua field, bukan
+satu: `dukcapil_match: true` dulu dikirim untuk sesi yang tidak punya registri
+sama sekali. Client tidak boleh memasang lencana "terverifikasi" saat
+`dukcapil_checked` false, dan **tidak boleh memblokir** nasabah karenanya —
+kartunya sudah lolos ketiga pemeriksaan di atas.
+
 ### Error Codes
 | Code | Keterangan |
 |------|-----------|
 | `OCR_PHOTO_BLURRY` | Foto terlalu buram, minta ambil ulang |
 | `OCR_GLARE_DETECTED` | Pantulan cahaya terdeteksi |
 | `OCR_CORNERS_MISSING` | Sudut KTP terpotong |
-| `OCR_NOT_KTP` | Dokumen bukan e-KTP |
+| `OCR_NOT_KTP` | Bukan e-KTP: tidak ada teks, label kartu < 5, NIK tidak berbentuk sah, atau NIK bertentangan dengan tanggal lahir/jenis kelamin/provinsi hasil OCR |
 | `OCR_EXPIRED_KTP` | KTP sudah tidak berlaku |
 | `OCR_DUKCAPIL_MISMATCH` | Data tidak cocok dengan Dukcapil |
 | `OCR_DUKCAPIL_TIMEOUT` | Koneksi ke Dukcapil timeout, boleh retry |
@@ -866,47 +1081,172 @@ bertahan melewati session baru.
 
 ---
 
-## 4. Biometric — Face Liveness
+## 4. Biometric — Active Face Liveness
 
-Upload foto wajah + liveness proof (frame sequence dari challenge-response).
+Dua endpoint, dan urutannya mengikat: **server menerbitkan tantangan**, client
+mengerjakan dan mengirim buktinya, **server yang memutuskan lulus**.
+
+Sebelum ini, keputusan lulus ada di perangkat: `liveness_meta` membawa
+`completed_actions` yang diisi konstanta oleh client, dan server mempercayainya.
+Satu-satunya pemeriksaan sisi server adalah jumlah frame antara 3 dan 5.
+
+### 4a. Terbitkan tantangan
+
+```
+POST /v1/onboarding/liveness/challenge
+Content-Type: application/json
+X-Device-ID: <wajib, harus pemilik sesi>
+```
+
+| Field | Type | Keterangan |
+|-------|------|-----------|
+| `session_id` | string | Harus di langkah `BIOMETRIC` |
+| `device_key_id` | string | Pengenal kunci perangkat |
+| `device_public_key` | string | base64 X.509 SPKI, **EC P-256** |
+| `signature_algorithm` | string | `EC-P256`; nilai lain ditolak lebih awal |
+
+#### Response `200 OK`
+```json
+{
+  "status": "success",
+  "data": {
+    "challenge_id": "chl_a1b2c3",
+    "nonce": "Zm9vYmFyYmF6cXV1eA...",
+    "actions": ["TURN_LEFT", "BLINK", "LOOK_UP"],
+    "expires_at": "2026-10-09T07:21:00Z"
+  }
+}
+```
+
+**`actions` dipakai apa adanya.** Server memilih `BLINK` + dua gerakan kepala
+berbeda lalu mengacak urutan ketiganya dengan `crypto/rand`. Client tidak pernah
+membuat, menyaring, atau mengurutkan ulang daftar ini — urutan yang bisa ditebak
+bisa dilewati dengan satu video rekaman.
+
+Nonce berumur 60 detik, **sekali pakai**, dan terikat `device_id`.
+
+#### Error Codes
+| Code | HTTP | Keterangan |
+|------|------|-----------|
+| `LIVENESS_DEVICE_KEY_INVALID` | 422 | Kunci bukan EC P-256 atau tidak terbaca |
+| `LIVENESS_COOLDOWN` | 429 | `details.retry_after_seconds` berisi sisa waktu |
+| `LIVENESS_BLOCKED` | 422 | Liveness mandiri dihentikan untuk sesi ini |
+| `ONBOARDING_DEVICE_MISMATCH` | 403 | Perangkat bukan pemilik sesi |
+
+### 4b. Kirim bukti
 
 ```
 POST /v1/onboarding/biometric
 Content-Type: multipart/form-data
+X-Device-ID: <wajib>
 ```
 
-### Request (multipart)
 | Field | Type | Keterangan |
 |-------|------|-----------|
 | `session_id` | string | |
-| `face_photo` | file (JPEG) | Foto wajah utama |
-| `liveness_frames` | file[] (JPEG) | 3-5 frame challenge (kedip, gerak kepala) |
-| `liveness_meta` | JSON string | `{"challenge_type": "BLINK", "completed_actions": 3, "precision_score": 98.2}` |
+| `challenge_id` | string | Dari 4a |
+| `nonce` | string | Dari 4a |
+| `device_key_id` | string | |
+| `device_public_key` | string | Dikirim, tapi **tidak** dipakai verifikasi — lihat catatan |
+| `signature` | string | base64 tanda tangan atas payload kanonis |
+| `signature_algorithm` | string | `EC-P256` |
+| `step_meta` | JSON string | `[{"index":0,"action":"TURN_LEFT","captured_at":1760000000000}, …]` |
+| `risk_signals` | JSON string | `{"emulator_likely":false,"root_artifacts":false,"debugger_attached":false}` |
+| `integrity_token` | string | Token Play Integrity, diminta dengan `nonce` di atas |
+| `neutral_frame` | file (JPEG) | Frame netral terbaik, pembanding face match |
+| `liveness_frames` | file[] (JPEG) | Satu frame per langkah, **urutannya harus sama dengan `step_meta`** |
 
-### Response `200 OK`
+**Tidak ada field yang menyatakan hasil.** `step_meta` hanya mengurutkan frame dan
+mencatat waktunya; server mendeteksi ulang pose di setiap frame itu sendiri.
+
+Frame bukti untuk `BLINK` diambil saat **mata terpejam**, bukan saat terbuka lagi:
+itu satu-satunya frame yang membuktikan kedipan terjadi, dan satu-satunya yang
+jelas berbeda dari frame netral.
+
+#### Payload kanonis yang ditandatangani
+
+Teks, bukan JSON — kedua sisi harus menghasilkan string yang **persis sama**, dan
+tidak ada pustaka JSON yang menjamin urutan kunci. Satu spasi berbeda berarti
+tanda tangan ditolak.
+
+```
+v1
+challenge_id=<challenge_id>
+nonce=<nonce>
+device_id=<X-Device-ID>
+neutral=<sha256 hex frame netral>
+step=<index>:<ACTION>:<captured_at ms>:<sha256 hex frame>
+step=…
+```
+
+Baris `step=` diurutkan `index` naik, dan setiap baris diakhiri `\n` termasuk yang
+terakhir. Digest per-frame adalah intinya: payload yang hanya menutupi metadata
+bisa dipasangkan ulang dengan frame lain dan tanda tangannya tetap cocok.
+
+Pasangan implementasinya: `internal/domain/onboarding/liveness_challenge_service.go`
+(`livenessSignedPayload`) dan `core/liveness/LivenessPayload.kt` di repo Android.
+Mengubah salah satu tanpa yang lain memecah **semua** pengiriman.
+
+> **Catatan `device_public_key`.** Verifikasi memakai kunci yang terdaftar saat
+> tantangan diterbitkan, bukan yang ikut di request ini. Kalau yang dipakai adalah
+> kunci dari request, penyerang cukup menandatangani dengan kunci buatannya sendiri
+> dan melampirkannya.
+
+#### Response `200 OK`
 ```json
 {
   "status": "success",
   "data": {
     "biometric_id": "bio_m1n2o3",
     "liveness_verified": true,
-    "liveness_score": 98.2,
+    "liveness_score": 96.0,
     "face_match_with_ktp": true,
-    "face_match_score": 96.7,
-    "iso_30107_compliant": true,
+    "face_match_score": 93.0,
     "current_step": "VIDEO_CALL"
   }
 }
 ```
 
-### Error Codes
-| Code | Keterangan |
-|------|-----------|
-| `BIO_LIVENESS_FAILED` | Gagal deteksi keaktifan, minta ulang |
-| `BIO_FACE_NOT_MATCH` | Wajah tidak cocok dengan foto KTP |
-| `BIO_MULTIPLE_FACES` | Lebih dari satu wajah terdeteksi |
-| `BIO_LOW_QUALITY` | Pencahayaan/resolusi tidak memadai |
-| `BIO_SPOOF_DETECTED` | Dugaan foto/layar/masker terdeteksi |
+`iso_30107_compliant` **sudah dihapus** dari response. Nilainya dulu diisi mesin
+biometrik tiruan dan diteruskan ke layar sebagai klaim sertifikasi; sertifikasi
+ISO/IEC 30107-3 hanya datang dari pengujian lab terakreditasi.
+
+`liveness_verified: false` tidak pernah dibalas `200` — kegagalan selalu berupa
+error code di bawah.
+
+#### Error Codes
+| Code | HTTP | Keterangan |
+|------|------|-----------|
+| `LIVENESS_CHALLENGE_INVALID` | 422 | Nonce tidak dikenal, kedaluwarsa, sudah dipakai, atau milik sesi/perangkat lain — **satu kode untuk keempatnya**, dengan sengaja |
+| `LIVENESS_SIGNATURE_INVALID` | 422 | Tanda tangan tidak cocok, atau frame diganti setelah ditandatangani |
+| `LIVENESS_INTEGRITY_FAILED` | 403 | Verdict Play Integrity tidak memenuhi kebijakan produksi |
+| `LIVENESS_PROVIDER_UNAVAILABLE` | 503 | Tidak ada provider liveness terkonfigurasi, atau providernya gagal berjalan. **Fail-closed: ini bukan lulus** |
+| `LIVENESS_COOLDOWN` | 429 | `details.retry_after_seconds` berisi sisa waktu |
+| `LIVENESS_BLOCKED` | 422 | Liveness mandiri dihentikan untuk sesi ini |
+| `LIVENESS_ESCALATED_TO_VIDEO_CALL` | 422 | Dihentikan dan sudah diarahkan ke antrean video call |
+| `BIO_LIVENESS_FAILED` | 422 | Provider menolak; alasan spesifiknya **tidak** dibalas |
+| `BIO_FACE_NOT_MATCH` | 422 | Wajah tidak cocok dengan foto KTP |
+| `BIO_MULTIPLE_FACES` | 422 | Lebih dari satu wajah di sebuah frame |
+
+Alasan internal penolakan (`step_pose_mismatch`, `duplicate_frame`,
+`timestamp_not_monotonic`, …) **hanya masuk jejak audit**. Menyebut pemeriksaan
+mana yang menolak sama dengan memberi tahu penyerang mana yang harus diakali.
+
+### 4c. Kebijakan percobaan (keputusan Q6)
+
+Seluruh hitungan ada di **server**; client hanya menampilkan sisa waktu yang
+dibalas API. Hitungan kedua di perangkat akan menyimpang dari yang berlaku.
+
+1. **3 kegagalan** → masa tunggu **5 menit**, per device + per sesi onboarding.
+2. **2 putaran masa tunggu (6 kegagalan) dalam 24 jam** → liveness mandiri
+   dihentikan, pemohon diarahkan ke antrean video call yang **sudah ada** dengan
+   risk flag `liveness_failed` di jejak audit. Langkah biometrik **tidak** ditandai
+   terverifikasi — petugas masih harus memastikan identitasnya.
+3. Fallback PIN tidak berlaku di sini: PIN baru dibuat di langkah `CREDENTIALS`.
+
+Semua angkanya konfigurasi: `LIVENESS_MAX_FAILURES`, `LIVENESS_COOLDOWN`,
+`LIVENESS_MAX_COOLDOWN_ROUNDS`, `LIVENESS_BLOCK_WINDOW`.
+
 
 ---
 
@@ -1282,6 +1622,17 @@ Di lingkungan yang tidak punya penyimpanan eskalasi, `NEED_REVIEW` dijawab
 `503 PROVIDER_NOT_CONFIGURED` — **bukan** disimpan tanpa eskalasi. Sesi `NEED_REVIEW`
 tanpa baris eskalasi akan menggantung tanpa jalan keluar, dan itu lebih buruk daripada
 menolak permintaannya.
+
+**Perkaranya ditutup Tier 2 lewat `PATCH /internal/v1/escalations/{escalation_id}`**
+(cakupan `ESCALATION_REVIEW`; kontraknya di `docs/01-API-SPECIFICATION.md` §11). Itu yang
+membebaskan nasabah dari tahanan `VIDEO_CALL_UNDER_REVIEW`: `APPROVED` memindahkannya ke
+`CREDENTIALS`, `REJECTED` meninggalkannya di `VIDEO_CALL` tapi **boleh mengantre lagi**
+karena barisnya sudah tidak terbuka.
+
+Petugas yang menyubmit `NEED_REVIEW` **tidak bisa** memegang maupun menutup perkaranya
+sendiri (`403 ESCALATION_SELF_RESOLVE`). `NEED_REVIEW` adalah pernyataan bahwa ia tidak
+sanggup memutuskan; membiarkannya memutus sendiri sesudahnya mengubah eskalasi menjadi
+jalan memutar yang menghasilkan keputusan yang persis sama tanpa diperiksa siapa pun.
 
 
 #### Penolakan permintaan
@@ -1710,7 +2061,8 @@ GAJI | USAHA | INVESTASI | WARISAN | LAINNYA
 | Semua `/v1/onboarding/*` | 60/5menit per IP |
 | `POST /onboarding/sessions` | 3/jam per device |
 | `POST /onboarding/ocr` | 10/jam per session |
-| `POST /onboarding/biometric` | 5/jam per session |
+| `POST /onboarding/liveness/challenge` | dibatasi penghitung kegagalan liveness (3 → 5 menit, 6/24 jam → stop) |
+| `POST /onboarding/biometric` | idem; nonce sekali pakai membatasi dengan sendirinya |
 | `POST /onboarding/verify-otp` | 5 kegagalan → blokir 30 menit per session (satu-satunya pembatas; lihat §3b) |
 | `POST /onboarding/resend-otp` | 3/jam per session |
 | `POST /onboarding/submit` | 1/session (idempotent) |

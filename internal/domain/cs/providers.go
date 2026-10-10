@@ -20,10 +20,23 @@ const (
 	ScopeCardAdmin   = "CARD_ADMIN"
 	ScopeCustomerPII = "CUSTOMER_PII"
 	ScopeTicket      = "TICKET"
+
+	// ScopeAuditRead membaca jejak audit petugas/terminal; ScopeEscalationReview
+	// menutup perkara NEED_REVIEW. Keduanya ditambahkan migrasi 000041, yang
+	// melebarkan CHECK dari 000027.
+	ScopeAuditRead        = "AUDIT_READ"
+	ScopeEscalationReview = "ESCALATION_REVIEW"
 )
 
-// AllScopes adalah keempat cakupan yang boleh diberikan.
-var AllScopes = []string{ScopeVideoCall, ScopeCardAdmin, ScopeCustomerPII, ScopeTicket}
+// AllScopes adalah keenam cakupan yang boleh diberikan.
+//
+// Urutannya mengikuti umurnya, bukan abjad: daftar ini tampil di `details.allowed` pada
+// penolakan SCOPE_UNKNOWN, dan mengurutkannya ulang setiap kali ada yang baru akan
+// membuat dua pesan penolakan yang sama terlihat berbeda.
+var AllScopes = []string{
+	ScopeVideoCall, ScopeCardAdmin, ScopeCustomerPII, ScopeTicket,
+	ScopeAuditRead, ScopeEscalationReview,
+}
 
 // ValidScope melaporkan apakah sebuah cakupan dikenal.
 func ValidScope(s string) bool {
@@ -109,6 +122,13 @@ func NewMockHRISDirectory() *MockHRISDirectory {
 				Position: "Operations Staff", Branch: "KCU Semarang", Active: true},
 			"SPV-3001": {EmployeeID: "SPV-3001", Name: "Rina Kusuma",
 				Position: "CS Supervisor", Branch: "KCU Semarang", Active: true},
+
+			// Peninjau Tier 2 kedua. Ada di sini supaya setiap NPP yang ditanam seeder
+			// juga bisa ditemukan lewat GET /hris/employees/{npp} — baris cs_agents yang
+			// NPP-nya tidak dikenal direktori pegawai akan membuat layar pendaftaran CS
+			// menjawab 404 untuk petugas yang jelas-jelas ada di database.
+			"SPV-3002": {EmployeeID: "SPV-3002", Name: "Dewi Lestari",
+				Position: "CS Supervisor", Branch: "KCU Jakarta Thamrin", Active: true},
 
 			// Pegawai yang statusnya sudah dicabut. Pendaftaran HARUS menolaknya, dan
 			// dengan alasan yang berbeda dari "NPP tidak ditemukan".

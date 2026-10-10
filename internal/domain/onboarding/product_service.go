@@ -194,3 +194,93 @@ func (s *ProductService) DepositShownFor(ctx context.Context, pt ProductType) (d
 	}
 	return 0, "", false
 }
+
+// --- Admin katalog produk (Fase 6) ---
+
+// ProductAdminService melayani penulisan katalog oleh admin.
+//
+// Terpisah dari ProductService, dan bukan sekadar demi kerapian: ProductService memegang
+// feature flag yang mematikan katalog untuk nasabah. Kalau admin menumpang service itu,
+// mematikan flag akan sekaligus mematikan kemampuan membetulkan katalog — dan katalog
+// yang dimatikan karena isinya salah adalah justru saat isinya paling perlu diubah.
+//
+// Karena itu ProductAdminService TIDAK punya flag. Layar admin tetap bisa membaca dan
+// menulis saat FEATURE_ONBOARDING_PRODUCT_CATALOG=false; yang berhenti dilayani hanya
+// endpoint nasabah.
+type ProductAdminService struct {
+	repo ProductCatalogAdminRepository
+
+	// cache dipakai HANYA untuk menghapus entri katalog aktif setelah penulisan.
+	// Boleh nil — tanpa Redis, pembacaan berikutnya memang sudah langsung ke database.
+	cache ProductCatalogCache
+}
+
+func NewProductAdminService(repo ProductCatalogAdminRepository, cache ProductCatalogCache) *ProductAdminService {
+	return &ProductAdminService{repo: repo, cache: cache}
+}
+
+// ListProducts mengembalikan seluruh katalog untuk layar admin.
+func (s *ProductAdminService) ListProducts(ctx context.Context) (*AdminProductCatalog, error) {
+	catalog, err := s.repo.ListAllProducts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list all products: %w", err)
+	}
+	if catalog == nil {
+		// Katalog kosong untuk ADMIN bukan 503 seperti di jalur nasabah: layar admin
+		// yang melihat daftar kosong sedang melihat keadaan database yang sebenarnya,
+		// dan itu jawaban yang benar — bukan kegagalan yang perlu disembunyikan.
+		return &AdminProductCatalog{Products: []AdminProductRow{}}, nil
+	}
+	if catalog.Products == nil {
+		catalog.Products = []AdminProductRow{}
+	}
+	return catalog, nil
+}
+
+// WriteProducts menulis satu atau beberapa produk dalam satu transaksi.
+//
+// Urutannya mengikat, dan terbalik dari yang terlihat wajar: validasi penuh lebih dulu,
+// penulisan kedua, invalidasi cache TERAKHIR — dan invalidasi yang gagal TIDAK
+// menggagalkan penulisan.
+//
+// Alasan yang terakhir: penulisannya sudah commit. Mengembalikan error setelah itu akan
+// membuat pemanggil mengulang permintaan yang sudah berhasil, menaikkan catalog_version
+// sekali lagi untuk perubahan yang sama. Yang benar adalah melaporkan keberhasilannya
+// dan mencatat bahwa cache-nya mungkin masih lama.
+func (s *ProductAdminService) WriteProducts(ctx context.Context, req ProductCatalogWriteRequest, actor, ip string) (*ProductCatalogWriteResult, error) {
+	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+
+	result, err := s.repo.WriteProducts(ctx, req.Products, actor, ip)
+	if err != nil {
+		return nil, err
+	}
+
+	s.invalidate(ctx, result.CatalogVersion)
+
+	slog.Info("katalog produk diubah admin",
+		"actor", actor,
+		"catalog_version", result.CatalogVersion,
+		"updated", result.Updated,
+		"features_replaced", result.FeaturesReplaced)
+
+	return result, nil
+}
+
+// invalidate menghapus entri katalog aktif di cache.
+//
+// Kegagalannya dicatat ERROR, bukan WARN, dan kalimatnya menyebut akibatnya: kunci
+// katalog produk tidak memuat versinya, jadi entri lama yang tertinggal akan terus
+// disajikan sampai TTL 24 jam habis — nasabah melihat setoran awal yang sudah diubah.
+// Yang membacanya di log perlu tahu bahwa `DEL onboarding:products:v1:catalog` manual
+// adalah tindak lanjutnya.
+func (s *ProductAdminService) invalidate(ctx context.Context, version string) {
+	if s.cache == nil {
+		return
+	}
+	if err := s.cache.InvalidateCatalog(ctx); err != nil {
+		slog.Error("hapus cache katalog produk gagal; katalog LAMA akan tersaji sampai TTL 24 jam habis — jalankan DEL onboarding:products:v1:catalog",
+			"catalog_version", version, "error", err)
+	}
+}

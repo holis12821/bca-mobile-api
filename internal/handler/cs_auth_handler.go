@@ -246,6 +246,51 @@ func (h *CSAuthHandler) RegisterAgent(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, r, http.StatusCreated, resp)
 }
 
+// UpdateAgent handles PATCH /internal/v1/agents/{employee_id}
+//
+// Mengubah cakupan atau mencabut hak petugas yang sudah terdaftar. Sebelum ini keduanya
+// hanya bisa lewat SQL langsung — jalur yang tidak menghasilkan jejak audit, tidak
+// menuntut otorisasi supervisor, dan tidak bisa diserahkan ke siapa pun di luar pemegang
+// kredensial database.
+//
+// Penjaganya AgentIdentity, sama dengan `POST /agents`: tidak satu pun dari enam cakupan
+// menggambarkan "boleh memberi kewenangan", dan yang menandatangani pemberiannya adalah
+// supervisor lewat dual-control di body. Yang menahan penyalahgunaannya adalah larangan
+// mengubah diri sendiri, bukan sebuah cakupan.
+//
+// NPP di PATH, bukan di body: ia menyebut SASARAN perubahan, dan sasaran yang datang dari
+// body membuat satu URL bisa mengubah petugas mana pun — termasuk saat permintaannya
+// tercatat di log proxy sebagai `PATCH /agents/CS-1042` yang menyentuh orang lain.
+func (h *CSAuthHandler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
+	updater, _, ok := middleware.AgentFromCtx(r.Context())
+	if !ok || updater == "" {
+		slog.Error("agent update reached without an authenticated updater",
+			"request_id", chimiddleware.GetReqID(r.Context()),
+		)
+		response.Err(w, r, apperr.Error{
+			Status:  http.StatusForbidden,
+			Code:    "FORBIDDEN",
+			Message: "Akses ditolak.",
+		})
+		return
+	}
+
+	var req cs.UpdateAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	resp, err := h.svc.UpdateAgent(r.Context(), chi.URLParam(r, "employee_id"),
+		req, updater, extractIP(r), r.UserAgent())
+	if err != nil {
+		h.handleErr(w, r, "update cs agent failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, resp)
+}
+
 func (h *CSAuthHandler) handleErr(w http.ResponseWriter, r *http.Request, msg string, err error) {
 	appErr := apperr.From(err)
 	if appErr.Code == apperr.InternalError.Code {

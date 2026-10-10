@@ -1695,6 +1695,91 @@ func (m *mockEscalationRepo) FindOpenBySessionID(_ context.Context, sessionID st
 	return nil, nil
 }
 
+// FindByID, List, Claim, dan Resolve dipakai EscalationService; VideoCallService hanya
+// memanggil Create dan FindOpenBySessionID. Ada di sini karena satu mock memenuhi satu
+// antarmuka — menambah method ke interface repository berarti SEMUA mock ikut diperbarui.
+func (m *mockEscalationRepo) FindByID(_ context.Context, escalationID string) (*VideoCallEscalation, error) {
+	if m.findErr != nil {
+		return nil, m.findErr
+	}
+	esc, ok := m.byID[escalationID]
+	if !ok {
+		return nil, nil
+	}
+	copied := *esc
+	return &copied, nil
+}
+
+func (m *mockEscalationRepo) List(_ context.Context, filter ListEscalationsFilter) ([]VideoCallEscalation, error) {
+	if m.findErr != nil {
+		return nil, m.findErr
+	}
+
+	var out []VideoCallEscalation
+	for _, e := range m.byID {
+		switch {
+		case filter.Status != "" && e.Status != filter.Status:
+			continue
+		// Status kosong berarti yang TERBUKA saja, sama dengan predikat
+		// idx_vc_escalations_one_open dan dengan jalur Postgres-nya.
+		case filter.Status == "" &&
+			e.Status != EscalationStatusPending && e.Status != EscalationStatusInReview:
+			continue
+		case filter.Queue != "" && e.EscalationQueue != filter.Queue:
+			continue
+		case filter.ClaimedBy != "" && e.ClaimedByAgent != filter.ClaimedBy:
+			continue
+		case filter.SessionID != "" && e.SessionID != filter.SessionID:
+			continue
+		}
+		out = append(out, *e)
+	}
+
+	// Terlama dulu, seperti ORDER BY raised_at ASC. Peta Go beriterasi acak, jadi tanpa
+	// pengurutan di sini test urutan antrean akan lulus atau gagal tanpa sebab.
+	sort.Slice(out, func(i, j int) bool { return out[i].RaisedAt.Before(out[j].RaisedAt) })
+
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
+}
+
+// Claim meniru UPDATE berkondisi: hanya perkara PENDING yang berubah.
+func (m *mockEscalationRepo) Claim(_ context.Context, escalationID, agentID string, at time.Time) (bool, error) {
+	esc, ok := m.byID[escalationID]
+	if !ok || esc.Status != EscalationStatusPending {
+		return false, nil
+	}
+	esc.Status = EscalationStatusInReview
+	esc.ClaimedByAgent = agentID
+	esc.ClaimedAt = &at
+	return true, nil
+}
+
+// Resolve meniru kondisi yang sama dengan jalur Postgres, TERMASUK penjaga pemegang
+// perkara: tanpa itu mock-nya akan meluluskan penutupan yang database menolaknya, dan
+// test four-eyes lulus karena mock-nya lebih longgar daripada skemanya.
+func (m *mockEscalationRepo) Resolve(_ context.Context, escalationID string, res EscalationResolution, at time.Time) (bool, error) {
+	esc, ok := m.byID[escalationID]
+	if !ok {
+		return false, nil
+	}
+	if esc.Status != EscalationStatusPending && esc.Status != EscalationStatusInReview {
+		return false, nil
+	}
+	if esc.ClaimedByAgent != "" && esc.ClaimedByAgent != res.ResolvedByAgent {
+		return false, nil
+	}
+	esc.Status = EscalationStatusResolved
+	esc.ResolvedByAgent = res.ResolvedByAgent
+	esc.ResolvedAt = &at
+	esc.Resolution = res.Resolution
+	esc.ResolutionReason = res.ResolutionReason
+	esc.ResolutionNotes = res.Notes
+	return true, nil
+}
+
 // setupVCServiceEscalated memasang repo eskalasi. setupVCService sengaja TIDAK
 // memasangnya — jalur "NEED_REVIEW tanpa tempat menyimpan eskalasi" juga perlu diuji.
 func setupVCServiceEscalated() (*VideoCallService, *mockSessionRepo, *mockSessionCache, *mockVideoCallRepo, *mockEscalationRepo, *mockAuditRepo) {
