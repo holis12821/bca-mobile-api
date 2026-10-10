@@ -1,0 +1,38 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+# One review per PR at a time: a new push supersedes the review still running
+# on the previous commit, so reviewers never read findings for stale code.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write # required by the action's default GitHub App auth
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          # --allowedTools must name the inline-comment tool even though the skill's
+          # own frontmatter does: the action starts that MCP server only when this
+          # flag asks for it, and without it the review lands in the run log only.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
+            --append-system-prompt "Repo ini backend perbankan m-BCA (Go, chi, pgx, Redis). Tulis semua temuan dalam bahasa Indonesia. Prioritaskan berurutan: (1) jalur uang - setiap debet/kredit wajib cek kepemilikan lewat accounts.FindOwnedByID sebelum menyentuh saldo, saldo tersedia = balance - hold_amount bukan balance, baris limit yang hilang berarti NOL (tolak) bukan tak terbatas, tanggal WIB dihitung di aplikasi bukan CURRENT_DATE, transaksi uang pakai SERIALIZABLE + kunci rekening urut UUID + retry 40001; (2) auth - access token wajib divalidasi ke sesi bukan cuma tanda tangan, kode akses bukan PIN, operasi yang mengubah keamanan wajib lewat verification_token atau OTP asli dan mencabut sesi lain, setiap cek PIN wajib rate limit + lockout + nonce; (3) cache - cek kepemilikan dulu baru baca cache, invalidasi cache semua pihak terdampak bukan hanya pengirim; (4) lapisan - domain tidak boleh mengimpor repository atau handler, handler tidak boleh mengimpor repository, interface repository didefinisikan di domain; (5) skema - setiap kolom yang ditulis kode harus ada di migrations/ dan migrasi wajib berpasangan up/down; (6) environment - integrasi eksternal mock wajib digerbangi APP_ENV, otp_debug hanya saat APP_ENV=development; (7) kebocoran - jangan pernah log PIN, OTP, token, atau PII. Perubahan bentuk response tanpa memperbarui docs/01-API-SPECIFICATION.md dan docs/postman/ adalah temuan karena memecah build Android."
