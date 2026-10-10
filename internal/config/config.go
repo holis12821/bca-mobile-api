@@ -1,11 +1,19 @@
 package config
 
 import (
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"log/slog"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
+
+	"github.com/holis12821/bca-mobile-api/internal/domain/onboarding"
 )
 
 type Config struct {
@@ -42,9 +50,38 @@ type Config struct {
 
 	Push Push
 
+	Liveness Liveness
+
 	SMS SMS
 
 	Client Client
+
+	KTP KTP
+}
+
+// KTP holds the e-KTP verification policy for onboarding.
+type KTP struct {
+	// StorageDriver selects where KTP photos are kept: "local" or "mock".
+	//
+	// Default "local", which writes real files under StorageLocalPath. "mock"
+	// keeps nothing and exists only for tests — with it, the photo appears not to
+	// attach and biometric face match has no reference to compare against.
+	StorageDriver string `env:"KTP_STORAGE_DRIVER" envDefault:"local"`
+
+	// StorageLocalPath is the root directory for the local driver.
+	StorageLocalPath string `env:"KTP_STORAGE_LOCAL_PATH" envDefault:"uploads"`
+
+	// DukcapilMode decides whether NIK is checked against a population registry:
+	// "off", "mock" or "real".
+	//
+	// Default "off". Not "mock", because the mock refuses every NIK outside its
+	// four test identities — so a real e-KTP is rejected with
+	// OCR_DUKCAPIL_MISMATCH, which reads as if the customer's card were bad. With
+	// "off" the card is still fully validated (e-KTP layout, NIK structure, and
+	// the NIK cross-checked against the parsed birth date and sex); what is
+	// skipped is only the registry lookup, and the response says so via
+	// dukcapil_checked=false.
+	DukcapilMode string `env:"DUKCAPIL_MODE" envDefault:"off"`
 }
 
 // Push holds the Firebase Cloud Messaging credentials.
@@ -55,6 +92,61 @@ type Config struct {
 // supported is a credentials file that exists but cannot be used — that fails
 // the boot, because a server which looks healthy while silently delivering
 // nothing is the failure this transport was added to remove.
+// Liveness holds the active face-liveness policy and the Play Integrity identity.
+//
+// All of it is configuration rather than Go constants because the numbers are
+// policy (three failures, five minutes, two rounds per 24 hours, the score
+// thresholds), and policy changes without a release.
+type Liveness struct {
+	// Provider selects the LivenessProvider: "internal" or "stub".
+	//
+	// "stub" accepts any submission that survives the deterministic checks and is
+	// refused outright unless APP_ENV=development — two independent conditions,
+	// because one misread variable in production would otherwise turn liveness
+	// into a formality.
+	Provider string `env:"LIVENESS_PROVIDER" envDefault:"internal"`
+
+	ChallengeTTL time.Duration `env:"LIVENESS_CHALLENGE_TTL" envDefault:"60s"`
+
+	// ActionCount is how many movements one challenge asks for. BLINK is always
+	// one of them.
+	ActionCount int `env:"LIVENESS_ACTION_COUNT" envDefault:"3"`
+
+	MaxFailures       int           `env:"LIVENESS_MAX_FAILURES" envDefault:"3"`
+	CooldownDuration  time.Duration `env:"LIVENESS_COOLDOWN" envDefault:"5m"`
+	MaxCooldownRounds int           `env:"LIVENESS_MAX_COOLDOWN_ROUNDS" envDefault:"2"`
+	BlockWindow       time.Duration `env:"LIVENESS_BLOCK_WINDOW" envDefault:"24h"`
+
+	LivenessThreshold  float64 `env:"LIVENESS_SCORE_THRESHOLD" envDefault:"90"`
+	FaceMatchThreshold float64 `env:"LIVENESS_FACE_MATCH_THRESHOLD" envDefault:"85"`
+
+	// MinFrameDistance is the minimum perceptual-hash Hamming distance between a
+	// head-pose frame and the neutral frame. Too low and a still image passes;
+	// too high and honest customers are refused.
+	MinFrameDistance int `env:"LIVENESS_MIN_FRAME_DISTANCE" envDefault:"6"`
+
+	MaxClockSkew time.Duration `env:"LIVENESS_MAX_CLOCK_SKEW" envDefault:"2m"`
+
+	// IntegrityLogOnly records a failing Play Integrity verdict without refusing
+	// the attempt. Validate() rejects it outside development: a production server
+	// that only logs a failed device verdict is not enforcing one.
+	IntegrityLogOnly bool `env:"LIVENESS_INTEGRITY_LOG_ONLY" envDefault:"false"`
+
+	// PlayIntegrityCredentialsFile is a Google service account JSON with the
+	// playintegrity scope. The file must never be committed.
+	PlayIntegrityCredentialsFile string `env:"PLAY_INTEGRITY_CREDENTIALS_FILE"`
+
+	// PlayIntegrityPackageName must equal the Android applicationId.
+	PlayIntegrityPackageName string `env:"PLAY_INTEGRITY_PACKAGE_NAME" envDefault:"id.bca.bcamobile"`
+
+	// PlayIntegrityCertSHA256 is the base64url SHA-256 of the app signing
+	// certificate as Play reports it. Empty skips the digest check, which leaves
+	// a repackaged APK claiming the right package name — acceptable in dev only.
+	PlayIntegrityCertSHA256 string `env:"PLAY_INTEGRITY_CERT_SHA256"`
+
+	PlayIntegrityTimeout time.Duration `env:"PLAY_INTEGRITY_TIMEOUT" envDefault:"10s"`
+}
+
 type Push struct {
 	// CredentialsFile is the path to the Google service account JSON, the same
 	// file GOOGLE_APPLICATION_CREDENTIALS would point at. The project id is read
@@ -175,6 +267,21 @@ type Client struct {
 	// Default false: integrasi kartu belum punya angka fee/limit resmi (§17),
 	// jadi menyalakannya adalah keputusan sadar, bukan bawaan.
 	CardSelectionEnabled bool `env:"FEATURE_CARD_SELECTION" envDefault:"false"`
+
+	// ProductCatalogEnabled adalah feature flag katalog jenis rekening. Mati berarti
+	// GET /v1/onboarding/products menjawab 503 ONBOARDING_CATALOG_UNAVAILABLE dan
+	// client jatuh ke daftar bawaannya di strings.xml — layar tetap berfungsi penuh,
+	// tanpa rollback deployment.
+	//
+	// Matinya katalog TIDAK BOLEH mematikan POST /sessions: validasi product_type di
+	// sana tetap pt.Valid() + cek maintenance, dan tidak pernah menuntut baris
+	// onboarding_products ada.
+	//
+	// Default true, berbeda dari CardSelectionEnabled: isi katalog ini disalin apa
+	// adanya dari strings.xml, jadi menyalakannya tidak mengubah satu kata pun yang
+	// dilihat nasabah. Yang belum resmi adalah ANGKA setoran awalnya — itu ditandai di
+	// komentar migrasi 000039, bukan dengan mematikan endpointnya.
+	ProductCatalogEnabled bool `env:"FEATURE_ONBOARDING_PRODUCT_CATALOG" envDefault:"true"`
 
 	// CardLegacyAppVersion adalah ambang X-App-Version untuk fallback client
 	// lama (§7 butir 6): build di bawah ambang ini tidak mengenal langkah
@@ -389,6 +496,29 @@ func (c *Config) Validate() error {
 		problems = append(problems, "DB_SSLMODE must not be \"disable\" outside development")
 	}
 
+	// The stub liveness provider is refused twice: ProvidersWith ignores it
+	// outside development, and the boot refuses to start with it configured. One
+	// variable set by mistake must not be able to make liveness a formality.
+	if strings.EqualFold(strings.TrimSpace(c.Liveness.Provider), "stub") {
+		problems = append(problems, "LIVENESS_PROVIDER=stub is only permitted when APP_ENV=development (it accepts any submission that passes the deterministic checks)")
+	}
+	if c.Liveness.IntegrityLogOnly {
+		problems = append(problems, "LIVENESS_INTEGRITY_LOG_ONLY must be false outside development (a failing Play Integrity verdict has to refuse the attempt, not just be logged)")
+	}
+	if !strings.EqualFold(strings.TrimSpace(c.KTP.DukcapilMode), "real") {
+		problems = append(problems, "DUKCAPIL_MODE must be \"real\" outside development (\"off\" skips the population registry check, and \"mock\" only recognises four test identities)")
+	}
+	if strings.EqualFold(strings.TrimSpace(c.KTP.StorageDriver), "mock") {
+		problems = append(problems, "KTP_STORAGE_DRIVER=mock discards the KTP photo, which also leaves biometric face match with no reference")
+	}
+
+	if strings.TrimSpace(c.Liveness.PlayIntegrityCredentialsFile) == "" {
+		problems = append(problems, "PLAY_INTEGRITY_CREDENTIALS_FILE is required outside development (without it no device verdict is verified and every liveness attempt is refused)")
+	}
+	if strings.TrimSpace(c.Liveness.PlayIntegrityCertSHA256) == "" {
+		problems = append(problems, "PLAY_INTEGRITY_CERT_SHA256 is required outside development (without it a repackaged APK claiming the right package name is accepted)")
+	}
+
 	if len(problems) > 0 {
 		return fmt.Errorf("invalid configuration for APP_ENV=%s:\n  - %s", c.App.Env, strings.Join(problems, "\n  - "))
 	}
@@ -407,4 +537,111 @@ func itoa(n int) string {
 		i--
 	}
 	return string(buf[i+1:])
+}
+
+// ToDomain maps the liveness policy onto the domain's own configuration type.
+//
+// Two types rather than one so the domain does not import the env-tag struct, in
+// line with the import direction in CLAUDE.md.
+func (l Liveness) ToDomain() onboarding.LivenessConfig {
+	cfg := onboarding.DefaultLivenessConfig()
+	if l.ChallengeTTL > 0 {
+		cfg.ChallengeTTL = l.ChallengeTTL
+	}
+	if l.ActionCount >= 2 {
+		cfg.ActionCount = l.ActionCount
+	}
+	if l.MaxFailures > 0 {
+		cfg.MaxFailures = l.MaxFailures
+	}
+	if l.CooldownDuration > 0 {
+		cfg.CooldownDuration = l.CooldownDuration
+	}
+	if l.MaxCooldownRounds > 0 {
+		cfg.MaxCooldownRounds = l.MaxCooldownRounds
+	}
+	if l.BlockWindow > 0 {
+		cfg.BlockWindow = l.BlockWindow
+	}
+	if l.LivenessThreshold > 0 {
+		cfg.LivenessThreshold = l.LivenessThreshold
+	}
+	if l.FaceMatchThreshold > 0 {
+		cfg.FaceMatchThreshold = l.FaceMatchThreshold
+	}
+	if l.MinFrameDistance > 0 {
+		cfg.MinFrameDistance = l.MinFrameDistance
+	}
+	if l.MaxClockSkew > 0 {
+		cfg.MaxClockSkew = l.MaxClockSkew
+	}
+	cfg.IntegrityLogOnly = l.IntegrityLogOnly
+	return cfg
+}
+
+// PlayIntegrityConfig loads the service account and returns the verifier config.
+//
+// A credentials file that cannot be read is logged and skipped rather than
+// panicking: the result is a verifier that produces an unacceptable verdict, so
+// production refuses every attempt. That is noisy and safe, which is the right
+// way round — unlike FCM, where a broken credential fails the boot because a
+// server delivering nothing silently is the worse outcome there.
+func (l Liveness) PlayIntegrityConfig() onboarding.PlayIntegrityConfig {
+	cfg := onboarding.PlayIntegrityConfig{
+		PackageName:       l.PlayIntegrityPackageName,
+		CertificateSHA256: l.PlayIntegrityCertSHA256,
+		Timeout:           l.PlayIntegrityTimeout,
+	}
+	if l.PlayIntegrityCredentialsFile == "" {
+		return cfg
+	}
+
+	raw, err := os.ReadFile(l.PlayIntegrityCredentialsFile)
+	if err != nil {
+		slog.Error("play integrity credentials unreadable; device verdicts will not be verified",
+			"path", l.PlayIntegrityCredentialsFile, "error", err)
+		return cfg
+	}
+
+	var account struct {
+		ClientEmail string `json:"client_email"`
+		PrivateKey  string `json:"private_key"`
+		TokenURI    string `json:"token_uri"`
+	}
+	if err := json.Unmarshal(raw, &account); err != nil {
+		slog.Error("play integrity credentials are not valid JSON", "error", err)
+		return cfg
+	}
+
+	block, _ := pem.Decode([]byte(account.PrivateKey))
+	if block == nil {
+		slog.Error("play integrity credentials carry no PEM private key")
+		return cfg
+	}
+	key, err := parsePKCS1Or8(block.Bytes)
+	if err != nil {
+		slog.Error("play integrity private key unusable", "error", err)
+		return cfg
+	}
+
+	cfg.ClientEmail = account.ClientEmail
+	cfg.PrivateKey = key
+	cfg.TokenURI = account.TokenURI
+	return cfg
+}
+
+// parsePKCS1Or8 accepts both encodings Google has issued for service accounts.
+func parsePKCS1Or8(der []byte) (*rsa.PrivateKey, error) {
+	if key, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		return key, nil
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(der)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("play integrity key is %T, want RSA", parsed)
+	}
+	return key, nil
 }

@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -905,5 +906,630 @@ func TestAccountCardRepo_RegisterIssuedCard(t *testing.T) {
 	// Dan nama produk datang dari join ke katalog, bukan disalin ke kartunya.
 	if cards[0].ProductName != "Gold Mastercard" {
 		t.Errorf("nama produk dari katalog: %q", cards[0].ProductName)
+	}
+}
+
+// --- Eskalasi NEED_REVIEW (migrasi 000038) ---
+//
+// Repo ini yang membuat NEED_REVIEW nyata: tanpa implementasinya, service menolak
+// setiap NEED_REVIEW dengan 503 dan penjaga VIDEO_CALL_UNDER_REVIEW tidak pernah
+// berjalan. Yang perlu dibuktikan di Postgres sungguhan ada dua: pemindaian kolomnya
+// cocok dengan skema yang dipasang, dan daftar status di query cocok dengan predikat
+// idx_vc_escalations_one_open.
+
+// insertEscalationSession membuat satu sesi onboarding untuk disangkutkan foreign key.
+func insertEscalationSession(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID string) {
+	t.Helper()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO onboarding_sessions (session_id, device_id, product_type, current_step, expires_at)
+		VALUES ($1, 'dev_esc', 'TAHAPAN_BCA', 'VIDEO_CALL', now() + interval '24 hours')`,
+		sessionID)
+	if err != nil {
+		t.Fatalf("insert onboarding session: %v", err)
+	}
+}
+
+func newEscalation(sessionID, escalationID, queue string) *onboarding.VideoCallEscalation {
+	return &onboarding.VideoCallEscalation{
+		EscalationID:    escalationID,
+		SessionID:       sessionID,
+		QueueID:         "q_esc_test",
+		EscalationQueue: queue,
+		Status:          "PENDING",
+		Reason:          "Wajah mirip tapi tanda tangan berbeda; perlu Tier 2.",
+		RaisedByAgent:   "CS-1042",
+		RaisedAt:        time.Now().UTC().Truncate(time.Microsecond),
+	}
+}
+
+func TestEscalationRepo_CreateAndFindOpen(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	const sessionID = "onb_esc_roundtrip"
+	insertEscalationSession(ctx, t, pool, sessionID)
+
+	esc := newEscalation(sessionID, "esc_roundtrip0001", onboarding.EscalationTier2)
+	if err := repo.Create(ctx, esc); err != nil {
+		t.Fatalf("create escalation: %v", err)
+	}
+
+	got, err := repo.FindOpenBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("find open escalation: %v", err)
+	}
+	if got == nil {
+		t.Fatal("eskalasi yang baru dibuat harus terbaca sebagai terbuka")
+	}
+	if got.EscalationID != esc.EscalationID {
+		t.Errorf("escalation_id = %q, mau %q", got.EscalationID, esc.EscalationID)
+	}
+	if got.EscalationQueue != onboarding.EscalationTier2 {
+		t.Errorf("escalation_queue = %q, mau %q", got.EscalationQueue, onboarding.EscalationTier2)
+	}
+	if got.Status != "PENDING" {
+		t.Errorf("status = %q, mau PENDING", got.Status)
+	}
+	if got.Reason != esc.Reason {
+		t.Errorf("reason = %q, mau %q", got.Reason, esc.Reason)
+	}
+	if got.RaisedByAgent != "CS-1042" {
+		t.Errorf("raised_by_agent = %q, mau CS-1042", got.RaisedByAgent)
+	}
+	if got.ResolvedAt != nil {
+		t.Errorf("resolved_at harus nil pada eskalasi terbuka, dapat %v", got.ResolvedAt)
+	}
+	if got.RaisedAt.IsZero() {
+		t.Error("raised_at tidak boleh kosong")
+	}
+}
+
+// Sesi tanpa eskalasi menjawab nil, nil — BUKAN error. Penjaga JoinQueue membaca ini
+// pada setiap percobaan antre, dan error di jalur itu akan menolak nasabah yang tidak
+// punya perkara apa pun.
+func TestEscalationRepo_FindOpenReturnsNilWhenNone(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	got, err := repo.FindOpenBySessionID(ctx, "onb_tidak_pernah_ada")
+	if err != nil {
+		t.Fatalf("find open escalation: %v", err)
+	}
+	if got != nil {
+		t.Errorf("mau nil, dapat %+v", got)
+	}
+}
+
+// Eskalasi kedua untuk sesi yang sama ditolak oleh idx_vc_escalations_one_open, dan
+// pelanggarannya diterjemahkan ke apperr — bukan dibocorkan sebagai error pgx mentah.
+func TestEscalationRepo_SecondOpenEscalationRejected(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	const sessionID = "onb_esc_ganda"
+	insertEscalationSession(ctx, t, pool, sessionID)
+
+	if err := repo.Create(ctx, newEscalation(sessionID, "esc_ganda00000001", onboarding.EscalationTier2)); err != nil {
+		t.Fatalf("create escalation pertama: %v", err)
+	}
+
+	err := repo.Create(ctx, newEscalation(sessionID, "esc_ganda00000002", onboarding.EscalationFraud))
+	if !errors.Is(err, apperr.VideoCallEscalationExists) {
+		t.Fatalf("mau VIDEO_CALL_ESCALATION_EXISTS, dapat %v", err)
+	}
+}
+
+// Eskalasi yang sudah RESOLVED berhenti terbaca sebagai terbuka, dan sesi itu boleh
+// punya eskalasi baru. Inilah yang melepaskan nasabah kembali ke antrean setelah Tier 2
+// memutus — tanpa ini ia tertahan selamanya.
+func TestEscalationRepo_ResolvedNoLongerBlocks(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	const sessionID = "onb_esc_selesai"
+	insertEscalationSession(ctx, t, pool, sessionID)
+
+	if err := repo.Create(ctx, newEscalation(sessionID, "esc_selesai000001", onboarding.EscalationTier2)); err != nil {
+		t.Fatalf("create escalation: %v", err)
+	}
+
+	// Penyelesaian menuntut penyelesai, waktu, DAN keputusan sekaligus
+	// (vc_escalations_resolved_consistent, migrasi 000038) — plus KETERANGAN
+	// (vc_escalations_resolved_has_notes, migrasi 000042). Tanpa yang terakhir UPDATE ini
+	// ditolak, dan itu memang tujuannya: perkara yang ditutup tanpa keterangan tidak bisa
+	// dijelaskan kepada nasabah yang menyengketakan hasilnya.
+	if _, err := pool.Exec(ctx, `
+		UPDATE onboarding_video_call_escalations
+		SET status = 'RESOLVED', resolved_at = now(),
+		    resolved_by_agent = 'SPV-3001', resolution = 'APPROVED',
+		    resolution_notes = 'Dokumen fisik diperiksa ulang bersama penyelia.'
+		WHERE escalation_id = $1`, "esc_selesai000001"); err != nil {
+		t.Fatalf("resolve escalation: %v", err)
+	}
+
+	got, err := repo.FindOpenBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("find open escalation: %v", err)
+	}
+	if got != nil {
+		t.Errorf("eskalasi RESOLVED tidak boleh terbaca terbuka, dapat %+v", got)
+	}
+
+	if err := repo.Create(ctx, newEscalation(sessionID, "esc_selesai000002", onboarding.EscalationCompliance)); err != nil {
+		t.Fatalf("eskalasi baru setelah yang lama selesai harus boleh: %v", err)
+	}
+}
+
+// IN_REVIEW juga menahan. Daftar status di query HARUS sama dengan predikat index:
+// kalau query membaca lebih sedikit, penjaga JoinQueue meluluskan nasabah yang
+// Create-nya justru akan ditolak index.
+func TestEscalationRepo_InReviewStillBlocks(t *testing.T) {
+	ctx := context.Background()
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingVideoCallEscalationRepo(pool)
+
+	const sessionID = "onb_esc_ditinjau"
+	insertEscalationSession(ctx, t, pool, sessionID)
+
+	if err := repo.Create(ctx, newEscalation(sessionID, "esc_tinjau0000001", onboarding.EscalationTier2)); err != nil {
+		t.Fatalf("create escalation: %v", err)
+	}
+	// claimed_by_agent ikut diisi: vc_escalations_in_review_has_agent (migrasi 000042)
+	// menolak IN_REVIEW tanpa pemegang — status yang menyatakan ada orang yang
+	// menanganinya tidak boleh benar tanpa orangnya, persis seperti
+	// cs_terminals_online_has_agent.
+	if _, err := pool.Exec(ctx, `
+		UPDATE onboarding_video_call_escalations
+		SET status = 'IN_REVIEW', claimed_by_agent = 'SPV-3001', claimed_at = now()
+		WHERE escalation_id = $1`, "esc_tinjau0000001"); err != nil {
+		t.Fatalf("set IN_REVIEW: %v", err)
+	}
+
+	got, err := repo.FindOpenBySessionID(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("find open escalation: %v", err)
+	}
+	if got == nil {
+		t.Fatal("IN_REVIEW harus tetap terbaca sebagai terbuka")
+	}
+	if got.Status != "IN_REVIEW" {
+		t.Errorf("status = %q, mau IN_REVIEW", got.Status)
+	}
+}
+
+// --- Admin katalog produk (Fase 6) ---
+
+// productWriteFixture menyusun penulisan yang sah untuk satu produk.
+func productWriteFixture(pt onboarding.ProductType, order int, deposit int64) onboarding.ProductWrite {
+	return onboarding.ProductWrite{
+		ProductType:        pt,
+		Name:               "Nama " + string(pt),
+		Description:        "Deskripsi " + string(pt),
+		MinInitialDeposit:  deposit,
+		Currency:           "IDR",
+		IconKey:            onboarding.ProductIconWallet,
+		Style:              onboarding.ProductStyleNeutral,
+		DisplayOrder:       order,
+		IsActive:           true,
+		AvailabilityStatus: onboarding.ProductAvailable,
+	}
+}
+
+// REGRESI: memindahkan badge "Paling Populer" dari satu produk ke produk lain dalam SATU
+// permintaan harus BERHASIL.
+//
+// Dulu gagal 409, dan sebabnya tidak terlihat dari mock mana pun: produk ditulis urut
+// product_type, jadi TABUNGANKU mendapat is_popular sebelum TAHAPAN_BCA melepasnya, dan
+// idx_onboarding_products_one_popular menolaknya pada statement itu juga — unique index
+// berekspresi tidak bisa DEFERRABLE. Hanya database sungguhan yang bisa menangkap ini.
+//
+// Perbaikannya dua langkah: semua baris ditulis dengan flag dipaksa FALSE lebih dulu,
+// baru yang diminta dinyalakan.
+func TestWriteProducts_MovesSingletonFlagInOneRequest(t *testing.T) {
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingProductRepo(pool)
+	ctx := context.Background()
+
+	// Keadaan awal dari migrasi 000039: TAHAPAN_BCA memegang is_popular dan is_default.
+	before, err := repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list produk: %v", err)
+	}
+	if holder := singletonHolder(before, func(r onboarding.AdminProductRow) bool { return r.IsPopular }); holder != onboarding.ProductTahapanBCA {
+		t.Fatalf("prasyarat: mau TAHAPAN_BCA memegang is_popular, dapat %q", holder)
+	}
+
+	// TABUNGANKU diurutkan SEBELUM TAHAPAN_BCA menurut product_type, jadi urutan inilah
+	// yang dulu memicu bug-nya.
+	gain := productWriteFixture(onboarding.ProductTabunganku, 3, 20000)
+	gain.IsPopular = true
+	gain.IsDefault = true
+	badge := onboarding.ProductBadgeMostPopular
+	gain.BadgeKey = &badge
+
+	lose := productWriteFixture(onboarding.ProductTahapanBCA, 1, 500000)
+
+	result, err := repo.WriteProducts(ctx,
+		[]onboarding.ProductWrite{lose, gain}, "OPS-2001", "10.0.0.1")
+	if err != nil {
+		t.Fatalf("memindahkan badge dalam satu permintaan harus berhasil, dapat: %v", err)
+	}
+	if len(result.Updated) != 2 {
+		t.Errorf("mau 2 produk tertulis, dapat %d", len(result.Updated))
+	}
+
+	after, err := repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list produk sesudah tulis: %v", err)
+	}
+	if holder := singletonHolder(after, func(r onboarding.AdminProductRow) bool { return r.IsPopular }); holder != onboarding.ProductTabunganku {
+		t.Errorf("mau TABUNGANKU memegang is_popular, dapat %q", holder)
+	}
+	if holder := singletonHolder(after, func(r onboarding.AdminProductRow) bool { return r.IsDefault }); holder != onboarding.ProductTabunganku {
+		t.Errorf("mau TABUNGANKU memegang is_default, dapat %q", holder)
+	}
+}
+
+// Versi katalog naik SEKALI untuk satu transaksi, berapa pun produk yang ditulis.
+//
+// DoD Fase 6. Diuji ke database sungguhan karena yang dibuktikan adalah UPDATE tunggal
+// di akhir transaksi — mock hanya bisa membuktikan service memanggil repo sekali.
+func TestWriteProducts_BumpsVersionOncePerTransaction(t *testing.T) {
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingProductRepo(pool)
+	ctx := context.Background()
+
+	before, err := repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list produk: %v", err)
+	}
+
+	result, err := repo.WriteProducts(ctx, []onboarding.ProductWrite{
+		productWriteFixture(onboarding.ProductTahapanXpre, 2, 55000),
+		productWriteFixture(onboarding.ProductTabunganku, 3, 25000),
+	}, "OPS-2001", "")
+	if err != nil {
+		t.Fatalf("penulisan dua produk: %v", err)
+	}
+
+	if result.CatalogVersion == before.CatalogVersion {
+		t.Fatal("versi katalog harus berubah setelah penulisan")
+	}
+
+	// Counter-nya harus naik tepat satu. Dibandingkan sebagai angka, bukan string:
+	// bentuknya "YYYY-MM-DD.counter" dan yang diuji adalah counter-nya.
+	if got, want := counterOf(t, result.CatalogVersion), counterOf(t, before.CatalogVersion)+1; got != want {
+		t.Errorf("mau counter %d (naik satu untuk dua produk), dapat %d", want, got)
+	}
+}
+
+// Penulisan yang ditolak database TIDAK meninggalkan perubahan apa pun, dan TIDAK
+// menaikkan versi.
+//
+// Katalog setengah tertulis adalah keadaan yang tidak diputuskan siapa pun: nasabah akan
+// melihat harga baru pada satu produk dan harga lama pada produk yang seharusnya berubah
+// bersamaan.
+func TestWriteProducts_RollsBackEverythingOnConflict(t *testing.T) {
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingProductRepo(pool)
+	ctx := context.Background()
+
+	before, err := repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list produk: %v", err)
+	}
+
+	// TAHAPAN_XPRESI meminta is_popular, tapi TAHAPAN_BCA masih memegangnya dan TIDAK
+	// ikut dikirim. Pemegang lama tidak disentuh permintaan ini, jadi ini memang harus
+	// ditolak — yang diuji adalah bahwa penolakannya tidak menyisakan apa pun.
+	grab := productWriteFixture(onboarding.ProductTahapanXpre, 2, 999000)
+	grab.IsPopular = true
+
+	_, err = repo.WriteProducts(ctx, []onboarding.ProductWrite{grab}, "OPS-2001", "")
+	if !errors.Is(err, apperr.OnboardingProductCatalogConflict) {
+		t.Fatalf("mau ONBOARDING_PRODUCT_CATALOG_CONFLICT, dapat %v", err)
+	}
+
+	after, err := repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list produk sesudah penolakan: %v", err)
+	}
+	if after.CatalogVersion != before.CatalogVersion {
+		t.Errorf("penulisan yang gagal tidak boleh menaikkan versi: %q → %q",
+			before.CatalogVersion, after.CatalogVersion)
+	}
+	for _, row := range after.Products {
+		if row.ProductType != onboarding.ProductTahapanXpre {
+			continue
+		}
+		if row.MinInitialDeposit == 999000 {
+			t.Error("setoran awal dari penulisan yang gagal ikut tersimpan — transaksinya tidak di-rollback")
+		}
+	}
+}
+
+// features nil JANGAN SENTUH, features [] HAPUS SEMUA, features [...] GANTI BERURUT.
+//
+// Tanpa pembedaan itu, setiap penulisan harga akan menghapus teks fitur produknya.
+func TestWriteProducts_FeatureReplacementSemantics(t *testing.T) {
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingProductRepo(pool)
+	ctx := context.Background()
+
+	before, err := repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list produk: %v", err)
+	}
+	seeded := featuresOf(before, onboarding.ProductTahapanXpre)
+	if len(seeded) == 0 {
+		t.Fatal("prasyarat: TAHAPAN_XPRESI harus punya fitur dari migrasi")
+	}
+
+	untouched := productWriteFixture(onboarding.ProductTahapanXpre, 2, 50000)
+	// Features sengaja nil.
+
+	replaced := productWriteFixture(onboarding.ProductTabunganku, 3, 20000)
+	newFeatures := []string{"Fitur pertama", "Fitur kedua"}
+	replaced.Features = &newFeatures
+
+	if _, err := repo.WriteProducts(ctx,
+		[]onboarding.ProductWrite{untouched, replaced}, "OPS-2001", ""); err != nil {
+		t.Fatalf("penulisan: %v", err)
+	}
+
+	after, err := repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list produk sesudah tulis: %v", err)
+	}
+
+	if got := featuresOf(after, onboarding.ProductTahapanXpre); !equalStrings(got, seeded) {
+		t.Errorf("features nil harus membiarkan fitur apa adanya: mau %v, dapat %v", seeded, got)
+	}
+	if got := featuresOf(after, onboarding.ProductTabunganku); !equalStrings(got, newFeatures) {
+		t.Errorf("features [...] harus mengganti berurut: mau %v, dapat %v", newFeatures, got)
+	}
+
+	// Sekarang hapus semuanya dengan array kosong.
+	cleared := productWriteFixture(onboarding.ProductTabunganku, 3, 20000)
+	empty := []string{}
+	cleared.Features = &empty
+
+	if _, err := repo.WriteProducts(ctx, []onboarding.ProductWrite{cleared}, "OPS-2001", ""); err != nil {
+		t.Fatalf("penulisan penghapusan fitur: %v", err)
+	}
+
+	after, err = repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list produk sesudah penghapusan: %v", err)
+	}
+	if got := featuresOf(after, onboarding.ProductTabunganku); len(got) != 0 {
+		t.Errorf("features [] harus menghapus semua, dapat %v", got)
+	}
+}
+
+// ListAllProducts mengembalikan produk is_active = FALSE, berbeda dari ActiveCatalog.
+//
+// Admin yang menyalakan kembali produk harus bisa melihat barisnya — dan fiturnya,
+// supaya ia tidak menulis ulang teks yang sudah ada.
+func TestListAllProducts_IncludesInactiveWithFeatures(t *testing.T) {
+	pool := setupCardDB(t)
+	repo := postgres.NewOnboardingProductRepo(pool)
+	ctx := context.Background()
+
+	off := productWriteFixture(onboarding.ProductTabunganku, 3, 20000)
+	off.IsActive = false
+	if _, err := repo.WriteProducts(ctx, []onboarding.ProductWrite{off}, "OPS-2001", ""); err != nil {
+		t.Fatalf("mematikan produk: %v", err)
+	}
+
+	admin, err := repo.ListAllProducts(ctx)
+	if err != nil {
+		t.Fatalf("list admin: %v", err)
+	}
+	found := false
+	for _, row := range admin.Products {
+		if row.ProductType != onboarding.ProductTabunganku {
+			continue
+		}
+		found = true
+		if row.IsActive {
+			t.Error("produk seharusnya is_active = false")
+		}
+		if len(row.Features) == 0 {
+			t.Error("fitur produk tidak aktif harus ikut terbaca di jalur admin")
+		}
+	}
+	if !found {
+		t.Error("produk is_active = false harus ikut di jalur admin")
+	}
+
+	// Jalur nasabah TIDAK boleh memuatnya.
+	customer, err := repo.ActiveCatalog(ctx)
+	if err != nil {
+		t.Fatalf("katalog nasabah: %v", err)
+	}
+	for _, p := range customer.Products {
+		if p.ProductType == onboarding.ProductTabunganku {
+			t.Error("produk is_active = false tidak boleh dilayani ke nasabah")
+		}
+	}
+}
+
+// --- pembantu ---
+
+func singletonHolder(c *onboarding.AdminProductCatalog, has func(onboarding.AdminProductRow) bool) onboarding.ProductType {
+	for _, row := range c.Products {
+		if has(row) {
+			return row.ProductType
+		}
+	}
+	return ""
+}
+
+func featuresOf(c *onboarding.AdminProductCatalog, pt onboarding.ProductType) []string {
+	for _, row := range c.Products {
+		if row.ProductType == pt {
+			return row.Features
+		}
+	}
+	return nil
+}
+
+func counterOf(t *testing.T, version string) int {
+	t.Helper()
+	idx := strings.LastIndex(version, ".")
+	if idx < 0 {
+		t.Fatalf("versi katalog tidak berbentuk YYYY-MM-DD.counter: %q", version)
+	}
+	n, err := strconv.Atoi(version[idx+1:])
+	if err != nil {
+		t.Fatalf("counter versi %q tidak terbaca: %v", version, err)
+	}
+	return n
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// --- Liveness attempts (migrasi 000040) ---
+
+// Baris jejak audit ditulis di jalur verifikasi liveness. Yang dibuktikan di sini
+// bukan logikanya, tapi bahwa kode Go cocok dengan skema yang benar-benar dipasang:
+// lebar kolom, batasan CHECK pada outcome, dan JSONB untuk risk_signals.
+func TestLivenessAttemptRepo_InsertAndCountFailures(t *testing.T) {
+	pool := setupCardDB(t)
+	ctx := context.Background()
+	repo := postgres.NewOnboardingLivenessAttemptRepo(pool)
+
+	base := time.Now().UTC().Add(-time.Hour)
+	rows := []struct {
+		outcome onboarding.LivenessAttemptOutcome
+		reason  string
+		offset  time.Duration
+	}{
+		{onboarding.LivenessOutcomeFailed, "signature_invalid", 0},
+		{onboarding.LivenessOutcomeFailed, "step_pose_mismatch", time.Minute},
+		{onboarding.LivenessOutcomeEscalated, "pad_below_threshold", 2 * time.Minute},
+		{onboarding.LivenessOutcomePassed, "passed", 3 * time.Minute},
+	}
+
+	for i, r := range rows {
+		attempt := &onboarding.LivenessAttempt{
+			ID:             uuid.New(),
+			SessionID:      "onb_attempt_test",
+			ChallengeID:    "chl_" + strconv.Itoa(i),
+			DeviceID:       "dev_attempt_test",
+			Outcome:        r.outcome,
+			Reason:         r.reason,
+			LivenessScore:  90.5,
+			FaceMatchScore: 88.25,
+			FrameCount:     3,
+			IntegrityOK:    true,
+			RiskSignals: onboarding.DeviceRiskSignals{
+				EmulatorLikely: i == 0,
+				RootArtifacts:  false,
+			},
+			IPAddress: "203.0.113.7",
+			UserAgent: "okhttp/4.12.0",
+			CreatedAt: base.Add(r.offset),
+		}
+		if err := repo.Insert(ctx, attempt); err != nil {
+			t.Fatalf("insert attempt %d: %v", i, err)
+		}
+	}
+
+	// PASSED tidak dihitung; ESCALATED dihitung, karena pemohonnya diarahkan ke
+	// petugas justru karena liveness mandiri tidak berhasil.
+	count, err := repo.CountFailuresSince(ctx, "onb_attempt_test", base.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("count failures: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("want 3 kegagalan (2 FAILED + 1 ESCALATED), got %d", count)
+	}
+
+	// Jendela waktu benar-benar menyaring.
+	recent, err := repo.CountFailuresSince(ctx, "onb_attempt_test", base.Add(90*time.Second))
+	if err != nil {
+		t.Fatalf("count recent: %v", err)
+	}
+	if recent != 1 {
+		t.Fatalf("want 1 kegagalan setelah batas waktu, got %d", recent)
+	}
+
+	// Sesi lain tidak ikut terhitung.
+	other, err := repo.CountFailuresSince(ctx, "onb_someone_else", base.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("count other session: %v", err)
+	}
+	if other != 0 {
+		t.Fatalf("hitungan harus per sesi, got %d", other)
+	}
+}
+
+// Satu-satunya hal yang boleh masuk kolom outcome adalah keempat nilai itu.
+// Tanpa CHECK, salah ketik di kode Go akan tersimpan diam-diam dan merusak
+// hitungan kegagalan tanpa error di mana pun.
+func TestLivenessAttemptRepo_RejectsUnknownOutcome(t *testing.T) {
+	pool := setupCardDB(t)
+	ctx := context.Background()
+	repo := postgres.NewOnboardingLivenessAttemptRepo(pool)
+
+	attempt := &onboarding.LivenessAttempt{
+		ID:        uuid.New(),
+		SessionID: "onb_attempt_test",
+		Outcome:   onboarding.LivenessAttemptOutcome("MAYBE"),
+		CreatedAt: time.Now().UTC(),
+	}
+
+	if err := repo.Insert(ctx, attempt); err == nil {
+		t.Fatal("outcome di luar enum harus ditolak database")
+	}
+}
+
+// Jejak audit tidak boleh memuat frame. Kalau suatu saat ada yang menambahkan
+// kolomnya, test ini yang menolak lebih dulu.
+func TestLivenessAttempts_TableHoldsNoFrames(t *testing.T) {
+	pool := setupCardDB(t)
+	ctx := context.Background()
+
+	rows, err := pool.Query(ctx, `
+		SELECT column_name, data_type
+		FROM information_schema.columns
+		WHERE table_name = 'liveness_attempts'`)
+	if err != nil {
+		t.Fatalf("read columns: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name, dataType string
+		if err := rows.Scan(&name, &dataType); err != nil {
+			t.Fatalf("scan column: %v", err)
+		}
+		if dataType == "bytea" {
+			t.Fatalf("kolom %q bertipe bytea; frame wajah tidak boleh dipersistensi", name)
+		}
+		for _, banned := range []string{"frame_data", "jpeg", "neutral_frame", "photo", "image"} {
+			if strings.Contains(name, banned) {
+				t.Fatalf("kolom %q terlihat menyimpan gambar wajah", name)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate columns: %v", err)
 	}
 }

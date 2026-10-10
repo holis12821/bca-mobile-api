@@ -18,7 +18,132 @@ func productionConfig() *Config {
 	cfg.Crypto.AESKey = strings.Repeat("ab", 32)
 	cfg.Crypto.LookupHMACKey = "lookup-secret"
 	cfg.SMS.Provider = "twilio"
+	cfg.Liveness.Provider = "internal"
+	cfg.Liveness.PlayIntegrityCredentialsFile = "/etc/secrets/play-integrity.json"
+	cfg.Liveness.PlayIntegrityCertSHA256 = "mRbXSyWcS0mGPaVyRo8t1Lh6ZVnkGPBNCVN0b3xCkCo"
+	cfg.KTP.DukcapilMode = "real"
+	cfg.KTP.StorageDriver = "local"
 	return cfg
+}
+
+// "off" is the right default for a deployment with no registry access, and the
+// wrong answer in production: there the identity has to be confirmed against
+// Dukcapil, not merely self-consistent.
+func TestValidate_ProductionRejectsDukcapilOff(t *testing.T) {
+	for _, value := range []string{"off", "mock", "", " off "} {
+		cfg := productionConfig()
+		cfg.KTP.DukcapilMode = value
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatalf("DUKCAPIL_MODE=%q must be refused in production", value)
+		}
+		if !strings.Contains(err.Error(), "DUKCAPIL_MODE") {
+			t.Fatalf("error should name the variable, got: %v", err)
+		}
+	}
+}
+
+// The mock storage keeps nothing, which also leaves face match with no
+// reference. Allowing it in production would reintroduce both bugs at once.
+func TestValidate_ProductionRejectsMockKTPStorage(t *testing.T) {
+	cfg := productionConfig()
+	cfg.KTP.StorageDriver = "mock"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("KTP_STORAGE_DRIVER=mock must be refused in production")
+	}
+	if !strings.Contains(err.Error(), "KTP_STORAGE_DRIVER") {
+		t.Fatalf("error should name the variable, got: %v", err)
+	}
+}
+
+// The stub provider accepts any submission that passes the deterministic checks.
+// It is refused in two independent places; this is the one that stops the boot,
+// so a single mis-set variable cannot turn liveness into a formality.
+func TestValidate_ProductionRejectsStubLivenessProvider(t *testing.T) {
+	for _, value := range []string{"stub", "STUB", " stub "} {
+		cfg := productionConfig()
+		cfg.Liveness.Provider = value
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatalf("LIVENESS_PROVIDER=%q must be refused in production", value)
+		}
+		if !strings.Contains(err.Error(), "LIVENESS_PROVIDER") {
+			t.Fatalf("error should name the variable, got: %v", err)
+		}
+	}
+}
+
+// A production server that only logs a failed device verdict is not enforcing one.
+func TestValidate_ProductionRejectsIntegrityLogOnly(t *testing.T) {
+	cfg := productionConfig()
+	cfg.Liveness.IntegrityLogOnly = true
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("LIVENESS_INTEGRITY_LOG_ONLY=true must be refused in production")
+	}
+	if !strings.Contains(err.Error(), "LIVENESS_INTEGRITY_LOG_ONLY") {
+		t.Fatalf("error should name the variable, got: %v", err)
+	}
+}
+
+// Without credentials no device verdict is verified, and with the fail-closed
+// policy that means every liveness attempt is refused. Better to say so at boot.
+func TestValidate_ProductionRequiresPlayIntegrityCredentials(t *testing.T) {
+	cfg := productionConfig()
+	cfg.Liveness.PlayIntegrityCredentialsFile = ""
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("PLAY_INTEGRITY_CREDENTIALS_FILE must be required in production")
+	}
+	if !strings.Contains(err.Error(), "PLAY_INTEGRITY_CREDENTIALS_FILE") {
+		t.Fatalf("error should name the variable, got: %v", err)
+	}
+}
+
+// Without the certificate digest, a repackaged APK claiming the right package
+// name is accepted.
+func TestValidate_ProductionRequiresPlayIntegrityCertDigest(t *testing.T) {
+	cfg := productionConfig()
+	cfg.Liveness.PlayIntegrityCertSHA256 = ""
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("PLAY_INTEGRITY_CERT_SHA256 must be required in production")
+	}
+}
+
+// ToDomain must not silently zero a policy value: a zero cooldown would mean no
+// cooldown at all.
+func TestLivenessToDomain_FallsBackToDefaults(t *testing.T) {
+	domain := Liveness{}.ToDomain()
+
+	if domain.MaxFailures == 0 || domain.CooldownDuration == 0 ||
+		domain.MaxCooldownRounds == 0 || domain.ChallengeTTL == 0 {
+		t.Fatalf("an empty config must fall back to the documented defaults, got %+v", domain)
+	}
+}
+
+func TestLivenessToDomain_CarriesOverrides(t *testing.T) {
+	domain := Liveness{
+		MaxFailures:      5,
+		CooldownDuration: 90 * time.Second,
+		IntegrityLogOnly: true,
+	}.ToDomain()
+
+	if domain.MaxFailures != 5 {
+		t.Fatalf("want MaxFailures 5, got %d", domain.MaxFailures)
+	}
+	if domain.CooldownDuration != 90*time.Second {
+		t.Fatalf("want 90s cooldown, got %s", domain.CooldownDuration)
+	}
+	if !domain.IntegrityLogOnly {
+		t.Fatal("IntegrityLogOnly must carry over, including when true")
+	}
 }
 
 func TestValidate_DevelopmentIsPermissive(t *testing.T) {

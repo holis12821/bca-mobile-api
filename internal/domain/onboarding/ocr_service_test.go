@@ -56,6 +56,10 @@ func (m *mockStorage) Upload(_ context.Context, bucket, key string, data []byte,
 	return "s3://" + bucket + "/" + key, nil
 }
 
+func (m *mockStorage) Download(_ context.Context, _, key string) ([]byte, error) {
+	return m.objects[key], nil
+}
+
 func (m *mockStorage) Delete(_ context.Context, _, key string) error {
 	m.deletes++
 	delete(m.objects, key)
@@ -335,15 +339,211 @@ func TestProcessKTP_NoQualitySignalsPasses(t *testing.T) {
 	}
 }
 
-// Low engine confidence is itself evidence of a bad capture.
-func TestProcessKTP_LowEngineConfidenceIsBlurry(t *testing.T) {
+// A photo whose text is not an e-KTP is refused.
+//
+// This is the case that used to be impossible to fail. The engine ignored the
+// image and returned a hardcoded KTP, so a plain grey rectangle came back with
+// accuracy_percent 99.4 and a full identity, and the session advanced.
+func TestProcessKTP_NonKTPTextRefused(t *testing.T) {
+	cases := map[string]string{
+		"gambar tanpa teks":     "",
+		"teks acak":             "selamat datang di toko kami, total belanja 45.000",
+		"hanya deretan angka":   "3174082104950001",
+		"struk dengan 16 digit": "TOKO MAKMUR\nNo. Transaksi 3174082104950001\nTotal 45000",
+	}
+
+	for name, text := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := setupOCRService()
+			sessionID := f.session(StepOCR)
+			f.engine.rawText = text
+
+			_, err := f.svc.ProcessKTP(
+				context.Background(), sessionID, []byte("x"), goodCapture(), "127.0.0.1", "test",
+			)
+			if apperr.From(err).Code != apperr.OCRNotKTP.Code {
+				t.Fatalf("expected OCR_NOT_KTP, got %v", err)
+			}
+		})
+	}
+}
+
+// With no server-side engine, the text comes from the client's on-device OCR.
+func TestProcessKTP_FallsBackToClientText(t *testing.T) {
 	f := setupOCRService()
 	sessionID := f.session(StepOCR)
-	f.engine.confidence = 40
+	f.svc.ocrEngine = nil
 
-	_, err := f.svc.ProcessKTP(context.Background(), sessionID, []byte("x"), DeviceCaptureMeta{}, "127.0.0.1", "test")
-	if apperr.From(err).Code != apperr.OCRPhotoBlurry.Code {
-		t.Fatalf("expected OCR_PHOTO_BLURRY, got %v", err)
+	meta := goodCapture()
+	meta.ClientOCRText = validKTPText
+
+	resp, err := f.svc.ProcessKTP(
+		context.Background(), sessionID, []byte("x"), meta, "127.0.0.1", "test",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Extracted.NIK != "3174082104950001" {
+		t.Fatalf("expected the NIK from the client text, got %q", resp.Extracted.NIK)
+	}
+}
+
+// No engine and no client text means nothing was read. The only honest answer
+// is a refusal — never a fabricated identity.
+func TestProcessKTP_NoTextSourceRefused(t *testing.T) {
+	f := setupOCRService()
+	sessionID := f.session(StepOCR)
+	f.svc.ocrEngine = nil
+
+	_, err := f.svc.ProcessKTP(
+		context.Background(), sessionID, []byte("x"), goodCapture(), "127.0.0.1", "test",
+	)
+	if apperr.From(err).Code != apperr.OCRNotKTP.Code {
+		t.Fatalf("expected OCR_NOT_KTP, got %v", err)
+	}
+	if f.storage.uploads != 0 {
+		t.Errorf("a refused photo must not be stored, got %d uploads", f.storage.uploads)
+	}
+}
+
+// The NIK carries the birth date and sex inside it, so OCR that misread either
+// one is caught here rather than becoming a wrong identity downstream.
+func TestProcessKTP_NIKInconsistencyRefused(t *testing.T) {
+	cases := map[string]string{
+		// NIK says 21-04-1995; the card line says 1996.
+		"tanggal lahir berbeda": `PROVINSI DKI JAKARTA
+NIK : 3174082104950001
+Nama : MUHAMMAD ARDAN PRAYOGI
+Tempat/Tgl Lahir : Jakarta, 21-04-1996
+Jenis Kelamin : LAKI-LAKI
+Alamat : Jl. Sudirman Kav. 45 No. 12B
+`,
+		// NIK day 21 means male; the card says female.
+		"jenis kelamin berbeda": `PROVINSI DKI JAKARTA
+NIK : 3174082104950001
+Nama : MUHAMMAD ARDAN PRAYOGI
+Tempat/Tgl Lahir : Jakarta, 21-04-1995
+Jenis Kelamin : PEREMPUAN
+Alamat : Jl. Sudirman Kav. 45 No. 12B
+`,
+		// 20 is not a province code.
+		"kode provinsi tidak ada": `PROVINSI DKI JAKARTA
+NIK : 2074082104950001
+Nama : MUHAMMAD ARDAN PRAYOGI
+Tempat/Tgl Lahir : Jakarta, 21-04-1995
+Jenis Kelamin : LAKI-LAKI
+Alamat : Jl. Sudirman Kav. 45 No. 12B
+`,
+		// Province header disagrees with the province encoded in the NIK.
+		"provinsi tidak cocok NIK": `PROVINSI JAWA BARAT
+NIK : 3174082104950001
+Nama : MUHAMMAD ARDAN PRAYOGI
+Tempat/Tgl Lahir : Jakarta, 21-04-1995
+Jenis Kelamin : LAKI-LAKI
+Alamat : Jl. Sudirman Kav. 45 No. 12B
+`,
+	}
+
+	for name, text := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := setupOCRService()
+			sessionID := f.session(StepOCR)
+			f.engine.rawText = text
+
+			_, err := f.svc.ProcessKTP(
+				context.Background(), sessionID, []byte("x"), goodCapture(), "127.0.0.1", "test",
+			)
+			if apperr.From(err).Code != apperr.OCRNotKTP.Code {
+				t.Fatalf("expected OCR_NOT_KTP, got %v", err)
+			}
+		})
+	}
+}
+
+// With no registry configured the card still passes, and the response says the
+// registry was never consulted instead of claiming a match.
+func TestProcessKTP_NoRegistryReportsUnchecked(t *testing.T) {
+	f := setupOCRService()
+	sessionID := f.session(StepOCR)
+	f.svc.dukcapil = nil
+
+	resp, err := f.svc.ProcessKTP(
+		context.Background(), sessionID, []byte("x"), goodCapture(), "127.0.0.1", "test",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.DukcapilChecked {
+		t.Error("dukcapil_checked must be false when no registry is configured")
+	}
+	if resp.DukcapilMatch {
+		t.Error("dukcapil_match must not claim a match nobody verified")
+	}
+}
+
+// A configured registry still reports both flags truthfully on success.
+func TestProcessKTP_RegistryMatchIsReportedAsChecked(t *testing.T) {
+	f := setupOCRService()
+	sessionID := f.session(StepOCR)
+
+	resp, err := f.svc.ProcessKTP(
+		context.Background(), sessionID, []byte("x"), goodCapture(), "127.0.0.1", "test",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.DukcapilChecked || !resp.DukcapilMatch {
+		t.Errorf("expected checked and matched, got checked=%v match=%v",
+			resp.DukcapilChecked, resp.DukcapilMatch)
+	}
+}
+
+// Fields OCR could not read are recovered from the NIK, which encodes them.
+func TestProcessKTP_BackfillsProvinceAndGenderFromNIK(t *testing.T) {
+	f := setupOCRService()
+	sessionID := f.session(StepOCR)
+	// No PROVINSI header and no "Jenis Kelamin" line, but still five markers.
+	f.engine.rawText = `NIK : 3174084504950002
+Nama : SITI NURHALIZA
+Tempat/Tgl Lahir : Jakarta, 05-04-1995
+Alamat : Jl. Sudirman Kav. 45 No. 12B
+RT/RW : 003/005
+Kel/Desa : Senayan
+`
+
+	resp, err := f.svc.ProcessKTP(
+		context.Background(), sessionID, []byte("x"), goodCapture(), "127.0.0.1", "test",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Extracted.Provinsi != "DKI JAKARTA" {
+		t.Errorf("province should come from the NIK, got %q", resp.Extracted.Provinsi)
+	}
+	// Day 45 = 5 + 40, so the NIK says female.
+	if resp.Extracted.JenisKelamin != "PEREMPUAN" {
+		t.Errorf("sex should come from the NIK, got %q", resp.Extracted.JenisKelamin)
+	}
+}
+
+// accuracy_percent must describe this photo, not a constant.
+func TestProcessKTP_AccuracyReflectsMarkersFound(t *testing.T) {
+	f := setupOCRService()
+	sessionID := f.session(StepOCR)
+	f.engine.confidence = 99.4 // the engine's self-report must be ignored
+
+	resp, err := f.svc.ProcessKTP(
+		context.Background(), sessionID, []byte("x"), goodCapture(), "127.0.0.1", "test",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.AccuracyPct == 99.4 {
+		t.Fatal("accuracy must not be the engine's self-reported confidence")
+	}
+	expected := AssessKTPText(validKTPText).Confidence()
+	if resp.AccuracyPct != expected {
+		t.Fatalf("expected %v, got %v", expected, resp.AccuracyPct)
 	}
 }
 

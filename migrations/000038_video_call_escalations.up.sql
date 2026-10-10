@@ -25,7 +25,7 @@ CREATE TABLE onboarding_video_call_escalations (
     status        VARCHAR(16) NOT NULL DEFAULT 'PENDING',
 
     -- Alasan eskalasi, teks bebas dari petugas. Berbeda dari rejection_reason yang
-    -- ber-enum: penolakan dihitung dan dilaporkan, sementana eskalasi dibaca manusia
+    -- ber-enum: penolakan dihitung dan dilaporkan, sementara eskalasi dibaca manusia
     -- yang akan menanganinya.
     reason        TEXT        NOT NULL,
 

@@ -35,6 +35,7 @@ import (
 	"github.com/holis12821/bca-mobile-api/internal/pkg/push"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/response"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/sms"
+	"github.com/holis12821/bca-mobile-api/internal/repository/localfs"
 	"github.com/holis12821/bca-mobile-api/internal/repository/postgres"
 	redisrepo "github.com/holis12821/bca-mobile-api/internal/repository/redis"
 	ws "github.com/holis12821/bca-mobile-api/internal/websocket"
@@ -433,6 +434,29 @@ func New(deps Deps) (http.Handler, error) {
 		Cache: redisrepo.NewOnboardingTNCCache(deps.RedisCache),
 	})
 
+	// Katalog jenis rekening: layar PERTAMA, dibaca sebelum S&K dan sebelum sesi ada —
+	// alasan yang sama kenapa ia service sendiri, bukan bagian SessionService.
+	//
+	// UnderMaintenance dibaca dari env yang SAMA dengan katalog kartu
+	// (ONBOARDING_PRODUCTS_MAINTENANCE), tapi dijawab berbeda: produk yang tutup tetap
+	// MUNCUL di daftar dengan availability_status DISABLED, bukan menghilang dan bukan
+	// membuat seluruh endpoint 422. Nasabah perlu tahu produk itu ada dan sedang tutup.
+	onboardingProductRepo := postgres.NewOnboardingProductRepo(deps.DB)
+	onboardingProductCache := redisrepo.NewOnboardingProductCache(deps.RedisCache)
+
+	onboardingProductService := onboarding.NewProductService(onboarding.ProductServiceConfig{
+		Repo:             onboardingProductRepo,
+		Cache:            onboardingProductCache,
+		Enabled:          clientCfg.ProductCatalogEnabled,
+		UnderMaintenance: clientCfg.ProductUnderMaintenance,
+	})
+
+	// Jalur tulis katalog produk. SENGAJA tidak membaca ProductCatalogEnabled: flag itu
+	// mematikan endpoint NASABAH, dan katalog yang dimatikan karena isinya salah adalah
+	// justru saat isinya paling perlu diubah. Lihat ProductAdminService.
+	onboardingProductAdminService := onboarding.NewProductAdminService(
+		onboardingProductRepo, onboardingProductCache)
+
 	onboardingVideoCallRepo := postgres.NewOnboardingVideoCallRepo(deps.DB)
 
 	// Registry petugas CS. Interface-nya, bukan tipe konkretnya: tanpa database —
@@ -455,11 +479,23 @@ func New(deps Deps) (http.Handler, error) {
 	// yang berarti panggilan tidak pernah bisa dimulai.
 	sigHub := ws.NewHub()
 
+	// Satu repo eskalasi, dipakai DUA service: VideoCallService melahirkan barisnya pada
+	// NEED_REVIEW, EscalationService menutupnya. Dibuat sekali di sini, bukan dua kali
+	// di tempat pemakaiannya, supaya tidak ada dua instance yang nanti berbeda
+	// konfigurasi tanpa ada yang menyadarinya.
+	onboardingEscalationRepo := postgres.NewOnboardingVideoCallEscalationRepo(deps.DB)
+
 	videoCallService := onboarding.NewVideoCallService(onboarding.VideoCallServiceConfig{
-		Sessions:         onboardingSessionRepo,
-		Cache:            onboardingCache,
-		VideoCalls:       onboardingVideoCallRepo,
-		Schedules:        postgres.NewOnboardingVideoCallScheduleRepo(deps.DB),
+		Sessions:   onboardingSessionRepo,
+		Cache:      onboardingCache,
+		VideoCalls: onboardingVideoCallRepo,
+		Schedules:  postgres.NewOnboardingVideoCallScheduleRepo(deps.DB),
+
+		// Tanpa baris ini NEED_REVIEW dijawab 503 di setiap environment, dan penjaga
+		// VIDEO_CALL_UNDER_REVIEW di JoinQueue adalah kode mati — tabel migrasi 000038
+		// ada tapi tidak ada yang menulis maupun membacanya.
+		Escalations: onboardingEscalationRepo,
+
 		QueueCache:       videoCallQueueCache,
 		JWTManager:       deps.JWTManager,
 		Audit:            onboardingAuditRepo,
@@ -479,6 +515,7 @@ func New(deps Deps) (http.Handler, error) {
 		Audit:            onboardingAuditRepo,
 		Cards:            cardService,
 		TNC:              tncService,
+		Products:         onboardingProductService,
 		LegacyAppVersion: clientCfg.CardLegacyAppVersion,
 		VideoCalls:       videoCallService,
 	})
@@ -486,7 +523,47 @@ func New(deps Deps) (http.Handler, error) {
 	// External integrations, chosen once by environment. In development these
 	// are the mocks; anywhere else they refuse with PROVIDER_NOT_CONFIGURED
 	// instead of fabricating a verified identity.
-	providers := onboarding.ProvidersFor(devMode)
+	livenessCfg := onboarding.DefaultLivenessConfig()
+	livenessMode := onboarding.LivenessModeInternal
+	var integrityVerifier onboarding.IntegrityVerifier
+	if deps.Config != nil {
+		livenessCfg = deps.Config.Liveness.ToDomain()
+		livenessMode = onboarding.LivenessProviderMode(deps.Config.Liveness.Provider)
+		integrityVerifier = onboarding.NewPlayIntegrityVerifier(
+			deps.Config.Liveness.PlayIntegrityConfig(),
+		)
+	}
+
+	// The face analyzer is nil: the ML layer of the internal liveness provider
+	// needs face-detection, embedding and PAD models, and none are available
+	// under a licence that permits commercial use. With it nil the provider
+	// fails closed — every attempt is refused rather than passed. See
+	// NewInternalLivenessProvider.
+	providerOpts := onboarding.ProviderOptions{
+		LivenessMode:   livenessMode,
+		LivenessConfig: livenessCfg,
+		Integrity:      integrityVerifier,
+		// No server-side OCR engine. The text comes from the client's on-device
+		// ML Kit recognizer, which already ran on the uploaded photo, and the
+		// server validates it. There is deliberately no mock engine to fall back
+		// on: the one that existed ignored the image and returned a hardcoded
+		// identity, so an image with no text at all was "verified".
+		OCR:          nil,
+		DukcapilMode: onboarding.DukcapilModeOff,
+	}
+	if deps.Config != nil {
+		providerOpts.DukcapilMode = onboarding.DukcapilMode(
+			strings.ToLower(strings.TrimSpace(deps.Config.KTP.DukcapilMode)),
+		)
+		// Real storage, so the KTP photo is actually kept. With the mock the
+		// photo_path column pointed at an object that never existed, and
+		// biometric face match had nothing to compare against.
+		if !strings.EqualFold(strings.TrimSpace(deps.Config.KTP.StorageDriver), "mock") {
+			providerOpts.Storage = localfs.New(deps.Config.KTP.StorageLocalPath)
+		}
+	}
+
+	providers := onboarding.ProvidersWith(devMode, providerOpts)
 
 	var piiAES *crypto.AES
 	if len(deps.PIIKey) > 0 {
@@ -529,19 +606,48 @@ func New(deps Deps) (http.Handler, error) {
 	})
 
 	onboardingBiometricRepo := postgres.NewOnboardingBiometricRepo(deps.DB)
-	bioRateLimiter := redisrepo.NewBiometricRateLimiter(deps.RedisSession)
+	onboardingLivenessAttemptRepo := postgres.NewOnboardingLivenessAttemptRepo(deps.DB)
+
+	// Challenges and the attempt counters share one store: both are short-lived,
+	// both are read on every attempt, and the single-use guarantee needs the
+	// atomic read-and-delete that Redis GETDEL provides.
+	onboardingLivenessCache := redisrepo.NewOnboardingLivenessCache(
+		deps.RedisSession,
+		redisrepo.LivenessPolicy{
+			ChallengeTTL:      livenessCfg.ChallengeTTL,
+			MaxFailures:       livenessCfg.MaxFailures,
+			CooldownDuration:  livenessCfg.CooldownDuration,
+			MaxCooldownRounds: livenessCfg.MaxCooldownRounds,
+			BlockWindow:       livenessCfg.BlockWindow,
+		},
+	)
 
 	biometricService := onboarding.NewBiometricService(onboarding.BiometricServiceConfig{
-		Sessions:    onboardingSessionRepo,
-		Cache:       onboardingCache,
-		OCRResults:  onboardingOCRRepo,
-		Biometrics:  onboardingBiometricRepo,
-		Engine:      providers.Biometric,
-		Storage:     providers.Storage,
-		RateLimiter: bioRateLimiter,
-		AES:         piiAES,
-		Audit:       onboardingAuditRepo,
+		Sessions:   onboardingSessionRepo,
+		Cache:      onboardingCache,
+		OCRResults: onboardingOCRRepo,
+		Biometrics: onboardingBiometricRepo,
+		Provider:   providers.Liveness,
+		Integrity:  providers.Integrity,
+		Challenges: onboardingLivenessCache,
+		Attempts:   onboardingLivenessCache,
+		AttemptLog: onboardingLivenessAttemptRepo,
+		Storage:    providers.Storage,
+		AES:        piiAES,
+		Audit:      onboardingAuditRepo,
+		Liveness:   livenessCfg,
 	})
+
+	livenessChallengeService := onboarding.NewLivenessChallengeService(
+		onboarding.LivenessChallengeServiceConfig{
+			Sessions:   onboardingSessionRepo,
+			Cache:      onboardingCache,
+			Challenges: onboardingLivenessCache,
+			Attempts:   onboardingLivenessCache,
+			Audit:      onboardingAuditRepo,
+			Liveness:   livenessCfg,
+		},
+	)
 
 	onboardingCredentialRepo := postgres.NewOnboardingCredentialRepo(deps.DB)
 
@@ -626,13 +732,13 @@ func New(deps Deps) (http.Handler, error) {
 		Access:    postgres.NewCSAccessLogRepo(deps.DB),
 		Hasher:    lookupHasher,
 	})
-	csH := handler.NewCSHandler(csService)
-
 	// Terminal, sesi petugas, dan jejak audit CS. Satu paket domain `cs`, konteks sama:
 	// semuanya tentang apa yang dilakukan PETUGAS, bukan tentang nasabah.
 	csTerminalRepo := postgres.NewCSTerminalRepo(deps.DB)
 	csSessionRepo := postgres.NewCSAgentSessionRepo(deps.DB)
 	csAuditRepo := postgres.NewCSAuditEventRepo(deps.DB)
+
+	csSupervisorRepo := postgres.NewCSSupervisorRepo(deps.DB)
 
 	csSessionService := cs.NewAgentSessionService(cs.AgentSessionServiceConfig{
 		Creds:     postgres.NewCSAgentCredentialRepo(deps.DB),
@@ -640,17 +746,53 @@ func New(deps Deps) (http.Handler, error) {
 		Terminals: csTerminalRepo,
 		Audit:     csAuditRepo,
 		Hasher:    crypto.NewPasswordHasher(),
+
+		// Pendaftaran petugas (SCR-001). Direktori pegawai digerbangi APP_ENV seperti
+		// seluruh integrasi luar di repo ini: di luar development ia menolak dengan
+		// HRIS_UNAVAILABLE, bukan meluluskan NPP yang tidak pernah diperiksa siapa pun.
+		Registry:    postgres.NewCSAgentRegistryRepo(deps.DB),
+		Supervisors: csSupervisorRepo,
+		HRIS:        cs.HRISDirectoryFor(devMode),
 	})
 
 	csTerminalService := cs.NewTerminalService(cs.TerminalServiceConfig{
 		Terminals:   csTerminalRepo,
-		Supervisors: postgres.NewCSSupervisorRepo(deps.DB),
+		Supervisors: csSupervisorRepo,
 		Sessions:    csSessionRepo,
 		Audit:       csAuditRepo,
 	})
 
+	// Pembacaan jejak audit terpisah dari penulisnya: penulisan terjadi di dalam
+	// tindakan yang memicunya, sementara pembacaan adalah pekerjaan pengawas.
+	csAuditQueryService := cs.NewAuditQueryService(csAuditRepo)
+
+	// Dashboard tidak punya tabel sendiri — setiap angkanya sudah dicatat di tempat lain
+	// sebagai akibat sebuah tindakan. Tabel ringkasan tersendiri akan menjadi salinan
+	// kedua yang bisa melenceng dari aslinya.
+	csDashboardService := cs.NewDashboardService(cs.DashboardServiceConfig{
+		Calls:     postgres.NewCSDashboardRepo(deps.DB),
+		Sessions:  csSessionRepo,
+		Terminals: csTerminalRepo,
+	})
+
+	// Tindak lanjut Tier 2 atas perkara NEED_REVIEW. Service tersendiri, bukan bagian
+	// VideoCallService: yang ini tidak punya socket, tidak punya media, dan dijalankan
+	// orang lain berjam-jam setelah panggilannya selesai.
+	//
+	// Tanpa jalur ini, baris eskalasi lahir tapi tidak pernah ditutup — dan nasabah yang
+	// perkaranya menggantung dijawab 422 VIDEO_CALL_UNDER_REVIEW setiap kali ia mencoba
+	// mengantre, selamanya.
+	csEscalationService := onboarding.NewEscalationService(onboarding.EscalationServiceConfig{
+		Escalations: onboardingEscalationRepo,
+		Sessions:    onboardingSessionRepo,
+		Cache:       onboardingCache,
+		Audit:       onboardingAuditRepo,
+	})
+
+	csH := handler.NewCSHandler(csService, csAuditQueryService, csDashboardService)
 	csAuthH := handler.NewCSAuthHandler(csSessionService)
 	csTerminalH := handler.NewCSTerminalHandler(csTerminalService)
+	csEscalationH := handler.NewCSEscalationHandler(csEscalationService)
 
 	ticketH := handler.NewTicketHandler(ticket.NewService(ticket.ServiceConfig{
 		Repo: postgres.NewTicketRepo(deps.DB),
@@ -660,7 +802,12 @@ func New(deps Deps) (http.Handler, error) {
 	cardAdminH := handler.NewCardAdminHandler(
 		onboarding.NewCardAdminService(cardRepo, cardCache))
 
-	onboardingH := handler.NewOnboardingHandler(onboardingSessionService, ocrService, personalDataService, biometricService, videoCallService, credentialService, submitService, monitoringService, tncService, deps.PINKeys)
+	onboardingH := handler.NewOnboardingHandler(onboardingSessionService, ocrService, personalDataService, biometricService, videoCallService, credentialService, submitService, monitoringService, tncService, onboardingProductService, deps.PINKeys)
+
+	// Dipasang lewat setter, bukan argumen ke-12 konstruktor di atas: lihat
+	// OnboardingHandler.productAdminService.
+	onboardingH.SetProductAdminService(onboardingProductAdminService)
+	onboardingH.SetLivenessChallengeService(livenessChallengeService)
 
 	uploadDir := "uploads"
 	if deps.Config != nil && deps.Config.UploadDir != "" {
@@ -754,6 +901,35 @@ func New(deps Deps) (http.Handler, error) {
 				r.Get("/products/{product_type}/cards", cardH.GetCatalog)
 			})
 
+			// Katalog jenis rekening: layar PERTAMA, sebelum S&K. Publik, tanpa
+			// session_id dan tanpa Authorization.
+			//
+			// Sengaja DI LUAR grup ber-limit-IP di bawah, sama seperti /tnc dan
+			// /products/{product_type}/cards: batas IP itu ada untuk mencegah
+			// penelusuran session_id dan pemerasan OTP, yang tidak berlaku untuk daftar
+			// produk yang publik dan cacheable.
+			//
+			// Jatahnya SENDIRI, bukan menumpang bucket S&K atau katalog kartu. Flow
+			// Android memuat ketiganya pada tiga layar berurutan, jadi bucket bersama
+			// berarti ketiga endpoint saling menghabiskan jatah dan nasabah menerima 429
+			// di tengah pendaftaran.
+			//
+			// Didaftarkan di grup terpisah dari /products/{product_type}/cards meski
+			// prefix-nya sama: chi mencocokkan pola statis lebih dulu, jadi /products
+			// tidak pernah tertelan oleh pola ber-parameter di atasnya. Keduanya diuji
+			// berdampingan di router_test.
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.RateLimit(rateLimiter, productCatalogRateKey,
+					productCatalogRateLimit, productCatalogRateWindow, false))
+				// Per-IP di atasnya dengan alasan yang sama seperti katalog kartu: batas
+				// per-device sendirian bisa dilewati dengan memutar X-Device-Id, dan
+				// setiap permintaan yang lolos membaca katalog utuh dari cache.
+				r.Use(middleware.RateLimit(rateLimiter, productCatalogIPRateKey,
+					productCatalogIPRateLimit, productCatalogIPRateWindow, false))
+
+				r.Get("/products", onboardingH.GetProducts)
+			})
+
 			// S&K dibaca pada layar PERTAMA buka rekening — sebelum sesi ada,
 			// jadi tanpa session_id dan tanpa Authorization. Sama seperti
 			// katalog kartu, ia sengaja DI LUAR grup ber-limit-IP di bawah:
@@ -790,6 +966,7 @@ func New(deps Deps) (http.Handler, error) {
 				r.Post("/personal-data", onboardingH.SavePersonalData)
 				r.Post("/verify-otp", onboardingH.VerifyOTP)
 				r.Post("/resend-otp", onboardingH.ResendOTP)
+				r.Post("/liveness/challenge", onboardingH.RequestLivenessChallenge)
 				r.Post("/biometric", onboardingH.ProcessBiometric)
 				r.Post("/video-call/queue", onboardingH.JoinVideoCallQueue)
 				r.Get("/video-call/signal", signalingH.HandleSignaling)
@@ -981,6 +1158,31 @@ func New(deps Deps) (http.Handler, error) {
 				Post("/logout", csAuthH.Logout)
 		})
 
+		// Pendaftaran petugas dan direktori pegawai (SCR-001).
+		//
+		// Di belakang AgentIdentity: pendaftar harus bisa disebut namanya di jejak audit.
+		// Tidak menuntut cakupan tertentu — mendaftarkan petugas adalah pekerjaan
+		// supervisor/teknisi, dan tidak satu pun dari empat cakupan yang ada
+		// menggambarkannya. Otorisasi dual-control diminta di BODY, bukan sebagai gerbang
+		// sesi: yang perlu ditandatangani adalah pemberian kewenangan, bukan kesiapan
+		// loket si pendaftar.
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.AgentIdentity(csAgentLookup))
+
+			r.Post("/agents", csAuthH.RegisterAgent)
+
+			// Mengubah cakupan atau mencabut petugas. Penjaganya sama dengan
+			// pendaftaran, dan dual-control-nya juga di body — yang ditandatangani
+			// adalah PERUBAHAN KEWENANGAN, bukan kesiapan loket si pengubah.
+			//
+			// Sebelum ini keduanya hanya bisa lewat SQL langsung: jalur yang tidak
+			// menghasilkan jejak audit, tidak menuntut otorisasi supervisor, dan tidak
+			// bisa diserahkan ke siapa pun di luar pemegang kredensial database.
+			r.Patch("/agents/{employee_id}", csAuthH.UpdateAgent)
+
+			r.Get("/hris/employees/{employee_id}", csAuthH.LookupEmployee)
+		})
+
 		// Supervisor: daftar untuk layar SCR-006, dan otorisasi dual-control.
 		r.Route("/supervisors", func(r chi.Router) {
 			// Daftar supervisor dibuka SEBELUM otorisasi, jadi ia hanya butuh sesi —
@@ -1046,6 +1248,42 @@ func New(deps Deps) (http.Handler, error) {
 			r.Post("/{ticket_number}/notes", ticketH.AddNote)
 		})
 
+		// Beranda petugas dan jejak audit CS — dua penjaga berbeda, dan bedanya penting.
+		//
+		// Beranda tetap AgentIdentity: ia menjawab tentang pekerjaan petugas SENDIRI —
+		// panggilan hari ini, loketnya, antrean yang menunggunya — dan tidak satu pun
+		// dari enam cakupan menggambarkan "boleh melihat pekerjaan sendiri".
+		//
+		// Jejak audit sekarang menuntut AUDIT_READ, dan ini perubahan yang memutus
+		// pemanggil lama. Sebelumnya ia hanya menuntut identitas petugas, jadi SETIAP
+		// petugas terautentikasi bisa membaca jejak rekannya: jam login, loket, dan
+		// setiap otorisasi supervisor yang pernah gagal atas nama seseorang. Jejak
+		// pengawasan yang terbuka bagi semua yang diawasinya bukan pembatas kewenangan.
+		// Cakupannya dibuka migrasi 000041.
+		r.Route("/cs", func(r chi.Router) {
+			r.With(middleware.AgentIdentity(csAgentLookup)).
+				Get("/dashboard", csH.Dashboard)
+
+			r.With(middleware.AgentAuth(csAgentLookup, middleware.ScopeAuditRead)).
+				Get("/audit-events", csH.ListAuditEvents)
+		})
+
+		// Antrean kerja Tier 2: perkara NEED_REVIEW.
+		//
+		// ESCALATION_REVIEW, bukan VIDEO_CALL, dan itu bukan kerapian: sebuah `APPROVED`
+		// di sini memindahkan nasabah ke CREDENTIALS — keputusan yang sama besar dengan
+		// keputusan panggilannya sendiri. Petugas yang mengaku tidak sanggup memutuskan
+		// sebuah verifikasi tidak boleh jadi orang yang menutup perkaranya, dan cakupan
+		// yang sama dengan panggilan akan memberikan tepat itu kepada setiap petugas
+		// Tier 1. Larangan menutup-perkara-sendiri ditegakkan di service; cakupan ini
+		// yang membuat sebagian besar petugas tidak bisa menyentuh jalurnya sama sekali.
+		r.Route("/escalations", func(r chi.Router) {
+			r.Use(middleware.AgentAuth(csAgentLookup, middleware.ScopeEscalationReview))
+
+			r.Get("/", csEscalationH.ListEscalations)
+			r.Patch("/{escalation_id}", csEscalationH.UpdateEscalation)
+		})
+
 		// Pemantauan sesi onboarding.
 		//
 		// Di /internal/v1, bukan menumpang /v1/onboarding seperti endpoint CS yang lebih
@@ -1060,6 +1298,25 @@ func New(deps Deps) (http.Handler, error) {
 			// Detailnya memuat data pribadi, dan itu kewenangan tersendiri.
 			r.With(middleware.AgentAuth(csAgentLookup, middleware.ScopeCustomerPII)).
 				Get("/sessions/{session_id}", onboardingH.GetSessionDetailForCS)
+
+			// Administrasi katalog jenis rekening tabungan (Fase 6).
+			//
+			// CARD_ADMIN, bukan cakupan kelima: mengatur katalog kartu Paspor dan
+			// mengatur katalog produk tabungan adalah pekerjaan administratif yang sama
+			// jenisnya, dan CHECK cs_agents_scopes_valid di migrasi 000027 mengunci
+			// daftar cakupan ke empat nilai — cakupan PRODUCT_ADMIN menuntut migrasi
+			// yang mengubah constraint itu. Kalau pemisahan tugas antara "boleh
+			// mengubah biaya kartu" dan "boleh menutup produk tabungan" nanti
+			// diputuskan perlu, di sinilah penjaganya berubah.
+			//
+			// GET dan PUT di path yang SAMA, dan ini bukan tabrakan dengan
+			// GET /v1/onboarding/products milik nasabah: prefix-nya berbeda
+			// (/internal/v1 vs /v1), dan jawabannya pun berbeda bentuk —
+			// AdminProductCatalog memuat is_active dan tidak memuat copy halaman.
+			r.With(middleware.AgentAuth(csAgentLookup, middleware.ScopeCardAdmin)).
+				Get("/products", onboardingH.AdminListProducts)
+			r.With(middleware.AgentAuth(csAgentLookup, middleware.ScopeCardAdmin)).
+				Put("/products", onboardingH.AdminWriteProducts)
 		})
 	})
 
@@ -1278,6 +1535,45 @@ func setCardRateKey(r *http.Request) string {
 		return "rate:cards:set:ip:" + middleware.ClientIP(r)
 	}
 	return "rate:cards:set:session:" + sessionID
+}
+
+// Katalog jenis rekening: 30 per 5 menit per device.
+//
+// Angkanya mengikuti S&K, bukan katalog kartu (60/jam), karena pemakaiannya mirip S&K:
+// satu layar yang dibuka sekali per pendaftaran dengan isi yang di-cache 5 menit di
+// client. Bucket-nya sendiri — lihat alasannya di titik pendaftaran rute.
+const (
+	productCatalogRateLimit  = 30
+	productCatalogRateWindow = 5 * time.Minute
+)
+
+// productCatalogRateKey membatasi per X-Device-Id, dan jatuh ke IP bila headernya tidak
+// ada.
+//
+// Cabang IP itu hanya jaring pengaman: GetProducts MENOLAK 400 tanpa X-Device-Id, jadi
+// permintaan tanpa header tidak pernah sampai ke handler. Cabangnya tetap ada supaya
+// penolakan itu sendiri ikut berbatas — tanpa itu, permintaan tanpa header bisa diulang
+// tanpa henti dan semuanya berbagi satu kunci kosong.
+func productCatalogRateKey(r *http.Request) string {
+	if deviceID := strings.TrimSpace(r.Header.Get("X-Device-Id")); deviceID != "" {
+		return "rate:products:device:" + deviceID
+	}
+	return "rate:products:ip:" + middleware.ClientIP(r)
+}
+
+// Plafon per-IP di atas batas per-device, alasan yang sama dengan
+// cardCatalogIPRateLimit: X-Device-Id dipilih client, jadi memutarnya setiap permintaan
+// melewati batas per-device sepenuhnya.
+//
+// Longgar dengan sengaja — pemakai m-BCA berbagi alamat di belakang NAT operator, dan
+// batas per-IP yang ketat akan memutus nasabah yang wajar.
+const (
+	productCatalogIPRateLimit  = 600
+	productCatalogIPRateWindow = time.Hour
+)
+
+func productCatalogIPRateKey(r *http.Request) string {
+	return "rate:products:ip:" + middleware.ClientIP(r)
 }
 
 // S&K: 30 per 5 menit. Layarnya dibuka sekali per pendaftaran dan isinya

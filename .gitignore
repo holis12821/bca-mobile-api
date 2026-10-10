@@ -35,3 +35,9 @@ vendor/
 
 # macOS
 .DS_Store
+
+# Binary hasil `go build ./scripts/...` dan `./cmd/...`.
+# Sempat ikut tercommit di 512c868 (13 MB Mach-O) — jangan terulang.
+/seed
+/server
+/pinenc

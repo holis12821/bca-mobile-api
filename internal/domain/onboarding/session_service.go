@@ -29,6 +29,10 @@ type SessionService struct {
 	// sesi berangkat dari OCR seperti sebelum sisipan ini ada.
 	cards *CardService
 
+	// products opsional: tanpa katalog, sesi tetap lahir dengan kedua kolom jejak
+	// kosong. Katalog yang mati TIDAK boleh mematikan pembuatan sesi.
+	products *ProductService
+
 	// tnc opsional hanya demi test lama yang membangun service tanpa S&K.
 	// Di router ia SELALU terisi: nil berarti `accepted_tnc_version` kembali
 	// jadi string bebas yang tersimpan tanpa ada yang bisa membuktikan isinya.
@@ -53,6 +57,7 @@ type SessionServiceConfig struct {
 	Audit            AuditRepository
 	Cards            *CardService
 	TNC              *TNCService
+	Products         *ProductService
 	LegacyAppVersion string
 	VideoCalls       VideoCallCanceller
 }
@@ -64,6 +69,7 @@ func NewSessionService(cfg SessionServiceConfig) *SessionService {
 		audit:            cfg.Audit,
 		cards:            cfg.Cards,
 		tnc:              cfg.TNC,
+		products:         cfg.Products,
 		legacyAppVersion: cfg.LegacyAppVersion,
 		videoCalls:       cfg.VideoCalls,
 	}
@@ -157,6 +163,27 @@ func (s *SessionService) CreateSession(ctx context.Context, req CreateSessionReq
 		session.CardType = card.CardType
 		session.CardSelectedAt = &now
 		session.CardCatalogVersion = req.CardCatalogVersion
+	}
+
+	// Jejak setoran awal yang DILIHAT nasabah.
+	//
+	// Diambil dari katalog yang sedang berlaku di server, BUKAN dari body: berbeda dari
+	// accepted_tnc_version yang memang harus datang dari client karena ia bukti
+	// persetujuan, angka ini adalah apa yang SERVER tampilkan. Menerimanya dari client
+	// berarti membiarkan yang disengketakan menentukan bukti sengketanya.
+	//
+	// Kegagalannya TIDAK menggagalkan apa pun — DepositShownFor melaporkan "tidak
+	// ketemu" saat katalog mati, flag mati, atau produknya belum ada barisnya, dan sesi
+	// tetap lahir dengan kedua kolom NULL. Aturan wajib #9: matinya katalog tidak boleh
+	// mematikan POST /sessions.
+	//
+	// Validasi product_type di atas SENGAJA tidak diubah: tetap pt.Valid() + cek
+	// maintenance, dan tidak pernah menuntut baris onboarding_products ada.
+	if s.products != nil {
+		if deposit, catalogVersion, ok := s.products.DepositShownFor(ctx, pt); ok {
+			session.MinInitialDepositShown = deposit
+			session.ProductCatalogVersion = catalogVersion
+		}
 	}
 
 	// Store in PostgreSQL
