@@ -524,3 +524,173 @@ func TestCancelSessionSucceedsWhenVideoCallCancelFails(t *testing.T) {
 		t.Error("sesinya tidak di-soft-delete")
 	}
 }
+
+// --- Jejak katalog produk di baris sesi (fase 5) ---
+
+// newServiceWithProducts merakit SessionService dengan katalog produk terpasang.
+func newServiceWithProducts(catalog *SavingsProductCatalog, enabled bool) (*SessionService, *mockSessionRepo) {
+	repo := newMockSessionRepo()
+	products := NewProductService(ProductServiceConfig{
+		Repo:    &mockProductRepo{catalog: catalog},
+		Enabled: enabled,
+	})
+	svc := NewSessionService(SessionServiceConfig{
+		Sessions: repo,
+		Cache:    newMockSessionCache(),
+		Audit:    &mockAuditRepo{},
+		Products: products,
+	})
+	return svc, repo
+}
+
+// Sesi baru mencatat setoran awal yang DILIHAT nasabah beserta versi katalognya.
+//
+// Yang perlu dibuktikan saat sengketa adalah angka saat itu, bukan angka hari ini.
+func TestCreateSession_RecordsProductCatalogTrail(t *testing.T) {
+	svc, repo := newServiceWithProducts(sampleProductCatalog(), true)
+
+	resp, err := svc.CreateSession(context.Background(), CreateSessionRequest{
+		ProductType: "TAHAPAN_XPRESI",
+		DeviceID:    "dev-trail",
+		// AcceptedTNCVersion wajib — tanpa TNCService terpasang ia hanya diperiksa
+		// tidak kosong, lalu tersimpan apa adanya.
+		AcceptedTNCVersion: "2026-09-01",
+	}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	stored := repo.sessions[resp.SessionID]
+	if stored == nil {
+		t.Fatal("sesi tidak tersimpan")
+	}
+	if stored.MinInitialDepositShown != 50000 {
+		t.Errorf("min_initial_deposit_shown = %d, mau 50000 (angka TAHAPAN_XPRESI)",
+			stored.MinInitialDepositShown)
+	}
+	if stored.ProductCatalogVersion != "2026-10-07.1" {
+		t.Errorf("product_catalog_version = %q", stored.ProductCatalogVersion)
+	}
+}
+
+// Angkanya diambil dari katalog SERVER, bukan dari body: berbeda dari
+// accepted_tnc_version yang memang harus datang dari client karena ia bukti
+// persetujuan, angka ini adalah apa yang server tampilkan. Menerimanya dari client
+// berarti membiarkan yang disengketakan menentukan bukti sengketanya.
+func TestCreateSession_DepositShownIgnoresClientClaims(t *testing.T) {
+	svc, repo := newServiceWithProducts(sampleProductCatalog(), true)
+
+	// CreateSessionRequest tidak punya field untuk angka setoran — dan itu memang
+	// bentuk yang dijaga test ini. Yang tersimpan harus angka katalog TAHAPAN_BCA.
+	resp, err := svc.CreateSession(context.Background(), CreateSessionRequest{
+		ProductType: "TAHAPAN_BCA",
+		DeviceID:    "dev-claim",
+		// AcceptedTNCVersion wajib — tanpa TNCService terpasang ia hanya diperiksa
+		// tidak kosong, lalu tersimpan apa adanya.
+		AcceptedTNCVersion: "2026-09-01",
+	}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := repo.sessions[resp.SessionID].MinInitialDepositShown; got != 500000 {
+		t.Errorf("min_initial_deposit_shown = %d, mau 500000 dari katalog server", got)
+	}
+}
+
+// ATURAN WAJIB #9: matinya katalog TIDAK boleh mematikan POST /sessions.
+//
+// Sesi tetap lahir, kedua kolom jejaknya kosong, dan tidak ada error.
+func TestCreateSession_SurvivesDeadCatalog(t *testing.T) {
+	cases := map[string]*SessionService{}
+
+	svcFlagOff, repoFlagOff := newServiceWithProducts(sampleProductCatalog(), false)
+	cases["flag katalog mati"] = svcFlagOff
+
+	svcEmpty, repoEmpty := newServiceWithProducts(nil, true)
+	cases["katalog kosong"] = svcEmpty
+
+	repos := map[string]*mockSessionRepo{
+		"flag katalog mati": repoFlagOff,
+		"katalog kosong":    repoEmpty,
+	}
+
+	for name, svc := range cases {
+		resp, err := svc.CreateSession(context.Background(), CreateSessionRequest{
+			ProductType:        "TAHAPAN_BCA",
+			DeviceID:           "dev-" + name,
+			AcceptedTNCVersion: "2026-09-01",
+		}, "127.0.0.1", "test")
+		if err != nil {
+			t.Fatalf("%s: sesi harus tetap lahir, dapat error: %v", name, err)
+		}
+
+		stored := repos[name].sessions[resp.SessionID]
+		if stored == nil {
+			t.Fatalf("%s: sesi tidak tersimpan", name)
+		}
+		if stored.MinInitialDepositShown != 0 {
+			t.Errorf("%s: min_initial_deposit_shown = %d, mau 0 (NULL di database)",
+				name, stored.MinInitialDepositShown)
+		}
+		if stored.ProductCatalogVersion != "" {
+			t.Errorf("%s: product_catalog_version = %q, mau kosong", name, stored.ProductCatalogVersion)
+		}
+	}
+}
+
+// Validasi product_type TIDAK berubah: tetap pt.Valid(), dan tidak pernah menuntut
+// baris onboarding_products ada. Produk yang sah tapi belum ada di katalog tetap bisa
+// membuat sesi — kolom jejaknya saja yang kosong.
+func TestCreateSession_ProductValidationUnchangedByCatalog(t *testing.T) {
+	// Katalog hanya memuat TAHAPAN_BCA; TABUNGANKU sah menurut enum tapi tidak ada di
+	// katalog.
+	partial := sampleProductCatalog()
+	partial.Products = partial.Products[:1]
+	svc, repo := newServiceWithProducts(partial, true)
+
+	resp, err := svc.CreateSession(context.Background(), CreateSessionRequest{
+		ProductType: "TABUNGANKU",
+		DeviceID:    "dev-partial",
+		// AcceptedTNCVersion wajib — tanpa TNCService terpasang ia hanya diperiksa
+		// tidak kosong, lalu tersimpan apa adanya.
+		AcceptedTNCVersion: "2026-09-01",
+	}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("produk sah di luar katalog harus tetap bisa membuat sesi: %v", err)
+	}
+	if got := repo.sessions[resp.SessionID].ProductCatalogVersion; got != "" {
+		t.Errorf("product_catalog_version = %q, mau kosong", got)
+	}
+
+	// Produk yang TIDAK sah tetap ditolak seperti sebelumnya.
+	if _, err := svc.CreateSession(context.Background(), CreateSessionRequest{
+		ProductType: "DEPOSITO_BERJANGKA",
+		DeviceID:    "dev-invalid",
+		// AcceptedTNCVersion wajib — tanpa TNCService terpasang ia hanya diperiksa
+		// tidak kosong, lalu tersimpan apa adanya.
+		AcceptedTNCVersion: "2026-09-01",
+	}, "127.0.0.1", "test"); err == nil {
+		t.Error("product_type di luar enum harus tetap ditolak")
+	}
+}
+
+// SessionService tanpa katalog sama sekali (test lama, dan deployment yang belum
+// merakitnya) tetap bekerja.
+func TestCreateSession_WorksWithoutProductService(t *testing.T) {
+	svc, repo, _, _ := newService()
+
+	resp, err := svc.CreateSession(context.Background(), CreateSessionRequest{
+		ProductType: "TAHAPAN_BCA",
+		DeviceID:    "dev-no-catalog",
+		// AcceptedTNCVersion wajib — tanpa TNCService terpasang ia hanya diperiksa
+		// tidak kosong, lalu tersimpan apa adanya.
+		AcceptedTNCVersion: "2026-09-01",
+	}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if repo.sessions[resp.SessionID].ProductCatalogVersion != "" {
+		t.Error("tanpa katalog, kolom jejak harus kosong")
+	}
+}

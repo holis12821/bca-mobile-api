@@ -489,10 +489,13 @@ func TestSubmitResult_Rejected(t *testing.T) {
 	joinResp, _ := svc.JoinQueue(ctx, JoinQueueRequest{SessionID: sessionID}, "127.0.0.1", "test")
 	pickUpCall(t, svc, joinResp.QueueID, testAgent)
 
+	// RejectionReason wajib dan ber-enum sejak §38: penolakan tanpa alasan
+	// terstruktur tidak bisa dilaporkan maupun dihitung.
 	resp, err := svc.SubmitResult(ctx, SubmitVideoCallResultRequest{
-		SessionID: sessionID,
-		QueueID:   joinResp.QueueID,
-		Result:    "REJECTED",
+		SessionID:       sessionID,
+		QueueID:         joinResp.QueueID,
+		Result:          "REJECTED",
+		RejectionReason: string(RejectIdentityMismatch),
 	}, testAgent, "127.0.0.1", "test")
 
 	if err != nil {
@@ -1649,5 +1652,438 @@ func TestGetVideoCallSchedule_ReturnsNilWhenNone(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("got = %+v, mau nil", got)
+	}
+}
+
+// --- NEED_REVIEW, alasan penolakan, dan eskalasi (§38) ---
+
+// mockEscalationRepo meniru `idx_vc_escalations_one_open` di migrasi 000038:
+// satu sesi hanya boleh punya satu eskalasi terbuka sekaligus.
+type mockEscalationRepo struct {
+	byID      map[string]*VideoCallEscalation
+	createErr error
+	findErr   error
+}
+
+func newMockEscalationRepo() *mockEscalationRepo {
+	return &mockEscalationRepo{byID: make(map[string]*VideoCallEscalation)}
+}
+
+func (m *mockEscalationRepo) Create(_ context.Context, esc *VideoCallEscalation) error {
+	if m.createErr != nil {
+		return m.createErr
+	}
+	for _, e := range m.byID {
+		if e.SessionID == esc.SessionID && e.ResolvedAt == nil {
+			return apperr.VideoCallEscalationExists
+		}
+	}
+	copied := *esc
+	m.byID[esc.EscalationID] = &copied
+	return nil
+}
+
+func (m *mockEscalationRepo) FindOpenBySessionID(_ context.Context, sessionID string) (*VideoCallEscalation, error) {
+	if m.findErr != nil {
+		return nil, m.findErr
+	}
+	for _, e := range m.byID {
+		if e.SessionID == sessionID && e.ResolvedAt == nil {
+			return e, nil
+		}
+	}
+	return nil, nil
+}
+
+// FindByID, List, Claim, dan Resolve dipakai EscalationService; VideoCallService hanya
+// memanggil Create dan FindOpenBySessionID. Ada di sini karena satu mock memenuhi satu
+// antarmuka — menambah method ke interface repository berarti SEMUA mock ikut diperbarui.
+func (m *mockEscalationRepo) FindByID(_ context.Context, escalationID string) (*VideoCallEscalation, error) {
+	if m.findErr != nil {
+		return nil, m.findErr
+	}
+	esc, ok := m.byID[escalationID]
+	if !ok {
+		return nil, nil
+	}
+	copied := *esc
+	return &copied, nil
+}
+
+func (m *mockEscalationRepo) List(_ context.Context, filter ListEscalationsFilter) ([]VideoCallEscalation, error) {
+	if m.findErr != nil {
+		return nil, m.findErr
+	}
+
+	var out []VideoCallEscalation
+	for _, e := range m.byID {
+		switch {
+		case filter.Status != "" && e.Status != filter.Status:
+			continue
+		// Status kosong berarti yang TERBUKA saja, sama dengan predikat
+		// idx_vc_escalations_one_open dan dengan jalur Postgres-nya.
+		case filter.Status == "" &&
+			e.Status != EscalationStatusPending && e.Status != EscalationStatusInReview:
+			continue
+		case filter.Queue != "" && e.EscalationQueue != filter.Queue:
+			continue
+		case filter.ClaimedBy != "" && e.ClaimedByAgent != filter.ClaimedBy:
+			continue
+		case filter.SessionID != "" && e.SessionID != filter.SessionID:
+			continue
+		}
+		out = append(out, *e)
+	}
+
+	// Terlama dulu, seperti ORDER BY raised_at ASC. Peta Go beriterasi acak, jadi tanpa
+	// pengurutan di sini test urutan antrean akan lulus atau gagal tanpa sebab.
+	sort.Slice(out, func(i, j int) bool { return out[i].RaisedAt.Before(out[j].RaisedAt) })
+
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+	return out, nil
+}
+
+// Claim meniru UPDATE berkondisi: hanya perkara PENDING yang berubah.
+func (m *mockEscalationRepo) Claim(_ context.Context, escalationID, agentID string, at time.Time) (bool, error) {
+	esc, ok := m.byID[escalationID]
+	if !ok || esc.Status != EscalationStatusPending {
+		return false, nil
+	}
+	esc.Status = EscalationStatusInReview
+	esc.ClaimedByAgent = agentID
+	esc.ClaimedAt = &at
+	return true, nil
+}
+
+// Resolve meniru kondisi yang sama dengan jalur Postgres, TERMASUK penjaga pemegang
+// perkara: tanpa itu mock-nya akan meluluskan penutupan yang database menolaknya, dan
+// test four-eyes lulus karena mock-nya lebih longgar daripada skemanya.
+func (m *mockEscalationRepo) Resolve(_ context.Context, escalationID string, res EscalationResolution, at time.Time) (bool, error) {
+	esc, ok := m.byID[escalationID]
+	if !ok {
+		return false, nil
+	}
+	if esc.Status != EscalationStatusPending && esc.Status != EscalationStatusInReview {
+		return false, nil
+	}
+	if esc.ClaimedByAgent != "" && esc.ClaimedByAgent != res.ResolvedByAgent {
+		return false, nil
+	}
+	esc.Status = EscalationStatusResolved
+	esc.ResolvedByAgent = res.ResolvedByAgent
+	esc.ResolvedAt = &at
+	esc.Resolution = res.Resolution
+	esc.ResolutionReason = res.ResolutionReason
+	esc.ResolutionNotes = res.Notes
+	return true, nil
+}
+
+// setupVCServiceEscalated memasang repo eskalasi. setupVCService sengaja TIDAK
+// memasangnya — jalur "NEED_REVIEW tanpa tempat menyimpan eskalasi" juga perlu diuji.
+func setupVCServiceEscalated() (*VideoCallService, *mockSessionRepo, *mockSessionCache, *mockVideoCallRepo, *mockEscalationRepo, *mockAuditRepo) {
+	sessionRepo := newMockSessionRepo()
+	cache := newMockSessionCache()
+	vcRepo := newMockVideoCallRepo()
+	queueCache := newMockQueueCache()
+	escRepo := newMockEscalationRepo()
+	audit := &mockAuditRepo{}
+
+	svc := NewVideoCallService(VideoCallServiceConfig{
+		Sessions:         sessionRepo,
+		Cache:            cache,
+		VideoCalls:       vcRepo,
+		QueueCache:       queueCache,
+		Escalations:      escRepo,
+		JWTManager:       testJWTManager(),
+		Audit:            audit,
+		SignalingBaseURL: "ws://test:8080",
+		Clock:            testClockWIB(),
+	})
+
+	return svc, sessionRepo, cache, vcRepo, escRepo, audit
+}
+
+// submitForReview menjalankan satu panggilan penuh sampai SubmitResult.
+func submitForReview(t *testing.T, svc *VideoCallService, sessionRepo *mockSessionRepo, cache *mockSessionCache, req SubmitVideoCallResultRequest) (*SubmitVideoCallResultResponse, error) {
+	t.Helper()
+	sessionID := createVCTestSession(sessionRepo, cache)
+	joinResp, err := svc.JoinQueue(context.Background(), JoinQueueRequest{SessionID: sessionID}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("join queue: %v", err)
+	}
+	pickUpCall(t, svc, joinResp.QueueID, testAgent)
+
+	req.SessionID = sessionID
+	req.QueueID = joinResp.QueueID
+	return svc.SubmitResult(context.Background(), req, testAgent, "127.0.0.1", "test")
+}
+
+// Penolakan tanpa alasan ditolak: alasan penolakan dilaporkan dan dihitung, jadi
+// REJECTED yang lolos tanpa alasan membuat barisnya tak terpakai untuk hal itu.
+func TestSubmitResult_RejectedWithoutReasonRefused(t *testing.T) {
+	svc, sessionRepo, cache, vcRepo, _, _ := setupVCServiceEscalated()
+
+	_, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{Result: "REJECTED"})
+	if !errors.Is(err, apperr.ValidationError) {
+		t.Fatalf("expected VALIDATION_ERROR, got %v", err)
+	}
+	// Panggilannya tidak boleh ikut tercatat selesai.
+	for _, vc := range vcRepo.byQueue {
+		if vc.Status == VCStatusCompleted {
+			t.Error("panggilan tidak boleh COMPLETED saat permintaannya ditolak")
+		}
+	}
+}
+
+// Alasan di luar enum ditolak: teks bebas membuat tiga ejaan dari satu hal menjadi
+// tiga kategori, dan itu alasan enum-nya ada.
+func TestSubmitResult_RejectedWithFreeTextReasonRefused(t *testing.T) {
+	svc, sessionRepo, cache, _, _, _ := setupVCServiceEscalated()
+
+	_, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{
+		Result:          "REJECTED",
+		RejectionReason: "ktp blur",
+	})
+	if !errors.Is(err, apperr.ValidationError) {
+		t.Fatalf("expected VALIDATION_ERROR, got %v", err)
+	}
+}
+
+// Alasan penolakan masuk jejak audit, bukan hanya kolom panggilan: pemeriksaan pola
+// penolakan per petugas dibaca dari jejak.
+func TestSubmitResult_RejectionReasonInAudit(t *testing.T) {
+	svc, sessionRepo, cache, _, _, audit := setupVCServiceEscalated()
+
+	resp, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{
+		Result:          "REJECTED",
+		RejectionReason: string(RejectFaceMismatch),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.CurrentStep != StepVideoCall {
+		t.Errorf("rejected harus tetap di VIDEO_CALL, got %s", resp.CurrentStep)
+	}
+	if resp.Escalation != nil {
+		t.Error("REJECTED tidak boleh membuat eskalasi")
+	}
+
+	log := hasAudit(audit, resp.SessionID, AuditVideoCallEnded)
+	if log == nil {
+		t.Fatal("jejak audit VIDEO_CALL_ENDED tidak ada")
+	}
+	if got := log.Details["rejection_reason"]; got != string(RejectFaceMismatch) {
+		t.Errorf("rejection_reason di audit = %v, mau %s", got, RejectFaceMismatch)
+	}
+}
+
+// NEED_REVIEW membuat eskalasi, TIDAK memindahkan step, dan antrean kosong berarti
+// Tier 2 — default yang disebut dokumen alur, bukan tebakan pemanggil.
+func TestSubmitResult_NeedReviewCreatesEscalationWithTier2Default(t *testing.T) {
+	svc, sessionRepo, cache, _, escRepo, audit := setupVCServiceEscalated()
+
+	resp, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{
+		Result: "NEED_REVIEW",
+		Notes:  "Wajah mirip tapi tanda tangan berbeda, perlu Tier 2.",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.CurrentStep != StepVideoCall {
+		t.Errorf("NEED_REVIEW harus tetap di VIDEO_CALL, got %s", resp.CurrentStep)
+	}
+	if resp.Escalation == nil {
+		t.Fatal("response harus membawa eskalasinya: petugas perlu nomor perkaranya")
+	}
+	if resp.Escalation.EscalationQueue != EscalationTier2 {
+		t.Errorf("antrean eskalasi = %s, mau %s", resp.Escalation.EscalationQueue, EscalationTier2)
+	}
+	if resp.Escalation.Status != "PENDING" {
+		t.Errorf("status eskalasi = %s, mau PENDING", resp.Escalation.Status)
+	}
+	if resp.Escalation.RaisedByAgent != testAgent.EmployeeID {
+		t.Errorf("raised_by_agent = %s, mau %s", resp.Escalation.RaisedByAgent, testAgent.EmployeeID)
+	}
+	if len(escRepo.byID) != 1 {
+		t.Fatalf("mau 1 baris eskalasi, ada %d", len(escRepo.byID))
+	}
+
+	// Sesi tetap di VIDEO_CALL di penyimpanan, bukan hanya di response.
+	if s := sessionRepo.sessions[resp.SessionID]; s.CurrentStep != StepVideoCall {
+		t.Errorf("sesi tersimpan di %s, mau VIDEO_CALL", s.CurrentStep)
+	}
+
+	log := hasAudit(audit, resp.SessionID, AuditVideoCallEnded)
+	if log == nil {
+		t.Fatal("jejak audit VIDEO_CALL_ENDED tidak ada")
+	}
+	if log.Details["escalation_id"] != resp.Escalation.EscalationID {
+		t.Errorf("escalation_id di audit = %v, mau %s", log.Details["escalation_id"], resp.Escalation.EscalationID)
+	}
+	if log.Details["escalation_queue"] != EscalationTier2 {
+		t.Errorf("escalation_queue di audit = %v, mau %s", log.Details["escalation_queue"], EscalationTier2)
+	}
+}
+
+// Antrean yang disebut pemanggil dipakai apa adanya kalau sah.
+func TestSubmitResult_NeedReviewHonoursExplicitQueue(t *testing.T) {
+	svc, sessionRepo, cache, _, _, _ := setupVCServiceEscalated()
+
+	resp, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{
+		Result:          "NEED_REVIEW",
+		Notes:           "Pola pendaftaran mencurigakan.",
+		EscalationQueue: EscalationFraud,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Escalation.EscalationQueue != EscalationFraud {
+		t.Errorf("antrean eskalasi = %s, mau %s", resp.Escalation.EscalationQueue, EscalationFraud)
+	}
+}
+
+// Eskalasi WAJIB beralasan: perkara tanpa alasan tidak bisa ditangani Tier 2, dan
+// spasi saja bukan alasan.
+func TestSubmitResult_NeedReviewRequiresNotes(t *testing.T) {
+	svc, sessionRepo, cache, _, escRepo, _ := setupVCServiceEscalated()
+
+	_, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{
+		Result: "NEED_REVIEW",
+		Notes:  "   ",
+	})
+	if !errors.Is(err, apperr.ValidationError) {
+		t.Fatalf("expected VALIDATION_ERROR, got %v", err)
+	}
+	if len(escRepo.byID) != 0 {
+		t.Error("tidak boleh ada eskalasi tercatat saat permintaannya ditolak")
+	}
+}
+
+func TestSubmitResult_NeedReviewRejectsUnknownQueue(t *testing.T) {
+	svc, sessionRepo, cache, _, _, _ := setupVCServiceEscalated()
+
+	_, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{
+		Result:          "NEED_REVIEW",
+		Notes:           "Perlu ditinjau.",
+		EscalationQueue: "TIER_99",
+	})
+	if !errors.Is(err, apperr.ValidationError) {
+		t.Fatalf("expected VALIDATION_ERROR, got %v", err)
+	}
+}
+
+// Tanpa repo eskalasi, NEED_REVIEW DITOLAK — bukan disimpan hasilnya tanpa eskalasi.
+// Sesi NEED_REVIEW tanpa baris eskalasi akan menggantung tanpa jalan keluar: penjaga
+// di JoinQueue menahannya dari antrean justru berdasarkan baris itu.
+func TestSubmitResult_NeedReviewRefusedWithoutEscalationRepo(t *testing.T) {
+	svc, sessionRepo, cache, _, _ := setupVCService()
+
+	_, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{
+		Result: "NEED_REVIEW",
+		Notes:  "Perlu ditinjau Tier 2.",
+	})
+	if !errors.Is(err, apperr.ProviderNotConfigured) {
+		t.Fatalf("expected PROVIDER_NOT_CONFIGURED, got %v", err)
+	}
+}
+
+// Eskalasi terbuka menahan nasabah dari antrean. Tanpa ini ia akan dilayani Tier 1
+// lagi dan mendapat keputusan yang sama — eskalasinya jadi hiasan.
+func TestJoinQueue_BlockedByOpenEscalation(t *testing.T) {
+	svc, sessionRepo, cache, _, escRepo, _ := setupVCServiceEscalated()
+	ctx := context.Background()
+
+	resp, err := submitForReview(t, svc, sessionRepo, cache, SubmitVideoCallResultRequest{
+		Result: "NEED_REVIEW",
+		Notes:  "Perlu ditinjau Tier 2.",
+	})
+	if err != nil {
+		t.Fatalf("submit need review: %v", err)
+	}
+
+	_, err = svc.JoinQueue(ctx, JoinQueueRequest{SessionID: resp.SessionID}, "127.0.0.1", "test")
+	if !errors.Is(err, apperr.VideoCallUnderReview) {
+		t.Fatalf("expected VIDEO_CALL_UNDER_REVIEW, got %v", err)
+	}
+
+	// Setelah eskalasinya selesai, nasabah boleh mengantre lagi.
+	esc := escRepo.byID[resp.Escalation.EscalationID]
+	resolved := time.Now()
+	esc.ResolvedAt = &resolved
+	esc.Status = "RESOLVED"
+
+	if _, err := svc.JoinQueue(ctx, JoinQueueRequest{SessionID: resp.SessionID}, "127.0.0.1", "test"); err != nil {
+		t.Fatalf("antrean setelah eskalasi selesai: %v", err)
+	}
+}
+
+// --- priority & service pada daftar antrean (SCR-011) ---
+
+func TestQueuePriorityFor(t *testing.T) {
+	cases := []struct {
+		waited time.Duration
+		want   string
+	}{
+		{0, QueuePriorityNormal},
+		{QueueHighPriorityAfter - time.Second, QueuePriorityNormal},
+		// Ambangnya inklusif: tepat 10 menit sudah HIGH.
+		{QueueHighPriorityAfter, QueuePriorityHigh},
+		{30 * time.Minute, QueuePriorityHigh},
+	}
+	for _, tc := range cases {
+		if got := QueuePriorityFor(tc.waited); got != tc.want {
+			t.Errorf("menunggu %s: priority = %s, mau %s", tc.waited, got, tc.want)
+		}
+	}
+}
+
+// Daftar antrean yang dilihat petugas membawa priority dan service. Keduanya DITURUNKAN,
+// bukan dibaca dari kolom — tidak ada sumber prioritas di sistem ini.
+func TestListQueued_CarriesPriorityAndService(t *testing.T) {
+	svc, sessionRepo, cache, vcRepo, _ := setupVCService()
+	ctx := context.Background()
+
+	sessionID := createVCTestSession(sessionRepo, cache)
+	joinResp, err := svc.JoinQueue(ctx, JoinQueueRequest{SessionID: sessionID}, "127.0.0.1", "test")
+	if err != nil {
+		t.Fatalf("join queue: %v", err)
+	}
+
+	resp, err := svc.ListQueued(ctx)
+	if err != nil {
+		t.Fatalf("list queued: %v", err)
+	}
+	if len(resp.Calls) != 1 {
+		t.Fatalf("mau 1 panggilan, dapat %d", len(resp.Calls))
+	}
+
+	// Baru mengantre: NORMAL.
+	if resp.Calls[0].Priority != QueuePriorityNormal {
+		t.Errorf("priority = %s, mau NORMAL", resp.Calls[0].Priority)
+	}
+	if resp.Calls[0].Service != QueueServiceEKYC {
+		t.Errorf("service = %s, mau %s", resp.Calls[0].Service, QueueServiceEKYC)
+	}
+
+	// Mundurkan joined_at melewati ambang: prioritasnya harus ikut naik tanpa ada yang
+	// menulis kolom apa pun.
+	//
+	// Relatif ke nilai yang SUDAH ada, bukan ke time.Now(): service memakai clock test
+	// (testClockWIB), dan memundurkan dari jam dinding akan menghitung selisih terhadap
+	// tanggal yang berbeda.
+	vc := vcRepo.byQueue[joinResp.QueueID]
+	vc.JoinedAt = vc.JoinedAt.Add(-(QueueHighPriorityAfter + time.Minute))
+
+	resp, err = svc.ListQueued(ctx)
+	if err != nil {
+		t.Fatalf("list queued kedua: %v", err)
+	}
+	if len(resp.Calls) != 1 {
+		t.Fatalf("mau 1 panggilan, dapat %d", len(resp.Calls))
+	}
+	if resp.Calls[0].Priority != QueuePriorityHigh {
+		t.Errorf("priority = %s, mau HIGH setelah menunggu lama", resp.Calls[0].Priority)
 	}
 }

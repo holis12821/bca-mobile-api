@@ -75,6 +75,14 @@ type ObjectStorage interface {
 	// Upload stores a file and returns the object path/key.
 	Upload(ctx context.Context, bucket, key string, data []byte, contentType string) (path string, err error)
 
+	// Download fetches a file back.
+	//
+	// Added because the face-match reference was never actually loaded: the
+	// biometric path passed nil as the KTP photo with a comment saying the mock
+	// did not need it, which meant face match could never be real even with a
+	// real engine. Returns nil, nil when the object does not exist.
+	Download(ctx context.Context, bucket, key string) ([]byte, error)
+
 	// Delete removes a file from storage.
 	Delete(ctx context.Context, bucket, key string) error
 }
@@ -97,6 +105,97 @@ type VideoCallEscalationRepository interface {
 	// FindOpenBySessionID mengembalikan eskalasi yang masih PENDING atau IN_REVIEW,
 	// atau nil, nil. Dibaca penjaga JoinQueue pada setiap percobaan antre.
 	FindOpenBySessionID(ctx context.Context, sessionID string) (*VideoCallEscalation, error)
+
+	// FindByID mengembalikan satu perkara apa pun statusnya, atau nil, nil.
+	//
+	// Berbeda dari FindOpenBySessionID yang HANYA membaca yang terbuka: jalur Tier 2
+	// perlu bisa membedakan "perkara tidak ada" (404) dari "perkara sudah ditutup"
+	// (409), dan pembaca yang hanya melihat yang terbuka menjawab keduanya dengan nil.
+	FindByID(ctx context.Context, escalationID string) (*VideoCallEscalation, error)
+
+	// List mengembalikan antrean kerja Tier 2, TERLAMA DULU.
+	//
+	// Urutannya naik, berbeda dari setiap daftar lain di repo ini yang terbaru dulu, dan
+	// itu disengaja: ini antrean kerja, bukan lini masa. Perkara yang paling lama
+	// menunggu adalah nasabah yang paling lama tidak bisa mengantre lagi.
+	List(ctx context.Context, filter ListEscalationsFilter) ([]VideoCallEscalation, error)
+
+	// Claim memindahkan PENDING → IN_REVIEW dan mencatat pemegangnya.
+	//
+	// Mengembalikan false kalau tidak ada baris yang berubah — perkaranya sudah dipegang
+	// orang lain atau sudah ditutup. UPDATE berkondisi, BUKAN SELECT lalu UPDATE: dua
+	// peninjau yang menekan tombolnya bersamaan akan sama-sama melihat "masih PENDING",
+	// dan yang kedua akan menimpa nama pemegang yang pertama.
+	Claim(ctx context.Context, escalationID, agentID string, at time.Time) (bool, error)
+
+	// Resolve menutup perkara: PENDING atau IN_REVIEW → RESOLVED.
+	//
+	// Mengembalikan false kalau tidak ada baris yang berubah. Kondisinya mencakup
+	// pemegang perkara — perkara IN_REVIEW hanya boleh ditutup pemegangnya — supaya
+	// pemeriksaan itu tidak bisa dilewati oleh dua permintaan yang berlomba.
+	//
+	// Tidak menyentuh langkah sesi nasabah: itu pekerjaan service, yang tahu mesin
+	// langkahnya. Repository yang ikut memindahkan langkah akan membuat satu tindakan
+	// punya dua pemilik.
+	Resolve(ctx context.Context, escalationID string, res EscalationResolution, at time.Time) (bool, error)
+}
+
+// ProductCatalogRepository membaca katalog jenis rekening tabungan.
+//
+// Satu metode saja: layar hanya butuh daftar. GET /products/{product_type} untuk satu
+// produk sengaja TIDAK dibuat — rute itu bertabrakan secara visual dengan
+// /products/{product_type}/cards milik katalog kartu.
+type ProductCatalogRepository interface {
+	// ActiveCatalog mengembalikan produk aktif beserta copy halaman dan versi katalog.
+	//
+	// Produk yang is_active = FALSE tidak ikut. Produk yang tutup (availability_status
+	// bukan AVAILABLE) TETAP ikut — nasabah perlu tahu produk itu ada dan sedang tutup.
+	ActiveCatalog(ctx context.Context) (*SavingsProductCatalog, error)
+}
+
+// ProductCatalogCache menyimpan katalog yang sudah dirakit.
+//
+// Isinya sama untuk semua nasabah dan berubah beberapa kali setahun, jadi satu entri
+// cukup — tanpa kunci per wilayah seperti katalog kartu.
+type ProductCatalogCache interface {
+	// GetCatalog mengembalikan nil, nil saat cache miss. Miss BUKAN error.
+	GetCatalog(ctx context.Context) (*SavingsProductCatalog, error)
+	SetCatalog(ctx context.Context, c *SavingsProductCatalog) error
+
+	// InvalidateCatalog menghapus entri katalog aktif.
+	//
+	// WAJIB dipanggil setelah katalog ditulis, dan di sini tidak cukup mengandalkan
+	// kenaikan catalog_version seperti katalog kartu. Bedanya nyata: kunci katalog
+	// kartu MEMUAT versinya, jadi versi baru otomatis menghasilkan kunci baru.
+	// Katalog produk disimpan di satu kunci tetap ber-TTL 24 jam, jadi versi yang naik
+	// tanpa penghapusan ini akan tetap menyajikan katalog lama sampai sehari penuh —
+	// nasabah melihat setoran awal yang sudah diubah product owner.
+	//
+	// Snapshot per versi (…:ver:<versi>) TIDAK dihapus: ia justru yang melayani client
+	// yang masih memegang ETag lama dan baris sesi yang sudah menyimpan versi itu.
+	InvalidateCatalog(ctx context.Context) error
+}
+
+// ProductCatalogAdminRepository menulis katalog jenis rekening tabungan.
+//
+// Dipisah dari ProductCatalogRepository dengan alasan yang sama seperti
+// CardAdminRepository: satu antarmuka yang bisa membaca DAN menulis berarti setiap
+// pemakai jalur baca nasabah juga memegang kemampuan mengubah katalognya.
+type ProductCatalogAdminRepository interface {
+	// ListAllProducts mengembalikan SELURUH baris, termasuk is_active = FALSE.
+	//
+	// Berbeda dari ActiveCatalog yang menyaringnya: layar admin justru perlu melihat
+	// produk yang sudah dihentikan, karena menyalakannya kembali berarti menyunting
+	// baris itu — dan baris produk tidak pernah dihapus.
+	ListAllProducts(ctx context.Context) (*AdminProductCatalog, error)
+
+	// WriteProducts menulis beberapa produk dalam SATU transaksi, lalu menaikkan
+	// catalog_version SEKALI.
+	//
+	// Sekali per transaksi, bukan per baris: dua produk yang diubah bersamaan adalah
+	// satu keputusan product owner, dan dua versi untuk satu keputusan membuat ETag
+	// berganti dua kali tanpa ada katalog perantara yang pernah tayang.
+	WriteProducts(ctx context.Context, writes []ProductWrite, actor, ipAddress string) (*ProductCatalogWriteResult, error)
 }
 
 // VideoCallScheduleRepository menyimpan janji video call.
@@ -227,13 +326,6 @@ type BiometricRepository interface {
 }
 
 // BiometricEngine abstracts face liveness and matching (Google Vision, AWS Rekognition, etc.).
-type BiometricEngine interface {
-	// Analyze performs liveness detection and face matching.
-	// facePhoto is the main face photo, livenessFrames are challenge frames,
-	// ktpPhoto is the KTP photo for face comparison.
-	Analyze(ctx context.Context, facePhoto []byte, livenessFrames [][]byte, ktpPhoto []byte) (*FaceAnalysisResult, error)
-}
-
 // BiometricRateLimiter checks biometric-specific rate limits per session.
 type BiometricRateLimiter interface {
 	CheckBiometricAttempt(ctx context.Context, sessionID string) (allowed bool, err error)
@@ -469,4 +561,90 @@ type TNCCache interface {
 
 	// SetTNC menyimpan satu versi dengan TTL.
 	SetTNC(ctx context.Context, version string, doc *TNCDocument) error
+}
+
+// --- Liveness ports ---
+
+// LivenessChallengeStore keeps issued challenges until they are spent.
+//
+// Consume must be atomic. A challenge read and then deleted in two operations can
+// be replayed in the window between them — the same reason BiometricChallengeCache
+// uses GETDEL for biometric login.
+type LivenessChallengeStore interface {
+	Store(ctx context.Context, challenge *LivenessChallenge) error
+
+	// Consume returns the challenge and marks it spent in one operation.
+	// Returns nil, nil when it is unknown, expired, or already used.
+	Consume(ctx context.Context, challengeID string) (*LivenessChallenge, error)
+}
+
+// LivenessAttemptTracker holds the failure counters and cooldown.
+//
+// These live on the server on purpose (Phase 2 decision Q6): a second counter on
+// the device would drift from the one that actually applies, and the customer
+// would see a live button while the server still refuses.
+type LivenessAttemptTracker interface {
+	Status(ctx context.Context, sessionID, deviceID string) (*LivenessAttemptStatus, error)
+
+	// RecordFailure increments the counter and returns the resulting state,
+	// including the cooldown the client should display.
+	RecordFailure(ctx context.Context, sessionID, deviceID string) (*LivenessAttemptStatus, error)
+
+	// Reset clears the counters after a pass.
+	Reset(ctx context.Context, sessionID, deviceID string) error
+}
+
+// LivenessProvider decides whether one submission came from a live, matching face.
+//
+// Selected by configuration so a certified vendor can replace the internal engine
+// without touching the client or the API contract (Phase 2 decision Q1b). An
+// implementation that cannot run must return a refusing verdict, never a passing
+// one — see the fail-closed rule in the same decision.
+type LivenessProvider interface {
+	// Verify is given the challenge it must be checked against, the submission,
+	// and the enrolled reference (the KYC selfie / KTP photo) for face match.
+	Verify(
+		ctx context.Context,
+		challenge *LivenessChallenge,
+		submission *LivenessSubmission,
+		reference []byte,
+	) (*LivenessVerdict, error)
+
+	// Name identifies the provider in the audit trail.
+	Name() string
+}
+
+// FaceAnalyzer is the ML port the internal provider needs.
+//
+// Kept as a port with no implementation in this repo on purpose: the models it
+// would need (face detection with pose, an embedding model, a PAD model) have no
+// weights under a licence that permits commercial use, which is the documented
+// reason the ML layer is BLOCKED. When a vendor or a licensed model arrives, it
+// is implemented here and nothing else changes.
+type FaceAnalyzer interface {
+	// Analyze re-detects the face and its pose in one frame. The server must not
+	// trust the client's claim about which pose a frame shows.
+	Analyze(ctx context.Context, jpeg []byte) (*FrameFaceAnalysis, error)
+
+	// SamePerson compares two embeddings, 0..1.
+	SamePerson(a, b []float32) float64
+
+	// SpoofScore is the passive PAD score, 0..1, higher meaning more likely live.
+	SpoofScore(ctx context.Context, jpeg []byte) (float64, error)
+}
+
+// IntegrityVerifier decodes and verifies a Play Integrity token server-side.
+//
+// The token is signed by Google and means nothing until decoded by Google, so it
+// is never inspected on the device (Phase 2 decision Q3).
+type IntegrityVerifier interface {
+	Verify(ctx context.Context, token, expectedNonce string) (*IntegrityVerdict, error)
+}
+
+// LivenessAttemptRepository writes one audit row per attempt.
+type LivenessAttemptRepository interface {
+	Insert(ctx context.Context, attempt *LivenessAttempt) error
+
+	// CountFailuresSince backs the 24-hour window when Redis has been flushed.
+	CountFailuresSince(ctx context.Context, sessionID string, since time.Time) (int, error)
 }

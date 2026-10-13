@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -421,13 +422,18 @@ func (s *VideoCallService) ListQueued(ctx context.Context) (*ListQueuedVideoCall
 		// nasabah sesudah ini sama dengan hitungan di sini. Memakai indeks awal akan
 		// membuat angka petugas lebih besar satu untuk setiap anggota yang baru dibuang.
 		pos := int64(len(calls) + 1)
+		waited := now.Sub(vc.JoinedAt)
 		calls = append(calls, QueuedVideoCall{
 			QueueID:       vc.QueueID,
 			QueueNumber:   vc.QueueNumber,
 			SessionID:     vc.SessionID,
 			Position:      pos,
-			WaitedSeconds: int(now.Sub(vc.JoinedAt).Seconds()),
+			WaitedSeconds: int(waited.Seconds()),
 			Status:        string(vc.Status),
+			// Diturunkan di sini, bukan dibaca dari kolom — lihat
+			// QueuedVideoCall.Priority.
+			Priority: QueuePriorityFor(waited),
+			Service:  QueueServiceEKYC,
 		})
 	}
 
@@ -1065,14 +1071,28 @@ func (s *VideoCallService) writeAudit(ctx context.Context, sessionID string, eve
 	}
 }
 
-// isWithinOperatingHours checks if the current clock time is between 06:00-22:00 WIB.
+// isWithinOperatingHours checks if the service clock is between 06:00-22:00 WIB.
 func (s *VideoCallService) isWithinOperatingHours() bool {
+	return WithinOperatingHours(s.clock())
+}
+
+// WithinOperatingHours melaporkan apakah sebuah waktu jatuh di dalam jam layanan video
+// call, 06:00-22:00 WIB.
+//
+// Diekspor dengan alasan yang sama dengan DefaultOperatingHours: dashboard petugas juga
+// perlu menjawabnya, dan dua tempat yang menuliskan sendiri "jam >= 6 && jam < 22" akan
+// berbeda pada perubahan pertama — sementara yang satu menolak nasabah mengantre dan yang
+// lain memberi tahu petugas antreannya buka.
+//
+// Zona waktu yang gagal dimuat dijawab true, sama seperti sebelumnya: menolak seluruh
+// antrean karena tzdata tidak ada di image adalah kegagalan yang jauh lebih buruk
+// daripada melayani di luar jam.
+func WithinOperatingHours(t time.Time) bool {
 	loc, err := time.LoadLocation("Asia/Jakarta")
 	if err != nil {
 		return true // fallback: allow
 	}
-	now := s.clock().In(loc)
-	hour := now.Hour()
+	hour := t.In(loc).Hour()
 	return hour >= 6 && hour < 22
 }
 

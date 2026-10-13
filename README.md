@@ -193,10 +193,90 @@ Di Postman, set `base_url` ke `https://<host>/v1`.
 
 ### Operator / CS endpoints (`/internal/v1`)
 
-Behind three guards: `X-Internal-API-Key` (which system), `X-Agent-Employee-ID` +
-`X-Agent-API-Key` (which agent, Argon2id against `cs_agents`), and the agent's
-`scopes` (what they may do). Full contract in `docs/01-API-SPECIFICATION.md` §11;
-client-side guidance in `.claude/skills/cs-desktop-api-integration/SKILL.md`.
+The Halo BCA agent path, not the customer path — so customer rate limits, body
+limits, and CORS do not apply here.
+
+**Three header guards** answer three different questions, and a fourth layer answers
+one more:
+
+| Layer | Header | Question |
+|---|---|---|
+| 1 | `X-Internal-API-Key` | which **system** is calling |
+| 2 | `X-Agent-Employee-ID` | which **agent** is acting |
+| 3 | `X-Agent-API-Key` | the proof (Argon2id against `cs_agents`), plus the row's `scopes` — `VIDEO_CALL`, `CUSTOMER_PII`, `CARD_ADMIN`, `TICKET`, `AUDIT_READ`, `ESCALATION_REVIEW` |
+| 4 | `Authorization: Bearer <session_token>` | is that agent **on duty at a terminal** |
+
+Layer 4 comes from `POST /internal/v1/auth/login` and is required wherever the
+terminal is determined by the **session** rather than by a path parameter — every
+`/terminals/*` gate, `/supervisors/*`, and `auth/logout`. That is what stops an agent
+declaring readiness for a counter they did not sign in at, or closing someone else's
+shift. The `session_token` is returned **once** and never again; the server keeps only
+its hash.
+
+Full contract in `docs/01-API-SPECIFICATION.md` §11; client-side guidance in
+`.claude/skills/cs-desktop-api-integration/SKILL.md`.
+
+**Agent identity, session, and registration** (SCR-001 … SCR-004, SCR-019):
+
+| Method | Path | Guard | Description |
+|--------|------|-------|-------------|
+| POST | `/internal/v1/auth/login` | system key only | NPP + password → time-bounded session. Requiring agent credentials first would mean having to be logged in to log in |
+| POST | `/internal/v1/auth/password` | agent identity | First-time password set / change. Not the session token — an agent without a password cannot have a session |
+| GET | `/internal/v1/auth/me` | agent identity | Who am I, what are my `scopes`, is there an open shift. Removes the desktop app's scope guessing — without it, every menu has to be tried once to be known, and each try costs an Argon2id verify (64 MB × 4 threads) |
+| POST | `/internal/v1/auth/logout` | session token | Closes the session carrying the token, and takes the terminal to `OFFLINE` |
+| GET | `/internal/v1/hris/employees/{employee_id}` | agent identity | NPP lookup. **HRIS is an external system** — there is no employee table here. Mock under `APP_ENV=development`, `503 HRIS_UNAVAILABLE` elsewhere |
+| POST | `/internal/v1/agents` | agent identity | Register an agent. Dual-control is in the **body** (`supervisor_id` + `token`). `api_key` is server-issued and shown once |
+| PATCH | `/internal/v1/agents/{employee_id}` | agent identity | Change `scopes` or revoke (`is_active: false`). Same dual-control. `scopes` **replaces** the list; omitted fields are left alone. An agent cannot change their own authority — `403 AGENT_SELF_UPDATE` |
+
+**Terminal lifecycle and the three readiness gates** (SCR-005 … SCR-009):
+
+| Method | Path | Guard | Description |
+|--------|------|-------|-------------|
+| POST | `/internal/v1/terminals` | agent identity | Register a counter. The registrant must be nameable in the audit trail |
+| GET | `/internal/v1/terminals/{terminal_id}` | system key only | Pre-login read — the client needs to know the terminal is registered before anyone signs in. Does **not** say who currently holds it |
+| GET | `/internal/v1/supervisors?location=` | session token | Supervisor directory for the authorization screen. **Never** carries the dual-control token |
+| POST | `/internal/v1/supervisors/authorize` | session token | Gate 1 `SUPERVISOR_AUTH`. Returns an `authorization_ref` receipt, not a token |
+| POST | `/internal/v1/terminals/healthcheck` | session token | Gate 2 `DEVICE_HEALTHCHECK`. **Probed by the client, recorded by the server** — treat `details` as a statement, not a measurement |
+| POST | `/internal/v1/terminals/pii-ack` | session token | Gate 3 `PII_ACK`. `acknowledged` must be explicitly `true`, and `pact_version` says *what* was agreed to |
+| GET | `/internal/v1/terminals/readiness` | session token | All three gates at once, with `can_activate` computed **server-side**. Also the reply from the three calls above |
+| POST | `/internal/v1/terminals/activate` | session token | → `ONLINE`. Refuses with `422 TERMINAL_NOT_READY` and **names the missing gate** |
+| POST | `/internal/v1/terminals/deactivate` | session token | → `OFFLINE` **without closing the session** — a break is not the end of a shift |
+
+Each gate is valid for **8 hours**, one shift. A gate that has lapsed reads
+`expired: true`, which is deliberately different from never having passed: the first is
+fixed by repeating the probe, the second may mean a screen was skipped.
+
+Terminal status is held **by the server**, and `POST /v1/onboarding/video-call/agent-token`
+rejects a terminal that is not `ONLINE`. That is Rule 4 being enforced rather than
+decorated — with readiness living only in frontend memory, an agent who edited client
+state could still take customer calls.
+
+**Agent home screen and audit** (SCR-010):
+
+| Method | Path | Guard | Description |
+|--------|------|-------|-------------|
+| GET | `/internal/v1/cs/dashboard` | agent identity | One request, not four: calls today, average duration, queue depth, terminal status, `can_take_calls` |
+| GET | `/internal/v1/cs/audit-events` | `AUDIT_READ` | The thirteen Rule 7 agent/terminal events. Filter by `actor`, `event_type`, `terminal_id`, `from`, `to`, `cursor` |
+
+`sla_percent`, `csat_percent`, and `shift_target` are **always `null`**, and the
+`measured` map says which figures are real. Nothing measures CSAT, no SLA definition has
+been agreed, and no shift target has been set by anyone; the fields stay in the contract
+so the desktop app need not change shape later. Invented KPIs on an operational screen
+get used to judge people.
+
+> **`/cs/audit-events` now requires the `AUDIT_READ` scope, and that breaks old callers.**
+> It used to ask only for the system key plus agent identity, so any authenticated agent
+> could read a colleague's trail — sign-in times, counter, and every supervisor
+> authorization that ever failed in their name. A supervision trail open to everyone it
+> supervises is not an authority boundary; it only looks like one. Migration `000041`
+> widens the CHECK `cs_agents_scopes_valid` from `000027` to admit the scope; grant it
+> with `PATCH /internal/v1/agents/{employee_id}`.
+>
+> `/cs/dashboard` still asks only for agent identity, and the difference is deliberate:
+> the home screen answers about the agent's **own** work, the audit trail about other
+> people's.
+
+**Customer data, tickets, and catalog admin:**
 
 | Method | Path | Scope | Description |
 |--------|------|-------|-------------|
@@ -207,12 +287,60 @@ client-side guidance in `.claude/skills/cs-desktop-api-integration/SKILL.md`.
 | POST,GET | `/internal/v1/tickets` | `TICKET` | Create / list service tickets |
 | GET,PATCH | `/internal/v1/tickets/{ticket_number}` | `TICKET` | Ticket detail / update. Addressed by `TKT-YYYYMMDD-NNNNNN`, not UUID |
 | POST | `/internal/v1/tickets/{ticket_number}/notes` | `TICKET` | Add a follow-up note |
+| GET | `/internal/v1/escalations` | `ESCALATION_REVIEW` | The Tier 2 work queue. **Oldest first** — this is a work queue, not a timeline. Without `?status=` it returns only open cases (`PENDING` + `IN_REVIEW`) |
+| PATCH | `/internal/v1/escalations/{escalation_id}` | `ESCALATION_REVIEW` | `action: CLAIM` takes the case, `action: RESOLVE` closes it. `APPROVED` moves the customer to `CREDENTIALS`; `REJECTED` leaves them at `VIDEO_CALL`, free to queue again |
+
+The escalation pair closes a gap that bit for real. A `NEED_REVIEW` verdict writes a row
+that holds the customer out of the queue with `422 VIDEO_CALL_UNDER_REVIEW`; until these
+endpoints existed, nothing closed that row except an `UPDATE` typed against the
+production database, so a customer whose case was forgotten could **never queue again**.
+
+`ESCALATION_REVIEW` is deliberately not `VIDEO_CALL`. An `APPROVED` here moves the
+customer to `CREDENTIALS` — the same decision the call itself makes — and the agent who
+raised the case cannot claim or close it (`403 ESCALATION_SELF_RESOLVE`). `NEED_REVIEW` is
+a statement that this agent could not decide; letting them decide afterwards turns the
+escalation into a detour that reaches the same verdict with nobody checking it.
 | GET,PUT | `/internal/v1/cards`, `/cards/{card_type}`, `/products/{product_type}/cards/{card_type}` | `CARD_ADMIN` | Paspor card catalogue admin |
+| GET,PUT | `/internal/v1/onboarding/products` | `CARD_ADMIN` | Savings product catalogue admin. `PUT` takes a **list** and bumps `catalog_version` **once** per request; unknown fields are rejected, not ignored; `features: null` leaves features alone while `features: []` clears them |
 
 > **Breaking change:** `/internal/v1/cards` used to accept `X-Internal-API-Key`
 > alone. It now also requires the two agent headers, and the agent's row in
 > `cs_agents` must carry the `CARD_ADMIN` scope. Callers sending only the system
 > key get `403`.
+
+Savings account catalog — the **first** screen of account opening, served before T&C,
+before card selection, before a session exists:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/onboarding/products` | Savings product types, their minimum initial deposit, features, and the screen copy. Public; requires `X-Device-Id`. `ETag: "products-<catalog_version>"`, `Cache-Control: public, max-age=300`, own rate-limit bucket (30 / 5 min per device) |
+
+`product_type` is the only product identity in the response — the client must never
+infer a product from its array position. Display order lives in `display_order`, and
+`display_order` is not identity. Products under maintenance stay **in** the list with
+`availability_status: "DISABLED"`; they do not disappear and they do not make the whole
+endpoint fail.
+
+The catalogue is changed through `PUT /internal/v1/onboarding/products` (scope
+`CARD_ADMIN`), which writes every product in one transaction, raises `catalog_version`
+once, and deletes the Redis entry itself. Migrations still set the **initial** values.
+Moving the "Paling Populer" badge needs both products in one request — the one losing it
+and the one gaining it — because the uniqueness of `is_popular` is enforced by a partial
+expression index that cannot be deferred. Sending only the one gaining it answers
+`409 ONBOARDING_PRODUCT_CATALOG_CONFLICT`.
+
+The admin path deliberately ignores `FEATURE_ONBOARDING_PRODUCT_CATALOG`: a catalogue
+switched off because its contents are wrong is exactly when those contents most need
+fixing.
+
+`POST /v1/onboarding/sessions` records `product_catalog_version` and
+`min_initial_deposit_shown` from the catalog in force, so the figure the customer
+actually saw is provable later. Both columns are nullable: an old APK that never calls
+the catalog still creates sessions, and a dead catalog never blocks session creation.
+
+> The deposit figures and feature texts in migration `000039` are **design data** copied
+> verbatim from the Android `strings.xml` (500,000 / 50,000 / 20,000) — **not official
+> BCA tariffs**. See `COMMENT ON TABLE onboarding_products`.
 
 Customer-facing video call rescheduling (serves the Android "Jadwalkan Panggilan
 Nanti" button, which was disabled until these existed):
@@ -271,6 +399,8 @@ See `internal/config/config.go` for all supported variables. Key ones:
 | `MIN_APP_VERSION` | `1.0.0` | Served by `GET /v1/health/config`; drives force-update |
 | `FEATURE_*` | `true` | Feature flags in `GET /v1/health/config` (`FEATURE_BIOMETRIC_LOGIN`, `FEATURE_QRIS_PAYMENT`, `FEATURE_EWALLET_TOPUP`, `FEATURE_ONBOARDING`) |
 | `FEATURE_CARD_SELECTION` | `false` | Turns the Paspor card-selection step on. Off keeps the old flow whole: sessions start at `OCR`, the catalog answers `CARD_CATALOG_EMPTY`, and submit does not demand a card. This is only the default — the Redis key `flag:onboarding:card_selection:enabled` overrides it without a restart. `.env.example` sets it to `true`: the catalog now carries real numbers (migration `000022`), so the screen has something to show. The code default stays `false` so a deployment that has not migrated cannot serve an empty catalog as a feature |
+| `FEATURE_ONBOARDING_PRODUCT_CATALOG` | `true` | Serves `GET /v1/onboarding/products`. Off makes it answer `503 ONBOARDING_CATALOG_UNAVAILABLE` and the Android client falls back to its bundled `strings.xml` list — the screen stays fully usable. Turning it off never blocks `POST /v1/onboarding/sessions`. Defaults to `true`, unlike `FEATURE_CARD_SELECTION`: the catalog's text is copied verbatim from the APK, so serving it changes not one word the customer sees. What is not yet official is the deposit **figures**, and that is flagged in the migration comment rather than by disabling the endpoint |
+| `ONBOARDING_PRODUCTS_MAINTENANCE` | (empty) | Comma-separated `product_type` list that is temporarily closed, e.g. `TABUNGANKU`. The catalog still **lists** them, with `availability_status: "DISABLED"` and `availability_reason_key: "MAINTENANCE"` — a customer needs to know the product exists and is closed, not be confused by a choice that vanished. `POST /sessions` for those products is refused with `422 ONBOARDING_PRODUCT_UNAVAILABLE`. Read by both the product and card catalogs |
 | `ONBOARDING_CARD_CORE_BANKING_CODES` | (empty) | Maps `card_type` to the core banking card code, e.g. `PASPOR_BLUE:CB-BLUE,PASPOR_GOLD:CB-GOLD`. Verified **at startup** when `FEATURE_CARD_SELECTION` is on: an active catalogued card with no mapping refuses to start, so a hole in the config surfaces at deploy rather than after a nasabah's account exists without a card. The values currently in `.env.example` are dev placeholders |
 | `ONBOARDING_CARD_LEGACY_APP_VERSION` | (empty) | `X-App-Version` threshold below which a session with no `card_type` gets the product's default card instead of stopping at `CARD_SELECTION`. Empty disables the fallback — pushing a default card, and its monthly fee, onto a nasabah who never chose it is a product decision |
 | `SMS_PROVIDER` | (empty) | OTP delivery transport. `twilio` is the only one implemented. Empty is allowed **only** in development (the gateway logs the code); outside development the boot is refused, because a process with no provider generates, stores and audits every OTP while no nasabah can get past `OTP_VERIFY`. An unknown value also fails the boot rather than falling back to silence |

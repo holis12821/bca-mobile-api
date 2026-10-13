@@ -64,18 +64,24 @@ func NewOCRService(cfg OCRServiceConfig) *OCRService {
 // ProcessKTP handles the full OCR pipeline:
 //  1. Validate session step == OCR
 //  2. Rate limit check
-//  3. Run OCR engine
-//  4. Parse KTP fields
-//  5. Validate NIK
-//  6. Verify via Dukcapil
-//  7. Assess photo quality
-//  8. Upload photo to object storage (encrypted at rest)
-//  9. Store results (encrypted PII)
-//  10. Transition session to PERSONAL_DATA
+//  3. Obtain the KTP text (server-side engine, else the client's on-device OCR)
+//  4. Confirm the text actually comes from an e-KTP
+//  5. Parse KTP fields
+//  6. Validate NIK structure and its internal consistency with the parsed fields
+//  7. Verify via Dukcapil, when a registry is configured at all
+//  8. Assess photo quality
+//  9. Upload photo to object storage (encrypted at rest)
+//  10. Store results (encrypted PII)
+//  11. Transition session to PERSONAL_DATA
 //
 // The upload deliberately comes after every rejection path: a photo that fails
 // NIK parsing, Dukcapil, or the quality gate must never be left sitting in the
 // bucket, and anything written after it is cleaned up on failure.
+//
+// Step 3 and 4 are what make this read a card rather than accept a file. Before
+// them the engine ignored the image bytes and returned a hardcoded identity, so
+// a plain grey rectangle was accepted with accuracy_percent 99.4 and advanced
+// the session to PERSONAL_DATA with somebody else's name in it.
 func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData []byte, captureMeta DeviceCaptureMeta, ipAddress, userAgent string) (*OCRResponse, error) {
 	// 1. Resolve session and validate step
 	session, err := s.resolveSession(ctx, sessionID)
@@ -109,53 +115,81 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		"auto_captured": captureMeta.AutoCaptured,
 	}, ipAddress, userAgent)
 
-	// 3. Run OCR engine
-	var rawText string
-	var confidence float64
-	if s.ocrEngine != nil {
-		rawText, confidence, err = s.ocrEngine.ExtractText(ctx, imageData)
-		if err != nil {
-			return nil, fmt.Errorf("ocr extract: %w", err)
-		}
+	// 3. Obtain the KTP text.
+	//
+	// A server-side engine wins when one is configured. Otherwise the text comes
+	// from the client's on-device recognizer (ML Kit), which already ran on this
+	// exact photo before the upload. There is no third branch: without text
+	// nothing is extracted, and the request is refused rather than answered with
+	// an invented identity.
+	rawText, textSource, err := s.extractText(ctx, imageData, captureMeta)
+	if err != nil {
+		return nil, err
 	}
 
-	// 4. Parse KTP fields from raw text
+	// 4. Confirm the text belongs to an e-KTP.
+	//
+	// This is the check that rejects a photo of something else. It looks for the
+	// card's own LABELS, not its values: labels are identical on every card,
+	// values differ per person. A receipt, a driving licence or a blank wall does
+	// not carry five e-KTP labels at once.
+	assessment := AssessKTPText(rawText)
+	if !assessment.IsKTP {
+		slog.Info("ocr rejected: text is not an e-KTP",
+			"session_id", sessionID,
+			"markers_found", assessment.MarkersFound,
+			"markers_total", assessment.MarkersTotal,
+			"text_source", textSource,
+		)
+		return nil, apperr.OCRNotKTP
+	}
+
+	// Confidence is the share of e-KTP markers that were legible — how sure we
+	// are this is a readable card. It is NOT an OCR engine's own self-report,
+	// which is what used to be stored here: a constant 99.4 that said nothing
+	// about the photo.
+	confidence := assessment.Confidence()
+
+	// 5. Parse KTP fields from raw text
 	ktpData := ParseKTPFromText(rawText)
 
-	// 5. Validate NIK format
+	// 6. Validate NIK structure, and cross-check it against the parsed fields.
+	//
+	// The NIK carries the birth date and sex inside itself, so those two can be
+	// checked without any registry. A single misread digit almost always breaks
+	// one of them, which is how an OCR error is caught here instead of becoming
+	// a wrong identity downstream.
 	if ktpData.NIK == "" {
+		slog.Info("ocr rejected: no NIK in text", "session_id", sessionID,
+			"text_source", textSource)
 		return nil, apperr.OCRNotKTP
 	}
-	if err := ValidateNIK(ktpData.NIK); err != nil {
+	if err := ValidateKTPConsistency(ktpData); err != nil {
+		slog.Info("ocr rejected: KTP data inconsistent",
+			"session_id", sessionID, "reason", err.Error(), "text_source", textSource)
 		return nil, apperr.OCRNotKTP
 	}
 
-	// 6. Verify via Dukcapil
-	dukcapilMatch := false
-	if s.dukcapil != nil {
-		match, dErr := s.dukcapil.VerifyNIK(ctx, ktpData.NIK, ktpData.NamaLengkap)
-		if dErr != nil {
-			// Only a genuine timeout is retryable; anything else is an
-			// upstream fault and must not masquerade as one.
-			if isTimeout(dErr) {
-				slog.Warn("dukcapil verify timed out", "session_id", sessionID, "error", dErr)
-				return nil, apperr.OCRDukcapilTimeout
-			}
-			slog.Error("dukcapil verify failed", "session_id", sessionID, "error", dErr)
-			return nil, apperr.OCRDukcapilUnavailable
-		}
-		dukcapilMatch = match
-		if !match {
-			return nil, apperr.OCRDukcapilMismatch
-		}
-	} else {
-		// Mock mode: assume match
-		dukcapilMatch = true
+	// Province is filled in from the NIK when OCR could not read the header. The
+	// NIK is the more reliable source of the two, and ValidateKTPConsistency has
+	// already confirmed they agree whenever OCR did read it.
+	if ktpData.Provinsi == "" {
+		ktpData.Provinsi = ProvinceNameFromNIK(ktpData.NIK)
+	}
+	// Same for sex: the NIK encodes it, so a line OCR missed is recoverable.
+	if ktpData.JenisKelamin == "" {
+		ktpData.JenisKelamin = GenderFromNIK(ktpData.NIK)
 	}
 
-	// 7. Assess photo quality from what the capture SDK measured plus the
-	// engine's own confidence.
-	quality := assessPhotoQuality(captureMeta, confidence)
+	// 7. Verify via Dukcapil, if a registry is configured at all.
+	dukcapilMatch, dukcapilChecked, err := s.verifyAgainstRegistry(ctx, sessionID, ktpData)
+	if err != nil {
+		return nil, err
+	}
+
+	// 8. Assess photo quality from what the capture SDK measured plus how much
+	// of the card was legible.
+	quality := assessPhotoQuality(captureMeta)
 	if quality.Sharpness == "LOW" {
 		return nil, apperr.OCRPhotoBlurry
 	}
@@ -166,7 +200,7 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		return nil, apperr.OCRCornersMissing
 	}
 
-	// 8. Upload photo to object storage (encrypted at rest)
+	// 9. Upload photo to object storage (encrypted at rest)
 	photoObjectKey := fmt.Sprintf("%s/%s.jpg", sessionID, uuid.New().String())
 	var photoPath string
 	if s.storage != nil {
@@ -180,10 +214,13 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		}
 		photoPath = path
 	} else {
-		photoPath = "local://" + photoObjectKey
+		// Keep the same bucket/key shape even with no storage configured, so
+		// SplitObjectPath can read it back. Without the bucket segment the split
+		// returns the session id as the bucket and the lookup goes nowhere.
+		photoPath = "local://" + ocrPhotoBucket + "/" + photoObjectKey
 	}
 
-	// 9. Encrypt PII and store results
+	// 10. Encrypt PII and store results
 	shortID, err := generateShortID()
 	if err != nil {
 		s.discardPhoto(ctx, photoObjectKey)
@@ -230,7 +267,7 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 		return nil, fmt.Errorf("store ocr result: %w", err)
 	}
 
-	// 10. Transition session step: OCR → PERSONAL_DATA
+	// 11. Transition session step: OCR → PERSONAL_DATA
 	completed := session.StepsCompleted
 	completed.OCRVerified = true
 	if err := s.sessions.UpdateStep(ctx, sessionID, StepPersonalData, completed); err != nil {
@@ -255,13 +292,91 @@ func (s *OCRService) ProcessKTP(ctx context.Context, sessionID string, imageData
 
 	// Return response with plaintext data (decrypted for client display)
 	return &OCRResponse{
-		OCRID:         ocrID,
-		AccuracyPct:   confidence,
-		Extracted:     ktpData, // Note: nik/nama/alamat are encrypted in DB but we return original values
-		DukcapilMatch: dukcapilMatch,
-		PhotoQuality:  quality,
-		CurrentStep:   StepPersonalData,
+		OCRID:           ocrID,
+		AccuracyPct:     confidence,
+		Extracted:       ktpData, // Note: nik/nama/alamat are encrypted in DB but we return original values
+		DukcapilMatch:   dukcapilMatch,
+		DukcapilChecked: dukcapilChecked,
+		PhotoQuality:    quality,
+		CurrentStep:     StepPersonalData,
 	}, nil
+}
+
+// textSource names where the KTP text came from, for the audit trail and logs.
+type textSource string
+
+const (
+	// textSourceServer means a server-side OCR engine read the image.
+	textSourceServer textSource = "server_engine"
+
+	// textSourceClient means the text came from the client's on-device
+	// recognizer. The server still validates every field it produces; what it
+	// cannot do is prove the text was read from the photo that was uploaded.
+	// That limitation is recorded rather than hidden.
+	textSourceClient textSource = "client_ondevice"
+)
+
+// extractText obtains the KTP text, preferring a server-side engine.
+//
+// Returning an error instead of empty text is the point. The previous behaviour
+// was a nil engine leaving rawText empty, which flowed into a parser that
+// produced an empty KTPData, which failed on an empty NIK — the right outcome by
+// accident. With a mock engine present it instead produced a full identity from
+// no input at all. Now the absence of text is handled explicitly and refused.
+func (s *OCRService) extractText(
+	ctx context.Context, imageData []byte, meta DeviceCaptureMeta,
+) (string, textSource, error) {
+	if s.ocrEngine != nil {
+		raw, _, err := s.ocrEngine.ExtractText(ctx, imageData)
+		if err != nil {
+			return "", textSourceServer, fmt.Errorf("ocr extract: %w", err)
+		}
+		if strings.TrimSpace(raw) != "" {
+			return raw, textSourceServer, nil
+		}
+		// An engine that read nothing is not a reason to fall back to a source
+		// the engine was configured to replace: it means this photo is unreadable.
+		return "", textSourceServer, apperr.OCRNotKTP
+	}
+
+	if strings.TrimSpace(meta.ClientOCRText) != "" {
+		return meta.ClientOCRText, textSourceClient, nil
+	}
+
+	slog.Info("ocr refused: no server engine and no client text")
+	return "", textSourceClient, apperr.OCRNotKTP
+}
+
+// verifyAgainstRegistry runs the Dukcapil check when one is configured.
+//
+// The second return value is what makes the answer honest. A nil client used to
+// mean "assume match", and the response then carried dukcapil_match=true for an
+// identity nothing had verified — the same class of untruth as an audit row
+// claiming a device check passed when none ran. Now "not checked" is its own
+// state, reported as dukcapil_checked=false, and the client shows no verified
+// badge for it.
+func (s *OCRService) verifyAgainstRegistry(
+	ctx context.Context, sessionID string, data KTPData,
+) (match, checked bool, err error) {
+	if s.dukcapil == nil {
+		return false, false, nil
+	}
+
+	ok, dErr := s.dukcapil.VerifyNIK(ctx, data.NIK, data.NamaLengkap)
+	if dErr != nil {
+		// Only a genuine timeout is retryable; anything else is an upstream
+		// fault and must not masquerade as one.
+		if isTimeout(dErr) {
+			slog.Warn("dukcapil verify timed out", "session_id", sessionID, "error", dErr)
+			return false, true, apperr.OCRDukcapilTimeout
+		}
+		slog.Error("dukcapil verify failed", "session_id", sessionID, "error", dErr)
+		return false, true, apperr.OCRDukcapilUnavailable
+	}
+	if !ok {
+		return false, true, apperr.OCRDukcapilMismatch
+	}
+	return true, true, nil
 }
 
 // discardPhoto removes an already-uploaded KTP photo when a later step fails.
@@ -274,6 +389,28 @@ func (s *OCRService) discardPhoto(ctx context.Context, key string) {
 	if err := s.storage.Delete(ctx, ocrPhotoBucket, key); err != nil {
 		slog.Error("discard ktp photo failed", "key", key, "error", err)
 	}
+}
+
+// SplitObjectPath splits a stored object path into bucket and key.
+//
+// Accepts the two schemes this codebase writes: "local://" from localfs.Storage
+// and "s3://" from the mock. The scheme itself carries no meaning here — what
+// matters is recovering the bucket and key, because the database column stores
+// only the joined path while ObjectStorage.Download needs them apart.
+func SplitObjectPath(path string) (bucket, key string, ok bool) {
+	rest := path
+	for _, scheme := range []string{"local://", "s3://"} {
+		if trimmed, found := strings.CutPrefix(path, scheme); found {
+			rest = trimmed
+			break
+		}
+	}
+
+	bucket, key, found := strings.Cut(rest, "/")
+	if !found || bucket == "" || key == "" {
+		return "", "", false
+	}
+	return bucket, key, true
 }
 
 // isTimeout reports whether err is a deadline/timeout rather than a hard fault.
@@ -427,22 +564,31 @@ func (s *OCRService) writeAudit(ctx context.Context, sessionID string, eventType
 const (
 	minSharpnessScore  = 60.0 // below this the KTP text is not reliably readable
 	maxGlareScore      = 50.0 // above this a reflection covers part of the card
-	minOCRConfidence   = 75.0 // engine confidence that low means a bad capture
 	requiredKTPCorners = 4
 	minCaptureWidth    = 640
 	minCaptureHeight   = 480
 )
 
-// assessPhotoQuality judges the capture from the signals actually available:
-// what the device's capture SDK measured, the frame resolution, and how
-// confident the OCR engine was in its own reading.
+// assessPhotoQuality judges the capture from what the device's capture SDK
+// measured and the frame resolution.
 //
 // Every signal is optional — a client that reports nothing is not punished for
 // it — but when a signal arrives and it is bad, the capture is rejected. That
-// is the difference from the previous version, which always returned HIGH and
-// so made OCR_PHOTO_BLURRY, OCR_GLARE_DETECTED and OCR_CORNERS_MISSING
-// unreachable.
-func assessPhotoQuality(meta DeviceCaptureMeta, ocrConfidence float64) PhotoQuality {
+// is the difference from the first version, which always returned HIGH and so
+// made OCR_PHOTO_BLURRY, OCR_GLARE_DETECTED and OCR_CORNERS_MISSING unreachable.
+//
+// It deliberately no longer takes the OCR confidence. Those are two different
+// questions — "was this frame legible" versus "how much of the card did we
+// read" — and feeding the second into the first was a mistake made while
+// changing what confidence means: it used to be an engine's self-report on a
+// 0-100 scale, it is now the share of e-KTP labels found, and a perfectly good
+// card reading 6 of 16 labels was rejected as blurry.
+//
+// Legibility is already enforced, and more strictly, elsewhere: a blurry photo
+// cannot produce five e-KTP labels AND a NIK whose embedded birth date and sex
+// agree with the parsed fields. That is a better blur test than a threshold on
+// a self-reported number.
+func assessPhotoQuality(meta DeviceCaptureMeta) PhotoQuality {
 	q := PhotoQuality{
 		Sharpness:         "HIGH",
 		GlareDetected:     false,
@@ -450,12 +596,6 @@ func assessPhotoQuality(meta DeviceCaptureMeta, ocrConfidence float64) PhotoQual
 	}
 
 	if meta.SharpnessScore != nil && *meta.SharpnessScore < minSharpnessScore {
-		q.Sharpness = "LOW"
-	}
-
-	// A confident engine reading is itself evidence the frame was legible;
-	// a weak one on a card we did manage to parse means a marginal capture.
-	if ocrConfidence > 0 && ocrConfidence < minOCRConfidence {
 		q.Sharpness = "LOW"
 	}
 
