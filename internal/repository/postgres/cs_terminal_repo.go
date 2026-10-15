@@ -29,17 +29,19 @@ func NewCSTerminalRepo(pool *pgxpool.Pool) *CSTerminalRepo {
 const selectTerminal = `
 	SELECT terminal_id, workstation, location, status,
 	       registered_by, registered_at,
-	       COALESCE(active_agent_id, ''), activated_at, last_seen_at, updated_at
+	       COALESCE(active_agent_id, ''), activated_at, last_seen_at, updated_at,
+	       locked_at, COALESCE(locked_reason, '')
 	FROM cs_terminals`
 
 func scanTerminal(row pgx.Row) (*cs.Terminal, error) {
 	var t cs.Terminal
-	var status string
+	var status, lockedReason string
 
 	err := row.Scan(
 		&t.TerminalID, &t.Workstation, &t.Location, &status,
 		&t.RegisteredBy, &t.RegisteredAt,
 		&t.ActiveAgentID, &t.ActivatedAt, &t.LastSeenAt, &t.UpdatedAt,
+		&t.LockedAt, &lockedReason,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -48,6 +50,7 @@ func scanTerminal(row pgx.Row) (*cs.Terminal, error) {
 		return nil, fmt.Errorf("scan terminal: %w", err)
 	}
 	t.Status = cs.TerminalStatus(status)
+	t.LockedReason = cs.LockReason(lockedReason)
 	return &t, nil
 }
 
@@ -79,9 +82,15 @@ func (r *CSTerminalRepo) FindByID(ctx context.Context, terminalID string) (*cs.T
 // idx_cs_terminals_one_online_per_agent (23505), BUKAN dari SELECT lebih dulu: dua
 // permintaan bersamaan akan sama-sama melihat "belum ada yang online".
 func (r *CSTerminalRepo) Activate(ctx context.Context, terminalID, employeeID string, at time.Time) error {
+	// locked_at dan locked_reason ikut dikosongkan: terminal yang ditinggalkan dalam
+	// keadaan LOCKED oleh petugas giliran sebelumnya diambil alih bersih oleh petugas
+	// berikutnya. Tanpa itu, CHECK cs_terminals_locked_consistent menolak baris ONLINE
+	// yang masih memegang locked_at — dan loket beku tidak akan pernah bisa dipakai lagi
+	// oleh siapa pun.
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE cs_terminals
-		SET status = 'ONLINE', active_agent_id = $2, activated_at = $3, updated_at = $3
+		SET status = 'ONLINE', active_agent_id = $2, activated_at = $3, updated_at = $3,
+		    locked_at = NULL, locked_reason = NULL
 		WHERE terminal_id = $1`,
 		terminalID, employeeID, at,
 	)
@@ -102,10 +111,15 @@ func (r *CSTerminalRepo) Activate(ctx context.Context, terminalID, employeeID st
 //
 // Harus bersamaan: CHECK cs_terminals_online_has_agent menolak baris ONLINE tanpa
 // petugas, jadi mengosongkan active_agent_id lebih dulu akan gagal.
+//
+// Juga mengosongkan tirai kunci meja, dan itu disengaja: logout saat layar terkunci
+// tetap boleh dan mengakhiri SEGALANYA. Petugas yang baru ingat PIN-nya setelah pulang
+// tidak boleh meninggalkan loket beku untuk giliran berikutnya.
 func (r *CSTerminalRepo) Deactivate(ctx context.Context, terminalID string, at time.Time) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE cs_terminals
-		SET status = 'OFFLINE', active_agent_id = NULL, activated_at = NULL, updated_at = $2
+		SET status = 'OFFLINE', active_agent_id = NULL, activated_at = NULL, updated_at = $2,
+		    locked_at = NULL, locked_reason = NULL
 		WHERE terminal_id = $1 AND status <> 'OFFLINE'`,
 		terminalID, at,
 	)
@@ -197,6 +211,64 @@ func (r *CSTerminalRepo) ListGates(ctx context.Context, sessionID uuid.UUID) ([]
 		return nil, fmt.Errorf("iterate readiness gates: %w", err)
 	}
 	return out, nil
+}
+
+// Lock menurunkan tirai kunci meja. Satu UPDATE bersyarat, tanpa SELECT lebih dulu.
+//
+// Syaratnya dipasang di WHERE: dua permintaan bersamaan akan sama-sama melihat "masih
+// ONLINE" kalau statusnya dibaca terpisah, dan yang kedua akan menimpa locked_at yang
+// baru saja dipasang yang pertama — jejaknya lalu menyebut waktu yang salah.
+//
+// active_agent_id TIDAK dilepas: petugasnya masih bertugas, hanya sedang tidak di
+// tempat, dan melepasnya akan membuat Unlock tidak tahu siapa yang berhak membuka.
+func (r *CSTerminalRepo) Lock(
+	ctx context.Context, terminalID, employeeID string, reason cs.LockReason, at time.Time,
+) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE cs_terminals
+		SET status = 'LOCKED', locked_at = $4, locked_reason = $3, updated_at = $4
+		WHERE terminal_id = $1 AND status = 'ONLINE' AND active_agent_id = $2`,
+		terminalID, employeeID, string(reason), at,
+	)
+	if err != nil {
+		return false, fmt.Errorf("lock terminal desk: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// Unlock mengangkat tirai: LOCKED → ONLINE, bukan READY.
+//
+// Gerbang kesiapan tidak pernah batal oleh penguncian. activated_at juga tidak disentuh:
+// gilirannya tidak dimulai ulang, ia hanya diteruskan.
+func (r *CSTerminalRepo) Unlock(ctx context.Context, terminalID, employeeID string, at time.Time) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE cs_terminals
+		SET status = 'ONLINE', locked_at = NULL, locked_reason = NULL, updated_at = $3
+		WHERE terminal_id = $1 AND status = 'LOCKED' AND active_agent_id = $2`,
+		terminalID, employeeID, at,
+	)
+	if err != nil {
+		return false, fmt.Errorf("unlock terminal desk: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// FreezeLock menandai loket beku setelah tiga kali PIN salah.
+//
+// Statusnya tetap LOCKED — pembekuan adalah ALASAN terkunci, bukan status keenam.
+// Status keenam akan memaksa setiap pembaca status memeriksa dua hal, dan yang lupa
+// memeriksa akan meluluskan loket beku.
+func (r *CSTerminalRepo) FreezeLock(ctx context.Context, terminalID string, at time.Time) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE cs_terminals
+		SET locked_reason = 'FAILED_UNLOCK', updated_at = $2
+		WHERE terminal_id = $1 AND status = 'LOCKED'`,
+		terminalID, at,
+	)
+	if err != nil {
+		return fmt.Errorf("freeze terminal desk: %w", err)
+	}
+	return nil
 }
 
 // CSSupervisorRepo memverifikasi token dual-control supervisor.

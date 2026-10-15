@@ -86,6 +86,30 @@ type TerminalRepository interface {
 
 	// ListGates mengembalikan gerbang yang tercatat untuk sebuah sesi.
 	ListGates(ctx context.Context, sessionID uuid.UUID) ([]GateRecord, error)
+
+	// Lock menurunkan tirai kunci meja: ONLINE → LOCKED.
+	//
+	// Hanya terminal yang SEDANG ONLINE dan dipegang petugas itu yang berubah; selain
+	// itu mengembalikan false tanpa error, dan service-lah yang memutuskan apakah itu
+	// berarti idempoten (sudah LOCKED) atau TERMINAL_NOT_ONLINE. Syaratnya dipasang di
+	// WHERE, bukan di SELECT lebih dulu: dua permintaan bersamaan akan sama-sama
+	// melihat "masih ONLINE".
+	//
+	// active_agent_id TIDAK dilepas. Petugasnya masih bertugas, hanya sedang tidak di
+	// tempat — dan melepasnya akan membuat Unlock tidak tahu siapa yang berhak membuka.
+	Lock(ctx context.Context, terminalID, employeeID string, reason LockReason, at time.Time) (bool, error)
+
+	// Unlock mengangkat tirai: LOCKED → ONLINE, bukan READY.
+	//
+	// Gerbang kesiapan tidak pernah batal oleh penguncian, jadi tidak ada yang perlu
+	// diulang. Mengembalikan false kalau terminalnya tidak sedang terkunci oleh petugas
+	// itu.
+	Unlock(ctx context.Context, terminalID, employeeID string, at time.Time) (bool, error)
+
+	// FreezeLock mengubah locked_reason menjadi FAILED_UNLOCK setelah percobaan ketiga.
+	//
+	// Statusnya TETAP LOCKED: pembekuan adalah alasan terkunci, bukan keadaan baru.
+	FreezeLock(ctx context.Context, terminalID string, at time.Time) error
 }
 
 // SupervisorRepository memverifikasi dan mendaftar supervisor.
@@ -139,6 +163,37 @@ type AgentCredentialRepository interface {
 
 	// ClearLoginFailures dipanggil setelah login berhasil.
 	ClearLoginFailures(ctx context.Context, employeeID string) error
+
+	// FindDeskPIN mengembalikan kredensial KETIGA petugas: PIN meja.
+	// Mengembalikan nil, nil kalau petugasnya tidak ada atau tidak aktif.
+	FindDeskPIN(ctx context.Context, employeeID string) (*AgentDeskPINRecord, error)
+
+	// SetDeskPIN menyimpan hash PIN meja dan MENGOSONGKAN penghitung gagal membuka.
+	//
+	// Keduanya bersamaan: petugas yang baru menyetel PIN tidak boleh langsung tertolak
+	// oleh penghitung dari PIN lamanya — itu akan membekukan loket yang baru saja
+	// dibereskan.
+	SetDeskPIN(ctx context.Context, employeeID, pinHash string, at time.Time) error
+
+	// RecordUnlockFailure menaikkan failed_unlock_attempts dan mengembalikan nilainya
+	// SETELAH kenaikan.
+	//
+	// Satu UPDATE, bukan baca-lalu-tulis: dua permintaan bersamaan akan sama-sama
+	// membaca penghitung lama, dan ambang tiga kali tidak pernah tercapai.
+	RecordUnlockFailure(ctx context.Context, employeeID string, at time.Time) (attempts int, err error)
+
+	// ClearUnlockFailures dipanggil setelah tirai berhasil diangkat.
+	ClearUnlockFailures(ctx context.Context, employeeID string) error
+}
+
+// AgentDeskPINRecord adalah baris cs_agents yang dibutuhkan jalur kunci meja.
+//
+// Tidak pernah di-encode ke JSON: ia memuat hash PIN.
+type AgentDeskPINRecord struct {
+	EmployeeID           string
+	DeskPINHash          string
+	DeskPINSetAt         *time.Time
+	FailedUnlockAttempts int
 }
 
 // AgentLoginRecord adalah baris cs_agents yang dibutuhkan jalur login.

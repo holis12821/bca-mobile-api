@@ -185,6 +185,36 @@ func (h *CSAuthHandler) SetPassword(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, r, http.StatusOK, map[string]any{"password_set": true})
 }
 
+// SetDeskPIN handles POST /internal/v1/auth/desk-pin
+//
+// Di belakang AgentSession, BUKAN AgentIdentity seperti `auth/password`: PIN meja hanya
+// berguna bagi petugas yang sedang bertugas, dan menyetelnya dari kunci API saja akan
+// membuat siapa pun yang pernah melihat kunci itu bisa menimpa PIN orang lain di luar
+// jam kerjanya.
+//
+// Di grup `/auth`, bukan `/terminals`: yang disetel milik PETUGAS, bukan milik loket,
+// dan ikut pindah saat ia pindah meja.
+func (h *CSAuthHandler) SetDeskPIN(w http.ResponseWriter, r *http.Request) {
+	sess, ok := csSessionFromRequest(w, r)
+	if !ok {
+		return
+	}
+
+	var req cs.SetDeskPINRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	setAt, err := h.svc.SetDeskPIN(r.Context(), sess, req, extractIP(r), r.UserAgent())
+	if err != nil {
+		h.handleErr(w, r, "set cs agent desk pin failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, map[string]any{"desk_pin_set_at": setAt})
+}
+
 // LookupEmployee handles GET /internal/v1/hris/employees/{employee_id}
 //
 // Di belakang kunci API petugas: yang mencari NPP orang lain di direktori pegawai harus

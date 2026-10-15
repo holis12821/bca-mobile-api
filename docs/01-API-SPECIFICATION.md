@@ -1826,6 +1826,45 @@ karakter → `422 AGENT_PASSWORD_WEAK`.
 
 Response `200 OK`: `{ "password_set": true }`
 
+### `POST /internal/v1/auth/desk-pin`
+
+Header: kunci sistem + **token sesi** — berbeda dari `auth/password`. PIN meja hanya
+berguna bagi petugas yang sedang bertugas, dan menyetelnya dari kunci API saja akan
+membuat siapa pun yang pernah melihat kunci itu bisa menimpa PIN orang lain di luar jam
+kerjanya. Tidak ada masalah ayam-telur di sini: gilirannya sudah terbuka saat ia
+menyetelnya.
+
+PIN meja adalah kredensial **ketiga** petugas, di samping kunci API dan kata sandi.
+Alasannya bukan kerapian: kata sandi dipakai sekali per giliran, PIN dipakai belasan kali
+per hari. Memaksa mengetik kata sandi 12 karakter setiap kembali dari toilet adalah cara
+paling pasti membuat petugas memilih kata sandi lemah — atau tidak mengunci layarnya sama
+sekali. PIN ini **tidak pernah** jadi jalan masuk `auth/login`.
+
+Di grup `/auth`, bukan `/terminals`: yang disetel milik **petugas**, dan ikut pindah saat
+ia pindah meja.
+
+```json
+{ "current_pin": "481902", "new_pin": "730514" }
+```
+
+`current_pin` wajib **hanya** kalau petugas sudah punya PIN meja. Aturan kekuatannya sama
+persis dengan PIN transaksi nasabah — tepat 6 digit, bukan satu angka berulang, bukan
+berurutan → `422 CRED_WEAK_PIN`.
+
+| Kode | HTTP | Kapan |
+|---|---|---|
+| `CRED_WEAK_PIN` | 422 | `new_pin` bukan tepat 6 digit, berulang, atau berurutan |
+| `AGENT_DESK_PIN_INVALID` | 403 | `current_pin` salah atau tidak dikirim padahal PIN sudah pernah disetel |
+| `AGENT_SESSION_INVALID` | 401 | Token sesi tidak berlaku atau sudah lewat tenggat |
+
+`current_pin` yang salah di sini **tidak** menaikkan penghitung yang membekukan loket.
+Pemanggilnya sudah memegang sesi hidup, jadi tirainya sudah terangkat dan tidak ada yang
+bisa direbut dengan menebak; yang membekukan loket adalah tebakan di layar **terkunci**
+(`terminals/unlock`). Membiarkan jalur ini ikut membekukan akan memberi petugas cara
+membekukan loketnya sendiri tanpa sengaja.
+
+Response `200 OK`: `{ "desk_pin_set_at": "2026-10-14T02:11:04Z" }`
+
 ### `POST /internal/v1/auth/login`
 
 Header: **kunci sistem saja.** Di sinilah petugas membuktikan dirinya; menuntut
@@ -2090,6 +2129,132 @@ Response `200 OK`: `{ "terminal_id": "WKS-SMG-0842", "status": "OFFLINE" }`
 
 **Tanpa menutup sesi:** petugas yang istirahat menonaktifkan loketnya tanpa mengakhiri
 gilirannya. Yang pulang memanggil `auth/logout`, yang melakukan keduanya.
+
+## Kunci meja petugas (clean desk policy)
+
+Empat endpoint di bawah `/internal/v1/terminals`, semuanya menuntut **token sesi**:
+petugas tidak boleh mengunci atau membuka loket orang lain. Tidak satu pun menuntut
+cakupan — mengunci meja sendiri bukan kewenangan yang dibagi-bagi.
+
+`LOCKED` adalah **status kelima** terminal, di samping REGISTERED/READY/ONLINE/OFFLINE.
+Yang dikunci adalah **terminal**, bukan sesi, dan itu pilihan yang menentukan segalanya:
+sesi petugas tetap hidup beserta tenggatnya, ketiga gerbang kesiapan berumur 8 jam tidak
+diulang, dan **panggilan video yang sedang berjalan tidak diputus** — petugas mengunci
+layar karena ada orang lain mendekat, bukan karena ingin memutus nasabah yang sedang
+diverifikasi. Yang berubah: `can_take_calls` jadi `false` dan antrean berhenti mengalir
+ke loket itu.
+
+**Apa yang dijanjikan kunci ini, dan apa yang tidak.** Dijamin: layar petugas berhenti
+menampilkan video, nama, dan NIK nasabah; loket berhenti menerima panggilan baru; ada
+baris audit yang mencatat kapan dan oleh siapa. **Tidak** dijamin: kerahasiaan data
+terhadap orang yang menguasai terminal fisiknya — siapa pun yang memegang PC-nya bisa
+menutup aplikasinya. Itu pekerjaan kebijakan perangkat, bukan API ini.
+
+### `POST /internal/v1/terminals/lock`
+
+```json
+{ "reason": "AGENT" }
+```
+
+`reason` boleh kosong (default `AGENT`); nilai sahnya `AGENT` dan `IDLE`. `FAILED_UNLOCK`
+**ditolak dari klien** — ia hanya lahir dari tiga kali PIN salah.
+
+Kunci otomatis saat menganggur dipicu **klien**: server tidak tahu petugasnya diam, dan
+penghitung idle di backend hanya akan menebak.
+
+Response `200 OK` memuat `DeskLockState` (lihat `lock-state`).
+
+**Idempoten:** mengunci loket yang sudah terkunci menjawab `200` dengan keadaan yang
+sama, bukan `409`. Klien memanggilnya dari tombol dan dari pintasan papan tik, dan
+balapan di antara keduanya bukan galat.
+
+| Kode | HTTP | Kapan |
+|---|---|---|
+| `AGENT_DESK_PIN_NOT_SET` | 422 | Petugas belum punya PIN meja — mengunci berarti mengunci diri sendiri di luar |
+| `TERMINAL_NOT_ONLINE` | 422 | Hanya loket `ONLINE` yang bisa dikunci |
+| `VALIDATION_ERROR` | 422 | `reason` di luar `AGENT`/`IDLE` |
+
+### `POST /internal/v1/terminals/unlock`
+
+```json
+{ "pin": "730514" }
+```
+
+Berhasil: loket kembali ke **`ONLINE`**, bukan `READY` — gerbangnya tidak pernah batal.
+Penghitung gagal kembali nol, dan `locked_duration_seconds` menyebut berapa lama loket
+itu ditinggalkan.
+
+| Kode | HTTP | Kapan |
+|---|---|---|
+| `AGENT_DESK_PIN_INVALID` | 403 | PIN salah. `details.attempts_remaining` ikut dikirim |
+| `TERMINAL_DESK_FROZEN` | 423 | Tiga kali gagal; hanya `unlock-override` yang membukanya |
+| `TERMINAL_NOT_LOCKED` | 409 | Tidak sedang terkunci — atau terkunci oleh petugas lain |
+| `VALIDATION_ERROR` | 422 | `pin` kosong. **Tidak** dihitung sebagai percobaan |
+
+Setelah gagal ketiga kali, `locked_reason` berubah jadi `FAILED_UNLOCK` dan statusnya
+**tetap `LOCKED`**: pembekuan adalah alasan terkunci, bukan status keenam. Tidak ada
+lockout berbasis waktu — petugas yang menunggu lima belas menit di depan mejanya sendiri
+adalah loket yang mati lima belas menit. Yang membukanya adalah **orang**, bukan jam.
+
+### `GET /internal/v1/terminals/lock-state`
+
+Dipanggil **sekali saat pemulihan sesi**, di tempat yang sama dengan `auth/me`. Inilah
+yang membuat tirai selamat dari proses yang mati: renderer yang di-reload atau PC yang
+mati kehilangan tirai lokalnya bersama PIN-nya, dan tanpa endpoint ini aplikasi yang
+dibuka kembali akan menampilkan layar nasabah. **Bukan** endpoint polling — keadaan kunci
+hanya berubah oleh tindakan petugas itu sendiri.
+
+```json
+{
+  "data": {
+    "terminal_id": "CS-FL-04",
+    "status": "LOCKED",
+    "locked": true,
+    "locked_at": "2026-10-14T02:45:00Z",
+    "locked_reason": "AGENT",
+    "frozen": false,
+    "attempts_remaining": 2,
+    "desk_pin_set": true
+  }
+}
+```
+
+`locked_duration_seconds` hanya muncul pada jawaban `unlock`. `desk_pin_set: false`
+berarti layar kunci harus mengarahkan petugas menyetel PIN lebih dulu, bukan menampilkan
+papan angka yang tidak akan pernah cocok.
+
+### `POST /internal/v1/terminals/unlock-override`
+
+Jalan keluar dari loket beku, lewat **dual-control yang sudah ada** — bukan mekanisme
+kedua.
+
+```json
+{
+  "authorization_ref": "BCA-AUTH-7F3A11",
+  "password": "KataSandiPanjang2026",
+  "new_pin": "204817"
+}
+```
+
+Dua bukti diminta bersamaan dan keduanya perlu: `authorization_ref` (dari
+`POST /supervisors/authorize`) membuktikan **supervisor hadir**, `password` — kata sandi
+petugas, bukan PIN — membuktikan **petugasnya masih orang yang sama**. Supervisor
+sendirian tidak boleh membuka meja orang lain lalu meninggalkannya terbuka; petugas
+sendirian sudah terbukti tidak ingat PIN-nya.
+
+`new_pin` opsional: menyetel ulang PIN selagi supervisor masih di samping meja.
+
+| Kode | HTTP | Kapan |
+|---|---|---|
+| `SUPERVISOR_TOKEN_INVALID` | 401 | `authorization_ref` tidak dikenal atau kedaluwarsa |
+| `AGENT_CREDENTIAL_INVALID` | 401 | Kata sandi petugas salah |
+| `AGENT_LOCKED` | 423 | Kata sandi salah berkali-kali — jalur lockout login tetap berlaku |
+| `TERMINAL_NOT_LOCKED` | 409 | Loketnya tidak sedang terkunci |
+| `CRED_WEAK_PIN` | 422 | `new_pin` lemah — divalidasi **sebelum** tirainya diangkat |
+
+**Yang tidak dibangun:** mockup menyebut "otorisasi **fisik** supervisor". Tidak ada
+mekanisme kehadiran fisik di sistem ini, dan endpoint yang mengaku memverifikasinya akan
+berbohong. Yang ada adalah `authorization_ref`, dan itulah yang dipakai.
 
 ### `GET /internal/v1/hris/employees/{employee_id}`
 
@@ -2865,6 +3030,10 @@ dijawab `404 VIDEO_CALL_SCHEDULE_NOT_FOUND`.
 | `VIDEO_CALL_SCHEDULE_NOT_FOUND` | 404 | Tidak ada jadwal aktif yang bisa dibatalkan |
 | `AGENT_CREDENTIAL_INVALID` | 401 | NPP atau kata sandi petugas salah pada `auth/login` |
 | `AGENT_PASSWORD_NOT_SET` | 422 | Petugas belum pernah menyetel kata sandi — lewat `POST /internal/v1/auth/password` lebih dulu |
+| `AGENT_DESK_PIN_NOT_SET` | 422 | Petugas belum punya PIN meja — lewat `POST /internal/v1/auth/desk-pin` lebih dulu |
+| `AGENT_DESK_PIN_INVALID` | 403 | PIN meja salah. `details.attempts_remaining` menyebut sisa percobaan sebelum loket beku |
+| `TERMINAL_DESK_FROZEN` | 423 | Loket beku setelah tiga kali PIN meja salah. Hanya `POST /internal/v1/terminals/unlock-override` yang membukanya |
+| `TERMINAL_NOT_LOCKED` | 409 | Loket tidak sedang terkunci, atau terkunci oleh petugas lain |
 | `AGENT_PASSWORD_WEAK` | 422 | Kata sandi petugas kurang dari 12 karakter |
 | `AGENT_LOCKED` | 423 | Akun petugas terkunci sementara karena terlalu banyak percobaan gagal |
 | `AGENT_SESSION_INVALID` | 401 | `Authorization: Bearer <session_token>` tidak berlaku atau sudah ditutup |

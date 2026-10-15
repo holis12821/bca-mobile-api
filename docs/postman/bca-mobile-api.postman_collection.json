@@ -3265,6 +3265,50 @@
             "description": "Di belakang token sesi: yang ditutup adalah sesi yang TOKENNYA dikirim, bukan sesi yang disebut di body. Tanpa itu token siapa pun bisa menutup giliran orang lain.\n\nMenutup giliran SEKALIGUS menonaktifkan loket → terminal_status OFFLINE. Yang hanya istirahat memanggil /terminals/deactivate, yang tidak mengakhiri sesinya."
           },
           "response": []
+        },
+        {
+          "name": "5. Setel PIN meja petugas",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cs_session_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"current_pin\": \"\",\n  \"new_pin\": \"730514\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{internal_base_url}}/auth/desk-pin",
+              "host": [
+                "{{internal_base_url}}"
+              ],
+              "path": [
+                "auth",
+                "desk-pin"
+              ]
+            },
+            "description": "Kredensial KETIGA petugas, di samping kunci API dan kata sandi. Di belakang TOKEN SESI, bukan kunci API seperti auth/password: PIN meja hanya berguna bagi petugas yang sedang bertugas. `current_pin` wajib hanya kalau PIN sudah pernah disetel. Aturan kekuatannya sama persis dengan PIN transaksi nasabah."
+          },
+          "response": []
         }
       ]
     },
@@ -3578,6 +3622,169 @@
               ]
             },
             "description": "TANPA menutup sesi: petugas yang istirahat menonaktifkan loketnya tanpa mengakhiri gilirannya. Yang pulang memanggil auth/logout, yang melakukan keduanya."
+          },
+          "response": []
+        },
+        {
+          "name": "10. Kunci meja (clean desk)",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cs_session_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"AGENT\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{internal_base_url}}/terminals/lock",
+              "host": [
+                "{{internal_base_url}}"
+              ],
+              "path": [
+                "terminals",
+                "lock"
+              ]
+            },
+            "description": "ONLINE -> LOCKED. Sesi petugas TETAP hidup, gerbang kesiapan TIDAK diulang, dan panggilan video yang sedang berjalan TIDAK diputus. Yang berubah: can_take_calls jadi false dan antrean berhenti mengalir ke loket ini. Idempoten: mengunci loket yang sudah terkunci menjawab 200, bukan 409. `reason` boleh kosong (default AGENT); nilai sahnya AGENT dan IDLE."
+          },
+          "response": []
+        },
+        {
+          "name": "11. Buka kunci meja",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cs_session_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pin\": \"730514\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{internal_base_url}}/terminals/unlock",
+              "host": [
+                "{{internal_base_url}}"
+              ],
+              "path": [
+                "terminals",
+                "unlock"
+              ]
+            },
+            "description": "LOCKED -> ONLINE, bukan READY: gerbangnya tidak pernah batal. PIN salah menjawab 403 AGENT_DESK_PIN_INVALID dengan details.attempts_remaining. Gagal ketiga kali membekukan loket (423 TERMINAL_DESK_FROZEN) sampai supervisor membukanya — orang, bukan jam."
+          },
+          "response": []
+        },
+        {
+          "name": "12. Keadaan kunci meja",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cs_session_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{internal_base_url}}/terminals/lock-state",
+              "host": [
+                "{{internal_base_url}}"
+              ],
+              "path": [
+                "terminals",
+                "lock-state"
+              ]
+            },
+            "description": "Dipanggil SEKALI saat pemulihan sesi, di tempat yang sama dengan auth/me. Inilah yang membuat tirai selamat dari proses yang mati: aplikasi desktop yang di-restart kehilangan tirai lokalnya bersama PIN-nya, dan tanpa ini ia akan membuka layar nasabah. BUKAN endpoint polling."
+          },
+          "response": []
+        },
+        {
+          "name": "13. Buka paksa loket beku (dual-control)",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cs_session_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"authorization_ref\": \"{{cs_authorization_ref}}\",\n  \"password\": \"KataSandiPanjang2026\",\n  \"new_pin\": \"204817\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{internal_base_url}}/terminals/unlock-override",
+              "host": [
+                "{{internal_base_url}}"
+              ],
+              "path": [
+                "terminals",
+                "unlock-override"
+              ]
+            },
+            "description": "Jalan keluar dari loket beku, lewat dual-control yang SUDAH ada. Dua bukti bersamaan: authorization_ref dari POST /supervisors/authorize membuktikan SUPERVISOR HADIR, password (kata sandi petugas, bukan PIN) membuktikan PETUGASNYA MASIH ORANG YANG SAMA. `new_pin` opsional: menyetel ulang PIN selagi supervisor masih di samping meja."
           },
           "response": []
         }

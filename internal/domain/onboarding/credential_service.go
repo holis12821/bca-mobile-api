@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"strings"
 	"time"
 
@@ -12,15 +11,7 @@ import (
 
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
 	"github.com/holis12821/bca-mobile-api/internal/pkg/crypto"
-)
-
-// sequentialRunLength is how many consecutive characters (e.g. "234", "cba")
-// are enough to call a credential sequential and reject it.
-const sequentialRunLength = 3
-
-var (
-	accessCodeRegex = regexp.MustCompile(`^[a-zA-Z0-9]{6}$`)
-	pinRegex        = regexp.MustCompile(`^[0-9]{6}$`)
+	"github.com/holis12821/bca-mobile-api/internal/pkg/pinrule"
 )
 
 type CredentialService struct {
@@ -199,85 +190,19 @@ func (s *CredentialService) decryptCredential(encrypted string) (string, error) 
 	return payload.PIN, nil
 }
 
-// validateAccessCode checks access code rules:
-// - Exactly 6 alphanumeric
-// - Not all same character
-// - Not sequential
-func validateAccessCode(code string) error {
-	if !accessCodeRegex.MatchString(code) {
-		return apperr.CredWeakAccessCode
-	}
-	lower := strings.ToLower(code)
-	if isAllSameChar(lower) {
-		return apperr.CredWeakAccessCode
-	}
-	if isSequential(lower) {
-		return apperr.CredWeakAccessCode
-	}
-	return nil
-}
+// The six-character credential rules now live in internal/pkg/pinrule, because
+// the CS desk PIN enforces exactly the same ones and internal/domain/cs cannot
+// call an unexported helper in this package. The four wrappers below keep this
+// package's own vocabulary at its call sites — and keep the single copy of the
+// rules in one place, where it cannot drift.
 
-// validatePIN checks PIN rules:
-// - Exactly 6 digits
-// - Not all same digit
-// - Not sequential
-func validatePIN(pin string) error {
-	if !pinRegex.MatchString(pin) {
-		return apperr.CredWeakPIN
-	}
-	if isAllSameChar(pin) {
-		return apperr.CredWeakPIN
-	}
-	if isSequential(pin) {
-		return apperr.CredWeakPIN
-	}
-	return nil
-}
+func validateAccessCode(code string) error { return pinrule.ValidateAccessCode(code) }
 
-// isAllSameChar checks if all characters are the same (e.g. "aaaaaa", "111111").
-func isAllSameChar(s string) bool {
-	if len(s) == 0 {
-		return false
-	}
-	for i := 1; i < len(s); i++ {
-		if s[i] != s[0] {
-			return false
-		}
-	}
-	return true
-}
+func validatePIN(pin string) error { return pinrule.ValidatePIN(pin) }
 
-// isSequential reports whether the string contains a run of at least
-// sequentialRunLength characters stepping by ±1 — "123456", "abcdef", "654321",
-// and also "ab1234", where the run sits inside an otherwise random string.
-//
-// runLength counts characters, not gaps: a pair one apart is already a run of
-// two. The previous version seeded the counter at 1 for a pair, so it only
-// fired at four characters while claiming three in its comment.
-func isSequential(s string) bool {
-	if len(s) < sequentialRunLength {
-		return false
-	}
+func isAllSameChar(s string) bool { return pinrule.AllSameChar(s) }
 
-	runLength := 1
-	for i := 1; i < len(s); i++ {
-		diff := int(s[i]) - int(s[i-1])
-		if diff == 1 || diff == -1 {
-			if i >= 2 && diff == int(s[i-1])-int(s[i-2]) {
-				runLength++ // same direction as the previous step: the run continues
-			} else {
-				runLength = 2 // a new run starts at this pair
-			}
-			if runLength >= sequentialRunLength {
-				return true
-			}
-			continue
-		}
-		runLength = 1
-	}
-
-	return false
-}
+func isSequential(s string) bool { return pinrule.Sequential(s) }
 
 func (s *CredentialService) resolveSession(ctx context.Context, sessionID string) (*Session, error) {
 	if s.cache != nil {

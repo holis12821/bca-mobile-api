@@ -28,15 +28,52 @@ const (
 
 	// TerminalOffline: giliran ditutup.
 	TerminalOffline TerminalStatus = "OFFLINE"
+
+	// TerminalLocked: tirai kunci meja sedang turun (clean desk policy).
+	//
+	// Status, bukan sesi yang ditutup. Petugasnya masih bertugas dan active_agent_id
+	// tetap terisi; yang berubah hanyalah bahwa loket ini berhenti jadi kandidat
+	// penugasan. Membuka kunci mengembalikannya ke ONLINE — bukan ke READY, karena
+	// ketiga gerbang kesiapan tidak pernah batal oleh penguncian.
+	TerminalLocked TerminalStatus = "LOCKED"
 )
 
 func ValidTerminalStatus(s TerminalStatus) bool {
 	switch s {
-	case TerminalRegistered, TerminalReady, TerminalOnline, TerminalOffline:
+	case TerminalRegistered, TerminalReady, TerminalOnline, TerminalOffline, TerminalLocked:
 		return true
 	}
 	return false
 }
+
+// LockReason adalah sebab sebuah loket terkunci. Cocok dengan CHECK di migrasi 000043.
+type LockReason string
+
+const (
+	// LockReasonAgent: petugas menekan tombol kunci.
+	LockReasonAgent LockReason = "AGENT"
+
+	// LockReasonIdle: aplikasi desktop mengunci sendiri setelah diam.
+	//
+	// Pemicunya milik KLIEN. Server tidak tahu petugasnya diam, dan penghitung idle
+	// di backend hanya akan menebak — lalu mengunci loket yang sebenarnya ditunggui.
+	LockReasonIdle LockReason = "IDLE"
+
+	// LockReasonFailedUnlock: beku setelah tiga kali PIN salah.
+	//
+	// Alasan terkunci, BUKAN status tersendiri. Status keenam akan memaksa setiap
+	// pembaca status memeriksa dua hal, dan yang lupa memeriksa akan meluluskan
+	// loket beku.
+	LockReasonFailedUnlock LockReason = "FAILED_UNLOCK"
+)
+
+// MaxUnlockAttempts 3. Setelah itu loketnya beku sampai SUPERVISOR membukanya (§3.5),
+// bukan sampai sebuah jam habis.
+//
+// Tidak ada lockout berbasis waktu di jalur ini, dan itu disengaja: petugas yang lupa
+// PIN lalu harus menunggu lima belas menit di depan mejanya sendiri adalah loket yang
+// mati lima belas menit. Orang, bukan jam.
+const MaxUnlockAttempts = 3
 
 // Terminal adalah satu loket petugas CS.
 type Terminal struct {
@@ -52,6 +89,11 @@ type Terminal struct {
 	ActivatedAt   *time.Time `json:"activated_at,omitempty"`
 	LastSeenAt    *time.Time `json:"last_seen_at,omitempty"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+
+	// LockedAt dan LockedReason terisi hanya saat Status == TerminalLocked, diikat
+	// CHECK cs_terminals_locked_consistent.
+	LockedAt     *time.Time `json:"locked_at,omitempty"`
+	LockedReason LockReason `json:"locked_reason,omitempty"`
 }
 
 // Gate adalah satu dari tiga gerbang kesiapan (Rule 3).
@@ -189,4 +231,67 @@ type PIIAckRequest struct {
 	// PactVersion menyebut versi teks pakta yang disetujui petugas. Tanpa itu, jejaknya
 	// tidak bisa menjawab "menyetujui APA" setelah teksnya direvisi.
 	PactVersion string `json:"pact_version"`
+}
+
+// --- Kunci meja (clean desk policy) ---
+
+// LockDeskRequest adalah body `POST /internal/v1/terminals/lock`.
+type LockDeskRequest struct {
+	// Reason kosong berarti AGENT. Klien memanggil endpoint ini dari dua jalur
+	// (tombol dan pintasan papan tik) dan yang satu tidak selalu menyebut alasannya.
+	Reason LockReason `json:"reason"`
+}
+
+// UnlockDeskRequest adalah body `POST /internal/v1/terminals/unlock`.
+type UnlockDeskRequest struct {
+	PIN string `json:"pin"`
+}
+
+// UnlockOverrideRequest adalah body `POST /internal/v1/terminals/unlock-override`.
+//
+// Dua bukti diminta bersamaan, dan keduanya perlu: AuthorizationRef membuktikan
+// SUPERVISOR HADIR, Password membuktikan PETUGASNYA MASIH ORANG YANG SAMA. Supervisor
+// sendirian tidak boleh membuka meja orang lain lalu meninggalkannya terbuka; petugas
+// sendirian sudah terbukti tidak ingat PIN-nya.
+type UnlockOverrideRequest struct {
+	AuthorizationRef string `json:"authorization_ref"`
+
+	// Password: kata sandi petugas, BUKAN PIN meja. PIN-nya justru yang sedang
+	// bermasalah.
+	Password string `json:"password"`
+
+	// NewPIN opsional: sekalian menyetel ulang PIN meja, supaya petugas tidak perlu
+	// memanggil `auth/desk-pin` lagi dengan supervisor masih berdiri di sampingnya.
+	NewPIN string `json:"new_pin"`
+}
+
+// DeskLockState adalah jawaban `GET /internal/v1/terminals/lock-state`, dan juga
+// jawaban lock/unlock.
+//
+// Inilah yang membuat tirai selamat dari proses yang mati. Renderer yang di-reload,
+// Electron yang di-restart, PC yang mati — tirai lokal ikut hilang bersama PIN-nya, dan
+// layar nasabah terbuka lagi. Klien memanggil ini SEKALI saat pemulihan sesi, di tempat
+// yang sama dengan `auth/me`.
+type DeskLockState struct {
+	TerminalID string         `json:"terminal_id"`
+	Status     TerminalStatus `json:"status"`
+	Locked     bool           `json:"locked"`
+
+	LockedAt     *time.Time `json:"locked_at,omitempty"`
+	LockedReason LockReason `json:"locked_reason,omitempty"`
+
+	// LockedDurationSeconds hanya terisi pada jawaban `unlock`: berapa lama loketnya
+	// ditinggalkan. Angka yang sama ikut ke jejak audit.
+	LockedDurationSeconds *int `json:"locked_duration_seconds,omitempty"`
+
+	// Frozen true berarti tiga kali PIN salah; hanya `unlock-override` yang membukanya.
+	Frozen bool `json:"frozen"`
+
+	// AttemptsRemaining sisa percobaan sebelum beku.
+	AttemptsRemaining int `json:"attempts_remaining"`
+
+	// DeskPINSet false berarti petugas belum pernah menyetel PIN — layar kunci harus
+	// mengarahkannya menyetel PIN lebih dulu, bukan menampilkan papan angka yang tidak
+	// akan pernah cocok.
+	DeskPINSet bool `json:"desk_pin_set"`
 }

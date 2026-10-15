@@ -531,11 +531,22 @@ shift. Ketiganya menunggu definisi, bukan kode.
 Tiga yang dulu ada di tabel ini **sudah selesai** — jangan bangun ulang: cakupan
 `AUDIT_READ`, penyelesaian eskalasi Tier 2, dan `PATCH /agents/{npp}`.
 
+**Satu selisih yang dokumen ini pernah lewatkan sama sekali, dan kini tertutup: kunci
+meja petugas (clean desk policy).** Ia tidak pernah muncul di tabel ini bukan karena
+ditunda, melainkan karena dokumen alur 19 layar memang tidak memuat layar terkunci —
+layar itu lahir belakangan dari desain Stitch `SCREEN_2`. Dibangun migrasi `000043` dan
+lima endpoint (`auth/desk-pin`, `terminals/lock`, `unlock`, `lock-state`,
+`unlock-override`): `LOCKED` jadi status kelima terminal, PIN meja jadi kredensial ketiga
+petugas di `cs_agents.desk_pin_hash`, dan empat peristiwa audit `DESK_*` menjawab
+pertanyaan yang tirai lokal di aplikasi desktop tidak pernah bisa jawab — jam berapa
+loket itu ditinggalkan, berapa lama, dan siapa yang membukanya kembali. Rinciannya di
+skill `cs-desktop-clean-desk-lock`.
+
 ---
 
 ## 4. Tabel yang sudah ada
 
-Sembilan migrasi: **`000032`–`000038`**, lalu **`000041`–`000042`**. Urutannya berbeda
+Sepuluh migrasi: **`000032`–`000038`**, lalu **`000041`–`000043`**. Urutannya berbeda
 dari rancangan awal di versi skill ini — yang berlaku adalah yang di bawah, bukan yang
 pernah direncanakan.
 
@@ -550,10 +561,10 @@ pernah direncanakan.
 | `000038` | `onboarding_video_call_escalations` | perkara `NEED_REVIEW`, `escalation_queue`, `status` |
 | `000041` | `cs_agents` + `cs_audit_events` (CHECK) | cakupan `AUDIT_READ` & `ESCALATION_REVIEW`, peristiwa `AGENT_UPDATED` |
 | `000042` | `onboarding_video_call_escalations` (+4 kolom) | `claimed_by_agent`, `claimed_at`, `resolution_reason`, `resolution_notes` + CHECK penyelesaian |
+| `000043` | `cs_agents` (+3 kolom), `cs_terminals` (+2 kolom & CHECK), `cs_audit_events` (CHECK) | kunci meja: `desk_pin_hash`, `desk_pin_set_at`, `failed_unlock_attempts`; status `LOCKED` + `locked_at`, `locked_reason`; peristiwa `DESK_*` |
 
-**Migrasi berikutnya mulai dari `000043`** (terakhir:
-`000042_video_call_escalation_resolution`; `000039` katalog produk dan `000040` liveness
-bukan milik jalur CS). Penomoran berurutan — `ls migrations/` dulu, jangan menebak, dan
+**Migrasi berikutnya mulai dari `000044`** (terakhir: `000043_cs_desk_lock`; `000039`
+katalog produk dan `000040` liveness bukan milik jalur CS). Penomoran berurutan — `ls migrations/` dulu, jangan menebak, dan
 jangan menabrak nomor yang sedang dikerjakan orang lain.
 
 Dua catatan tentang `000041`, karena keduanya menentukan cara merilisnya:
@@ -665,10 +676,11 @@ migrasinya, jadi tanpa `PATCH /agents/{npp}` di rilis yang sama tidak akan ada s
 petugas yang bisa membaca jejak audit lagi.
 
 **Yang tersisa ada di §3.8**, dan keduanya menunggu hal di luar kode: pratinjau dokumen
-sisi CS menunggu keputusan kebijakan PII, OIDC menunggu penyedia identitas.
+sisi CS menunggu keputusan kebijakan PII, OIDC menunggu penyedia identitas. Kunci meja —
+yang dulu tidak tercatat di mana pun — sudah terbit bersama migrasi `000043`.
 
 Layar desktop yang sudah ada **tidak boleh rusak** di tahap mana pun. Tambahkan field,
-jangan mengubah yang terbit — itu berlaku untuk ketiga puluh empat endpoint sekarang,
+jangan mengubah yang terbit — itu berlaku untuk ketiga puluh sembilan endpoint sekarang,
 bukan hanya untuk antrean, panggilan, dan hasil.
 
 **Satu pengecualian yang sudah diambil, dan harus diketahui:** pengetatan

@@ -105,3 +105,20 @@ type SessionContext struct {
 	TerminalID string
 	ExpiresAt  time.Time
 }
+
+// SetDeskPINRequest adalah body `POST /internal/v1/auth/desk-pin`.
+//
+// PIN meja adalah kredensial KETIGA petugas, di samping kunci API dan kata sandi.
+// Alasannya bukan kerapian: kata sandi dipakai SEKALI per giliran, PIN dipakai belasan
+// kali per hari. Memaksa mengetik kata sandi minimal 12 karakter setiap kembali dari
+// toilet adalah cara paling pasti membuat petugas memilih kata sandi lemah — atau tidak
+// mengunci layarnya sama sekali.
+//
+// PIN ini TIDAK PERNAH jadi jalan masuk `POST /auth/login`. Ia hanya mengangkat tirai
+// atas giliran yang sudah terbuka.
+type SetDeskPINRequest struct {
+	// CurrentPIN wajib hanya kalau petugas SUDAH punya PIN meja.
+	CurrentPIN string `json:"current_pin"`
+
+	NewPIN string `json:"new_pin"`
+}

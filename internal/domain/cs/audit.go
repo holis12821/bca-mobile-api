@@ -43,6 +43,24 @@ const (
 	EventTerminalRegistered  = "TERMINAL_REGISTERED"
 	EventTerminalActivated   = "TERMINAL_ACTIVATED"
 	EventTerminalDeactivated = "TERMINAL_DEACTIVATED"
+
+	// Kunci meja (clean desk policy), ditambahkan migrasi 000043.
+	//
+	// Keempatnya ada karena pemeriksaan kepatuhan UU PDP No. 27 Tahun 2022 menanyakan
+	// hal yang tirai lokal di aplikasi desktop tidak bisa jawab: jam berapa loket itu
+	// ditinggalkan, berapa lama, dan siapa yang membukanya kembali.
+	EventDeskPINSet = "DESK_PIN_SET"
+	EventDeskLocked = "DESK_LOCKED"
+
+	// EventDeskUnlocked ditulis juga oleh jalur override, dibedakan lewat
+	// details.override — bukan jenis peristiwa tersendiri: yang terjadi sama, yang
+	// berbeda adalah siapa yang ikut menandatanganinya.
+	EventDeskUnlocked = "DESK_UNLOCKED"
+
+	// EventDeskUnlockFailed ditulis pada SETIAP kegagalan, bukan hanya yang ketiga.
+	// Pola percobaan yang berhenti di dua, berulang tiap hari, di loket yang sama,
+	// adalah justru yang dicari pemeriksa.
+	EventDeskUnlockFailed = "DESK_UNLOCK_FAILED"
 )
 
 // AuditEvent adalah satu baris cs_audit_events.

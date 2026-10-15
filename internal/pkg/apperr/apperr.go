@@ -253,6 +253,22 @@ var (
 
 	TerminalAgentBusy = Error{http.StatusConflict, "TERMINAL_AGENT_BUSY", "Anda masih aktif di terminal lain. Tutup giliran di sana lebih dulu.", nil}
 
+	// --- Kunci meja petugas (clean desk policy, migrasi 000043) ---
+
+	// Mengunci layar tanpa pernah menyetel PIN berarti mengunci diri sendiri di luar.
+	// Dibedakan dari "PIN salah": petugasnya tidak sedang salah mengetik.
+	AgentDeskPINNotSet = Error{http.StatusUnprocessableEntity, "AGENT_DESK_PIN_NOT_SET", "PIN meja belum disetel. Setel PIN sebelum mengunci layar.", nil}
+
+	// Details memuat attempts_remaining — tanpa angkanya, layar kunci hanya bisa
+	// berkata "salah" dan petugas tidak tahu ia selangkah dari membekukan loketnya.
+	AgentDeskPINInvalid = Error{http.StatusForbidden, "AGENT_DESK_PIN_INVALID", "PIN meja salah.", nil}
+
+	// 423, sama dengan AGENT_LOCKED, tapi jalan keluarnya berbeda: yang ini tidak
+	// pernah terbuka sendiri oleh waktu. Hanya otorisasi supervisor yang membukanya.
+	TerminalDeskFrozen = Error{http.StatusLocked, "TERMINAL_DESK_FROZEN", "Loket dibekukan setelah tiga kali PIN salah. Perlu otorisasi supervisor.", nil}
+
+	TerminalNotLocked = Error{http.StatusConflict, "TERMINAL_NOT_LOCKED", "Loket tidak sedang terkunci.", nil}
+
 	// Petugas yang sudah memegang panggilan tidak boleh mengambil yang kedua.
 	AgentCallInProgress = Error{http.StatusConflict, "AGENT_CALL_IN_PROGRESS", "Anda masih menangani panggilan lain.", nil}
 

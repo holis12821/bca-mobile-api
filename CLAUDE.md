@@ -57,6 +57,7 @@ untuk pekerjaan mendalam:
 | `twilio-sms-otp` | setup & integrasi provider SMS: kredensial Twilio, `SMS_*`, `internal/pkg/sms`, normalisasi E.164, menelusuri OTP yang tidak sampai |
 | `cs-desktop-api-integration` | kontrak 34 endpoint CS yang **sudah terbit** — auth empat lapis, enam cakupan, sesi petugas, terminal & gerbang kesiapan, eskalasi Tier 2, signaling, penyamaran PII |
 | `cs-desktop-workflow-backend` | alur desktop CS 19 layar: identitas petugas, siklus hidup terminal, gerbang kesiapan, KPI, `NEED_REVIEW` + penutupan eskalasi Tier 2 — **keputusan di balik yang sudah dibangun**, dan dua selisih yang tersisa |
+| `cs-desktop-clean-desk-lock` | kunci meja petugas: PIN meja, status terminal `LOCKED`, pembekuan loket + pembukaan dual-control, peristiwa audit `DESK_*` |
 
 File ini hanya memuat yang **tidak** ada di skill: workflow harian, jebakan
 nyata di repo ini, dan aturan di atas.

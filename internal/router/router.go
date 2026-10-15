@@ -740,8 +740,13 @@ func New(deps Deps) (http.Handler, error) {
 
 	csSupervisorRepo := postgres.NewCSSupervisorRepo(deps.DB)
 
+	// Satu CSAgentCredentialRepo dipakai dua service: sesi petugas memakainya untuk kata
+	// sandi, kunci meja untuk PIN meja. Dua instansi akan menunjuk tabel yang sama dan
+	// hanya menambah satu tempat lagi yang bisa lupa diperbarui.
+	csCredentialRepo := postgres.NewCSAgentCredentialRepo(deps.DB)
+
 	csSessionService := cs.NewAgentSessionService(cs.AgentSessionServiceConfig{
-		Creds:     postgres.NewCSAgentCredentialRepo(deps.DB),
+		Creds:     csCredentialRepo,
 		Sessions:  csSessionRepo,
 		Terminals: csTerminalRepo,
 		Audit:     csAuditRepo,
@@ -760,6 +765,12 @@ func New(deps Deps) (http.Handler, error) {
 		Supervisors: csSupervisorRepo,
 		Sessions:    csSessionRepo,
 		Audit:       csAuditRepo,
+
+		// Kunci meja: PIN-nya milik petugas, yang terkunci adalah terminal, jadi
+		// keduanya bertemu di service ini. Hasher yang SAMA dengan kata sandi petugas —
+		// Argon2id, bukan hasher kedua yang lebih murah untuk enam digit.
+		Creds:  csCredentialRepo,
+		Hasher: crypto.NewPasswordHasher(),
 	})
 
 	// Pembacaan jejak audit terpisah dari penulisnya: penulisan terjadi di dalam
@@ -1154,8 +1165,20 @@ func New(deps Deps) (http.Handler, error) {
 				r.Post("/password", csAuthH.SetPassword)
 			})
 
-			r.With(middleware.AgentSession(csSessionService)).
-				Post("/logout", csAuthH.Logout)
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.AgentSession(csSessionService))
+
+				r.Post("/logout", csAuthH.Logout)
+
+				// PIN meja: kredensial KETIGA petugas (clean desk policy). Di sini,
+				// bukan di /terminals, karena yang disetel milik PETUGAS dan ikut
+				// pindah saat ia pindah meja.
+				//
+				// AgentSession, bukan AgentIdentity seperti /password: PIN meja hanya
+				// berguna bagi petugas yang sedang bertugas, dan tidak ada masalah
+				// ayam-telur di sini — gilirannya sudah terbuka saat ia menyetelnya.
+				r.Post("/desk-pin", csAuthH.SetDeskPIN)
+			})
 		})
 
 		// Pendaftaran petugas dan direktori pegawai (SCR-001).
@@ -1211,6 +1234,17 @@ func New(deps Deps) (http.Handler, error) {
 				r.Post("/pii-ack", csTerminalH.AcknowledgePII)
 				r.Post("/activate", csTerminalH.Activate)
 				r.Post("/deactivate", csTerminalH.Deactivate)
+
+				// Kunci meja (clean desk policy). Tidak menuntut cakupan: mengunci meja
+				// SENDIRI bukan kewenangan yang dibagi-bagi, dan tidak satu pun dari
+				// enam cakupan yang ada menggambarkannya — sama seperti cs/dashboard.
+				//
+				// Terminalnya ditentukan SESI, seperti ketiga gerbang kesiapan: petugas
+				// tidak boleh mengunci atau membuka loket orang lain.
+				r.Post("/lock", csTerminalH.LockDesk)
+				r.Post("/unlock", csTerminalH.UnlockDesk)
+				r.Get("/lock-state", csTerminalH.DeskLockState)
+				r.Post("/unlock-override", csTerminalH.UnlockOverride)
 			})
 
 			// Didaftarkan TERAKHIR: chi mencocokkan pola statis lebih dulu, tapi

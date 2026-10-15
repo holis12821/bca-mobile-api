@@ -2,6 +2,8 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -228,6 +230,106 @@ func (h *CSTerminalHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 		"terminal_id": sess.TerminalID,
 		"status":      string(cs.TerminalOffline),
 	})
+}
+
+// LockDesk handles POST /internal/v1/terminals/lock
+//
+// Idempoten: mengunci loket yang sudah terkunci menjawab 200 dengan keadaan yang sama,
+// bukan 409. Klien memanggilnya dari dua jalur — tombol dan pintasan papan tik — dan
+// balapan di antara keduanya tidak boleh berbunyi seperti galat.
+func (h *CSTerminalHandler) LockDesk(w http.ResponseWriter, r *http.Request) {
+	sess, ok := csSessionFromRequest(w, r)
+	if !ok {
+		return
+	}
+
+	// Body boleh kosong: `reason` default AGENT, dan pintasan papan tik tidak selalu
+	// mengirim apa pun.
+	var req cs.LockDeskRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			response.Err(w, r, apperr.ValidationError)
+			return
+		}
+	}
+
+	state, err := h.svc.LockDesk(r.Context(), sess, req, extractIP(r), r.UserAgent())
+	if err != nil {
+		h.handleErr(w, r, "lock cs terminal desk failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, state)
+}
+
+// UnlockDesk handles POST /internal/v1/terminals/unlock
+func (h *CSTerminalHandler) UnlockDesk(w http.ResponseWriter, r *http.Request) {
+	sess, ok := csSessionFromRequest(w, r)
+	if !ok {
+		return
+	}
+
+	var req cs.UnlockDeskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	state, err := h.svc.UnlockDesk(r.Context(), sess, req, extractIP(r), r.UserAgent())
+	if err != nil {
+		// PIN salah tidak dicatat sebagai galat server, dan PIN-nya sendiri tidak pernah
+		// masuk log — handleErr hanya mencetak yang kodenya INTERNAL_ERROR.
+		h.handleErr(w, r, "unlock cs terminal desk failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, state)
+}
+
+// DeskLockState handles GET /internal/v1/terminals/lock-state
+//
+// Dipanggil SEKALI saat pemulihan sesi, di tempat yang sama dengan `auth/me`: tirai
+// lokal di aplikasi desktop hilang bersama proses yang mati, dan tanpa endpoint ini
+// aplikasi yang dibuka kembali akan menampilkan layar nasabah. Bukan endpoint polling.
+func (h *CSTerminalHandler) DeskLockState(w http.ResponseWriter, r *http.Request) {
+	sess, ok := csSessionFromRequest(w, r)
+	if !ok {
+		return
+	}
+
+	state, err := h.svc.DeskLockState(r.Context(), sess)
+	if err != nil {
+		h.handleErr(w, r, "read cs terminal lock state failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, state)
+}
+
+// UnlockOverride handles POST /internal/v1/terminals/unlock-override
+//
+// Jalan keluar dari loket beku, lewat dual-control yang SUDAH ada: `authorization_ref`
+// dari `POST /supervisors/authorize`, ditambah kata sandi petugas — bukan PIN-nya, yang
+// justru sedang bermasalah.
+func (h *CSTerminalHandler) UnlockOverride(w http.ResponseWriter, r *http.Request) {
+	sess, ok := csSessionFromRequest(w, r)
+	if !ok {
+		return
+	}
+
+	var req cs.UnlockOverrideRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Err(w, r, apperr.ValidationError)
+		return
+	}
+
+	state, err := h.svc.UnlockOverride(r.Context(), sess, req, extractIP(r), r.UserAgent())
+	if err != nil {
+		h.handleErr(w, r, "override unlock cs terminal desk failed", err)
+		return
+	}
+
+	response.Success(w, r, http.StatusOK, state)
 }
 
 // respondReadiness menjawab dengan keadaan gerbang TERBARU setelah satu gerbang lolos.

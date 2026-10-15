@@ -235,3 +235,93 @@ func (r *CSAgentCredentialRepo) ClearLoginFailures(ctx context.Context, employee
 	}
 	return nil
 }
+
+// --- PIN meja (clean desk policy, migrasi 000043) ---
+
+// FindDeskPIN membaca kredensial KETIGA petugas.
+//
+// Query tersendiri, bukan menumpang FindForLogin: yang itu dilalui SETIAP login dan
+// tidak perlu memuat hash PIN meja di memori. Nilai yang tidak pernah dibaca tidak bisa
+// bocor ke log lewat sebuah slog.Info yang mencetak seluruh struct.
+func (r *CSAgentCredentialRepo) FindDeskPIN(ctx context.Context, employeeID string) (*cs.AgentDeskPINRecord, error) {
+	var rec cs.AgentDeskPINRecord
+	var pinHash *string
+
+	err := r.pool.QueryRow(ctx, `
+		SELECT employee_id, desk_pin_hash, desk_pin_set_at, failed_unlock_attempts
+		FROM cs_agents
+		WHERE employee_id = $1 AND is_active`, employeeID,
+	).Scan(&rec.EmployeeID, &pinHash, &rec.DeskPINSetAt, &rec.FailedUnlockAttempts)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find agent desk pin: %w", err)
+	}
+	if pinHash != nil {
+		rec.DeskPINHash = *pinHash
+	}
+	return &rec, nil
+}
+
+// SetDeskPIN menyimpan hash PIN meja dan MENGOSONGKAN penghitung gagal membuka.
+//
+// Keduanya bersamaan, alasan yang sama dengan SetPassword: petugas yang baru menyetel
+// PIN tidak boleh langsung tertolak oleh penghitung dari PIN lamanya — itu akan
+// membekukan loket yang baru saja dibereskan.
+//
+// locked_until TIDAK disentuh: itu lockout LOGIN, dan PIN meja tidak membuka giliran.
+func (r *CSAgentCredentialRepo) SetDeskPIN(ctx context.Context, employeeID, pinHash string, at time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE cs_agents
+		SET desk_pin_hash = $2, desk_pin_set_at = $3,
+		    failed_unlock_attempts = 0, updated_at = $3
+		WHERE employee_id = $1 AND is_active`,
+		employeeID, pinHash, at,
+	)
+	if err != nil {
+		return fmt.Errorf("set agent desk pin: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("agent not found or inactive")
+	}
+	return nil
+}
+
+// RecordUnlockFailure menaikkan penghitung dan mengembalikan nilainya SETELAH kenaikan.
+//
+// Satu UPDATE…RETURNING, bukan baca-lalu-tulis: dua permintaan bersamaan akan sama-sama
+// membaca penghitung lama, dan ambang tiga kali tidak pernah tercapai.
+//
+// Tidak ada lockout berbasis waktu yang dipasang di sini — tidak seperti
+// RecordLoginFailure. Yang membuka loket beku adalah supervisor, bukan jam.
+func (r *CSAgentCredentialRepo) RecordUnlockFailure(
+	ctx context.Context, employeeID string, at time.Time,
+) (int, error) {
+	var attempts int
+	err := r.pool.QueryRow(ctx, `
+		UPDATE cs_agents
+		SET failed_unlock_attempts = failed_unlock_attempts + 1, updated_at = $2
+		WHERE employee_id = $1 AND is_active
+		RETURNING failed_unlock_attempts`,
+		employeeID, at,
+	).Scan(&attempts)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("record agent unlock failure: %w", err)
+	}
+	return attempts, nil
+}
+
+func (r *CSAgentCredentialRepo) ClearUnlockFailures(ctx context.Context, employeeID string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE cs_agents
+		SET failed_unlock_attempts = 0
+		WHERE employee_id = $1 AND failed_unlock_attempts > 0`, employeeID)
+	if err != nil {
+		return fmt.Errorf("clear agent unlock failures: %w", err)
+	}
+	return nil
+}

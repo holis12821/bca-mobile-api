@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/pinrule"
 )
 
 // TerminalService mengurus pendaftaran terminal, tiga gerbang kesiapan, dan aktivasi.
@@ -20,6 +21,12 @@ type TerminalService struct {
 	sessions    AgentSessionRepository
 	audit       AuditEventRepository
 
+	// creds dan hasher hanya dipakai jalur kunci meja: PIN-nya milik PETUGAS, tapi yang
+	// terkunci adalah TERMINAL, jadi keduanya bertemu di service ini. Nil membuat jalur
+	// kunci meja menolak, bukan panic.
+	creds  AgentCredentialRepository
+	hasher PasswordHasher
+
 	clock func() time.Time
 }
 
@@ -28,6 +35,9 @@ type TerminalServiceConfig struct {
 	Supervisors SupervisorRepository
 	Sessions    AgentSessionRepository
 	Audit       AuditEventRepository
+
+	Creds  AgentCredentialRepository
+	Hasher PasswordHasher
 
 	Clock func() time.Time
 }
@@ -42,6 +52,8 @@ func NewTerminalService(cfg TerminalServiceConfig) *TerminalService {
 		supervisors: cfg.Supervisors,
 		sessions:    cfg.Sessions,
 		audit:       cfg.Audit,
+		creds:       cfg.Creds,
+		hasher:      cfg.Hasher,
 		clock:       clock,
 	}
 }
@@ -387,7 +399,12 @@ func (s *TerminalService) promoteIfReady(ctx context.Context, sess *SessionConte
 	if err != nil {
 		return err
 	}
-	if !state.CanActivate || state.Status == TerminalOnline || state.Status == TerminalReady {
+	// TerminalLocked ikut dikecualikan: loket terkunci sudah lewat aktivasi, dan
+	// menurunkannya ke READY akan menabrak CHECK cs_terminals_locked_consistent —
+	// locked_at-nya masih terisi. Petugas yang mengulang healthcheck dari balik tirai
+	// tidak sedang meminta loketnya dibuka.
+	if !state.CanActivate || state.Status == TerminalOnline || state.Status == TerminalReady ||
+		state.Status == TerminalLocked {
 		return nil
 	}
 	return s.terminals.SetStatus(ctx, sess.TerminalID, TerminalReady, now)
@@ -407,4 +424,447 @@ func newAuthorizationRef() (string, error) {
 		return "", err
 	}
 	return "BCA-AUTH-" + strings.ToUpper(hex.EncodeToString(raw)), nil
+}
+
+// --- Kunci meja petugas (clean desk policy) ---
+//
+// Apa yang DIJAMIN jalur ini: layar petugas berhenti menampilkan video, nama, dan NIK
+// nasabah; loket berhenti menerima panggilan baru; ada baris audit yang mencatat kapan
+// dan oleh siapa.
+//
+// Apa yang TIDAK dijaminnya: kerahasiaan data terhadap orang yang menguasai terminal
+// fisiknya. Siapa pun yang memegang PC-nya bisa menutup aplikasi atau membaca memorinya.
+// Itu pekerjaan kebijakan perangkat — screen lock OS, disk encryption — bukan API ini.
+// Jangan menulis kalimat di response atau dokumen yang terbaca sebagai janji lebih besar.
+
+// LockDesk menurunkan tirai: terminal ONLINE → LOCKED.
+//
+// Tiga hal yang SENGAJA tidak terjadi di sini, dan ketiganya diuji:
+//
+//  1. Panggilan video yang sedang berjalan TIDAK diputus. Petugas mengunci layar karena
+//     ada orang lain mendekat, bukan karena ingin memutus nasabah yang sedang
+//     diverifikasi. onboarding_video_calls tidak disentuh, hub signaling tidak ditutup,
+//     dan `call_ended` tidak dikirim.
+//  2. Sesi petugas tidak diperpanjang dan tidak dihentikan. expires_at berjalan terus
+//     selama terkunci; giliran yang habis di balik tirai berakhir seperti biasa.
+//  3. last_seen_at tidak disentuh. Loket terkunci adalah loket yang tidak ditunggui, dan
+//     menandainya "baru terlihat" tiap kali tirainya diperiksa akan membuat deteksi sesi
+//     terlantar buta.
+//
+// Antreannya berhenti mengalir tanpa kode tambahan: AssertOnline menuntut status ==
+// ONLINE persis, dan dashboard menghitung can_take_calls dari pembacaan yang sama.
+func (s *TerminalService) LockDesk(
+	ctx context.Context, sess *SessionContext, req LockDeskRequest, ip, userAgent string,
+) (*DeskLockState, error) {
+	if s.creds == nil || s.hasher == nil {
+		return nil, apperr.ProviderNotConfigured
+	}
+
+	reason := req.Reason
+	if reason == "" {
+		// Klien memanggil ini dari dua jalur — tombol dan pintasan papan tik — dan yang
+		// satu tidak selalu menyebut alasannya.
+		reason = LockReasonAgent
+	}
+	// FAILED_UNLOCK sengaja TIDAK diterima dari klien: ia hanya boleh lahir dari tiga
+	// kali PIN salah, dan loket yang bisa menyatakan dirinya beku atas permintaan sendiri
+	// adalah loket yang bisa memanggil supervisor tanpa pernah salah mengetik.
+	if reason != LockReasonAgent && reason != LockReasonIdle {
+		return nil, apperr.ValidationError
+	}
+
+	rec, err := s.creds.FindDeskPIN(ctx, sess.EmployeeID)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, apperr.AgentCredentialInvalid
+	}
+	if rec.DeskPINHash == "" {
+		// Mengunci tanpa punya PIN berarti mengunci diri sendiri di luar: tidak ada yang
+		// bisa diketik untuk membukanya, dan jalan keluarnya hanya lewat supervisor.
+		return nil, apperr.AgentDeskPINNotSet
+	}
+
+	t, err := s.Get(ctx, sess.TerminalID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Idempoten. Mengunci loket yang sudah terkunci menjawab keadaan yang sama, bukan
+	// 409: dua jalur klien yang berbalapan bukan galat, dan layar kunci yang menampilkan
+	// pesan error saat berhasil terkunci akan membuat petugas menekan tombolnya lagi.
+	if t.Status == TerminalLocked {
+		return s.deskLockState(t, rec, nil), nil
+	}
+	if t.Status != TerminalOnline || t.ActiveAgentID != sess.EmployeeID {
+		return nil, apperr.TerminalNotOnline
+	}
+
+	now := s.clock()
+	locked, err := s.terminals.Lock(ctx, sess.TerminalID, sess.EmployeeID, reason, now)
+	if err != nil {
+		return nil, err
+	}
+	if !locked {
+		// Keadaannya berubah di antara SELECT dan UPDATE. Dibaca ulang, bukan ditebak:
+		// yang menang balapan mungkin permintaan kunci kedua dari klien yang sama.
+		t, err = s.Get(ctx, sess.TerminalID)
+		if err != nil {
+			return nil, err
+		}
+		if t.Status == TerminalLocked {
+			return s.deskLockState(t, rec, nil), nil
+		}
+		return nil, apperr.TerminalNotOnline
+	}
+
+	s.writeAudit(ctx, EventDeskLocked, sess.EmployeeID, sess.TerminalID, &sess.SessionID,
+		map[string]any{"reason": string(reason)}, ip, userAgent)
+
+	t, err = s.Get(ctx, sess.TerminalID)
+	if err != nil {
+		return nil, err
+	}
+	return s.deskLockState(t, rec, nil), nil
+}
+
+// UnlockDesk mengangkat tirai dengan PIN meja: LOCKED → ONLINE.
+//
+// Kembali ke ONLINE, bukan READY: ketiga gerbang kesiapan tidak pernah batal oleh
+// penguncian, jadi tidak ada yang perlu diulang.
+func (s *TerminalService) UnlockDesk(
+	ctx context.Context, sess *SessionContext, req UnlockDeskRequest, ip, userAgent string,
+) (*DeskLockState, error) {
+	if s.creds == nil || s.hasher == nil {
+		return nil, apperr.ProviderNotConfigured
+	}
+	// PIN kosong ditolak SEBELUM dihitung sebagai percobaan: sebuah klien yang mengirim
+	// body kosong karena bug tidak boleh bisa membekukan loket dalam tiga permintaan.
+	if strings.TrimSpace(req.PIN) == "" {
+		return nil, apperr.ValidationError
+	}
+
+	rec, err := s.creds.FindDeskPIN(ctx, sess.EmployeeID)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, apperr.AgentCredentialInvalid
+	}
+
+	t, err := s.Get(ctx, sess.TerminalID)
+	if err != nil {
+		return nil, err
+	}
+	// Terkunci oleh ORANG LAIN dijawab sama dengan tidak terkunci: petugas yang bukan
+	// pemegangnya tidak perlu tahu keadaan tirai loket orang.
+	if t.Status != TerminalLocked || t.ActiveAgentID != sess.EmployeeID {
+		return nil, apperr.TerminalNotLocked
+	}
+	if rec.FailedUnlockAttempts >= MaxUnlockAttempts {
+		return nil, apperr.TerminalDeskFrozen
+	}
+	if rec.DeskPINHash == "" {
+		return nil, apperr.AgentDeskPINNotSet
+	}
+
+	now := s.clock()
+	ok, err := s.hasher.Verify(ctx, req.PIN, rec.DeskPINHash)
+	if err != nil {
+		// Argon2id yang gagal bukan bukti PIN-nya salah, dan bukan alasan menaikkan
+		// penghitung yang membekukan loket.
+		return nil, fmt.Errorf("verify desk pin: %w", err)
+	}
+	if !ok {
+		return nil, s.recordUnlockFailure(ctx, sess, now, ip, userAgent)
+	}
+
+	unlocked, err := s.terminals.Unlock(ctx, sess.TerminalID, sess.EmployeeID, now)
+	if err != nil {
+		return nil, err
+	}
+	if !unlocked {
+		return nil, apperr.TerminalNotLocked
+	}
+	if err := s.creds.ClearUnlockFailures(ctx, sess.EmployeeID); err != nil {
+		return nil, err
+	}
+
+	return s.finishUnlock(ctx, sess, t, rec, now, nil, ip, userAgent)
+}
+
+// UnlockOverride membuka loket BEKU dengan dual-control yang sudah ada.
+//
+// Dua bukti diminta bersamaan dan keduanya perlu: authorization_ref membuktikan
+// SUPERVISOR HADIR, password membuktikan PETUGASNYA MASIH ORANG YANG SAMA. Supervisor
+// sendirian tidak boleh membuka meja orang lain lalu meninggalkannya terbuka; petugas
+// sendirian sudah terbukti tidak ingat PIN-nya.
+//
+// Rujukan otorisasinya dibaca dari gerbang SUPERVISOR_AUTH sesi ini — mekanisme yang
+// SAMA dengan kesiapan terminal, bukan yang kedua. Mockup menyebut "otorisasi FISIK
+// supervisor"; tidak ada mekanisme kehadiran fisik di sistem ini, dan endpoint yang
+// mengaku memverifikasinya akan berbohong.
+func (s *TerminalService) UnlockOverride(
+	ctx context.Context, sess *SessionContext, req UnlockOverrideRequest, ip, userAgent string,
+) (*DeskLockState, error) {
+	if s.creds == nil || s.hasher == nil {
+		return nil, apperr.ProviderNotConfigured
+	}
+
+	ref := strings.TrimSpace(req.AuthorizationRef)
+	if ref == "" || req.Password == "" {
+		return nil, apperr.ValidationError
+	}
+	if req.NewPIN != "" {
+		// Divalidasi SEBELUM apa pun dibuka: PIN baru yang ditolak setelah tirainya
+		// terangkat akan meninggalkan petugas dengan PIN lama yang ia kira sudah diganti.
+		if err := pinrule.ValidatePIN(req.NewPIN); err != nil {
+			return nil, err
+		}
+	}
+
+	t, err := s.Get(ctx, sess.TerminalID)
+	if err != nil {
+		return nil, err
+	}
+	if t.Status != TerminalLocked || t.ActiveAgentID != sess.EmployeeID {
+		return nil, apperr.TerminalNotLocked
+	}
+
+	now := s.clock()
+	gate, err := s.findSupervisorGate(ctx, sess.SessionID, ref, now)
+	if err != nil {
+		return nil, err
+	}
+
+	// Kata sandi petugas, lewat jalur lockout yang SUDAH ada. Jalur ini tidak boleh jadi
+	// tempat menebak kata sandi tanpa batas hanya karena ia bernama "override".
+	login, err := s.creds.FindForLogin(ctx, sess.EmployeeID)
+	if err != nil {
+		return nil, err
+	}
+	if login == nil {
+		return nil, apperr.AgentCredentialInvalid
+	}
+	if login.LockedUntil != nil && login.LockedUntil.After(now) {
+		return nil, lockedError(login.LockedUntil.Sub(now))
+	}
+	if login.PasswordHash == "" {
+		return nil, apperr.AgentPasswordNotSet
+	}
+	ok, err := s.hasher.Verify(ctx, req.Password, login.PasswordHash)
+	if err != nil {
+		return nil, fmt.Errorf("verify agent password: %w", err)
+	}
+	if !ok {
+		lockedUntil, lerr := s.creds.RecordLoginFailure(ctx, sess.EmployeeID, MaxFailedLogins, LoginLockout, now)
+		if lerr != nil {
+			return nil, lerr
+		}
+		s.writeAudit(ctx, EventDeskUnlockFailed, sess.EmployeeID, sess.TerminalID,
+			&sess.SessionID, map[string]any{
+				"override":          true,
+				"reason":            "password_invalid",
+				"authorization_ref": ref,
+			}, ip, userAgent)
+		if lockedUntil != nil && lockedUntil.After(now) {
+			return nil, lockedError(lockedUntil.Sub(now))
+		}
+		return nil, apperr.AgentCredentialInvalid
+	}
+	if err := s.creds.ClearLoginFailures(ctx, sess.EmployeeID); err != nil {
+		return nil, err
+	}
+
+	rec, err := s.creds.FindDeskPIN(ctx, sess.EmployeeID)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, apperr.AgentCredentialInvalid
+	}
+
+	// PIN baru disetel SEBELUM tirainya diangkat. Kalau penyetelannya gagal, loketnya
+	// tetap beku dan supervisor masih di sampingnya — jauh lebih murah daripada loket
+	// terbuka dengan PIN lama yang petugasnya sudah lupa.
+	if req.NewPIN != "" {
+		hash, herr := s.hasher.Hash(ctx, req.NewPIN)
+		if herr != nil {
+			return nil, fmt.Errorf("hash desk pin: %w", herr)
+		}
+		// SetDeskPIN sekaligus mengosongkan failed_unlock_attempts.
+		if serr := s.creds.SetDeskPIN(ctx, sess.EmployeeID, hash, now); serr != nil {
+			return nil, serr
+		}
+		s.writeAudit(ctx, EventDeskPINSet, sess.EmployeeID, sess.TerminalID, &sess.SessionID,
+			map[string]any{"first_time": rec.DeskPINHash == "", "override": true}, ip, userAgent)
+		rec.DeskPINHash = hash
+	} else if cerr := s.creds.ClearUnlockFailures(ctx, sess.EmployeeID); cerr != nil {
+		return nil, cerr
+	}
+
+	unlocked, err := s.terminals.Unlock(ctx, sess.TerminalID, sess.EmployeeID, now)
+	if err != nil {
+		return nil, err
+	}
+	if !unlocked {
+		return nil, apperr.TerminalNotLocked
+	}
+
+	return s.finishUnlock(ctx, sess, t, rec, now, map[string]any{
+		"override":          true,
+		"authorization_ref": ref,
+		"supervisor_id":     gate.SupervisorID,
+	}, ip, userAgent)
+}
+
+// DeskLockState menjawab `GET /internal/v1/terminals/lock-state`.
+//
+// Inilah yang membuat tirai selamat dari proses yang mati: renderer yang di-reload atau
+// PC yang mati kehilangan tirai lokalnya bersama PIN-nya, dan tanpa endpoint ini aplikasi
+// yang dibuka kembali akan menampilkan layar nasabah.
+//
+// Dipanggil SEKALI saat pemulihan sesi, di tempat yang sama dengan `auth/me`. Bukan
+// endpoint polling: keadaan kunci hanya berubah oleh tindakan petugas itu sendiri, dan
+// klien sudah tahu tindakannya sendiri.
+func (s *TerminalService) DeskLockState(ctx context.Context, sess *SessionContext) (*DeskLockState, error) {
+	if s.creds == nil {
+		return nil, apperr.ProviderNotConfigured
+	}
+
+	t, err := s.Get(ctx, sess.TerminalID)
+	if err != nil {
+		return nil, err
+	}
+	rec, err := s.creds.FindDeskPIN(ctx, sess.EmployeeID)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, apperr.AgentCredentialInvalid
+	}
+	return s.deskLockState(t, rec, nil), nil
+}
+
+// recordUnlockFailure menaikkan penghitung, membekukan loket pada percobaan ketiga, dan
+// mengembalikan galat yang pantas.
+//
+// DESK_UNLOCK_FAILED ditulis pada SETIAP kegagalan, bukan hanya yang ketiga: pola
+// percobaan yang berhenti di dua, berulang tiap hari, di loket yang sama, adalah justru
+// yang dicari pemeriksa.
+func (s *TerminalService) recordUnlockFailure(
+	ctx context.Context, sess *SessionContext, now time.Time, ip, userAgent string,
+) error {
+	attempts, err := s.creds.RecordUnlockFailure(ctx, sess.EmployeeID, now)
+	if err != nil {
+		return err
+	}
+
+	frozen := attempts >= MaxUnlockAttempts
+	if frozen {
+		// Statusnya TETAP LOCKED; yang berubah hanya alasannya. Pembekuan adalah alasan
+		// terkunci, bukan keadaan baru.
+		if err := s.terminals.FreezeLock(ctx, sess.TerminalID, now); err != nil {
+			return err
+		}
+	}
+
+	s.writeAudit(ctx, EventDeskUnlockFailed, sess.EmployeeID, sess.TerminalID, &sess.SessionID,
+		map[string]any{"attempts": attempts, "frozen": frozen}, ip, userAgent)
+
+	if frozen {
+		return apperr.TerminalDeskFrozen
+	}
+
+	// Sisa percobaan ikut dikirim: tanpa angkanya layar kunci hanya bisa berkata "salah",
+	// dan petugas tidak tahu ia selangkah dari membekukan loketnya sendiri.
+	e := apperr.AgentDeskPINInvalid
+	e.Details = map[string]any{"attempts_remaining": MaxUnlockAttempts - attempts}
+	return e
+}
+
+// finishUnlock menulis jejak dan menyusun jawaban untuk kedua jalur pembukaan.
+func (s *TerminalService) finishUnlock(
+	ctx context.Context, sess *SessionContext, before *Terminal, rec *AgentDeskPINRecord,
+	now time.Time, extra map[string]any, ip, userAgent string,
+) (*DeskLockState, error) {
+	details := map[string]any{"reason": string(before.LockedReason)}
+	for k, v := range extra {
+		details[k] = v
+	}
+
+	var duration *int
+	if before.LockedAt != nil {
+		secs := int(now.Sub(*before.LockedAt).Seconds())
+		if secs < 0 {
+			secs = 0
+		}
+		duration = &secs
+		details["locked_duration_seconds"] = secs
+	}
+
+	s.writeAudit(ctx, EventDeskUnlocked, sess.EmployeeID, sess.TerminalID, &sess.SessionID,
+		details, ip, userAgent)
+
+	t, err := s.Get(ctx, sess.TerminalID)
+	if err != nil {
+		return nil, err
+	}
+	// Penghitungnya sudah dikosongkan di database; salinan di memori ini menyusul supaya
+	// attempts_remaining di jawaban tidak menampilkan angka yang sudah basi.
+	rec.FailedUnlockAttempts = 0
+	return s.deskLockState(t, rec, duration), nil
+}
+
+// findSupervisorGate mencari otorisasi dual-control yang masih berlaku untuk sesi ini.
+//
+// Membaca gerbang SUPERVISOR_AUTH yang sudah dicatat AuthorizeSupervisor, bukan
+// memverifikasi token supervisor lagi: tanda terimanya memang yang dipegang klien, dan
+// mekanisme kedua untuk hal yang sama adalah mekanisme kedua untuk disalahgunakan.
+func (s *TerminalService) findSupervisorGate(
+	ctx context.Context, sessionID uuid.UUID, ref string, now time.Time,
+) (*GateRecord, error) {
+	records, err := s.terminals.ListGates(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range records {
+		r := records[i]
+		if r.Gate != GateSupervisorAuth || r.AuthorizationRef != ref {
+			continue
+		}
+		if !r.ExpiresAt.After(now) {
+			// Kedaluwarsa dijawab sama dengan tidak ada: keduanya diselesaikan dengan
+			// meminta supervisor menandatangani lagi.
+			return nil, apperr.SupervisorTokenInvalid
+		}
+		return &r, nil
+	}
+	return nil, apperr.SupervisorTokenInvalid
+}
+
+// deskLockState menyusun jawaban dari terminal dan kredensial petugas.
+func (s *TerminalService) deskLockState(t *Terminal, rec *AgentDeskPINRecord, duration *int) *DeskLockState {
+	remaining := MaxUnlockAttempts - rec.FailedUnlockAttempts
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	locked := t.Status == TerminalLocked
+	return &DeskLockState{
+		TerminalID:            t.TerminalID,
+		Status:                t.Status,
+		Locked:                locked,
+		LockedAt:              t.LockedAt,
+		LockedReason:          t.LockedReason,
+		LockedDurationSeconds: duration,
+
+		// Beku hanya berarti sesuatu selama tirainya turun. Penghitung yang tertinggal di
+		// tiga pada loket yang sudah terbuka bukan pembekuan, dan melaporkannya sebagai
+		// beku akan membuat layar menampilkan tombol supervisor yang tidak dibutuhkan.
+		Frozen:            locked && rec.FailedUnlockAttempts >= MaxUnlockAttempts,
+		AttemptsRemaining: remaining,
+		DeskPINSet:        rec.DeskPINHash != "",
+	}
 }

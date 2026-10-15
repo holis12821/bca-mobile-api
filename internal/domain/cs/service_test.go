@@ -465,6 +465,13 @@ func (m *mockTerminalLookup) UpsertGate(context.Context, *GateRecord) error { re
 func (m *mockTerminalLookup) ListGates(context.Context, uuid.UUID) ([]GateRecord, error) {
 	return nil, nil
 }
+func (m *mockTerminalLookup) Lock(context.Context, string, string, LockReason, time.Time) (bool, error) {
+	return false, nil
+}
+func (m *mockTerminalLookup) Unlock(context.Context, string, string, time.Time) (bool, error) {
+	return false, nil
+}
+func (m *mockTerminalLookup) FreezeLock(context.Context, string, time.Time) error { return nil }
 
 // clockAt membekukan waktu pada satu instan WIB.
 func clockAt(wib string) func() time.Time {
@@ -587,6 +594,11 @@ func TestDashboard_CanTakeCallsOnlyWhenOnline(t *testing.T) {
 		{TerminalReady, false},
 		{TerminalRegistered, false},
 		{TerminalOffline, false},
+
+		// Kunci meja (000043): loket terkunci berhenti jadi kandidat penugasan tanpa
+		// satu baris kode pun di jalur antrean. Inilah yang membedakannya dari tirai
+		// lokal di aplikasi desktop, yang tidak pernah bisa menahan nasabah.
+		{TerminalLocked, false},
 	}
 
 	for _, tc := range cases {
@@ -1104,5 +1116,741 @@ func TestValidAuditEventType(t *testing.T) {
 		if ValidAuditEventType(ev) {
 			t.Errorf("%q tidak boleh sah", ev)
 		}
+	}
+}
+
+// --- Kunci meja petugas (clean desk policy, migrasi 000043) ---
+
+// fakeDeskTerminals BERSTATUS, tidak seperti mockTerminalLookup: seluruh gunanya adalah
+// memeriksa transisi ONLINE → LOCKED → ONLINE, dan mock yang selalu menjawab hal yang
+// sama tidak bisa membuktikan satu pun dari enam aturan di bawah.
+type fakeDeskTerminals struct {
+	t     *Terminal
+	gates []GateRecord
+
+	// Jejak panggilan yang TIDAK boleh terjadi saat mengunci.
+	deactivateCalls int
+	setStatusCalls  int
+}
+
+func (f *fakeDeskTerminals) Register(context.Context, *Terminal) error { return nil }
+
+func (f *fakeDeskTerminals) FindByID(context.Context, string) (*Terminal, error) {
+	// Salinan, bukan pointer: service menyimpan keadaan SEBELUM membuka untuk menghitung
+	// lamanya terkunci, dan pointer bersama akan membuatnya menghitung dari nilai yang
+	// sudah ikut berubah.
+	cp := *f.t
+	return &cp, nil
+}
+
+// Activate meniru UPDATE sungguhan: ia ikut mengosongkan tirai, supaya petugas
+// berikutnya mengambil alih loket yang bersih (aturan 6).
+func (f *fakeDeskTerminals) Activate(_ context.Context, _, employeeID string, at time.Time) error {
+	f.t.Status = TerminalOnline
+	f.t.ActiveAgentID = employeeID
+	f.t.ActivatedAt = &at
+	f.t.LockedAt = nil
+	f.t.LockedReason = ""
+	return nil
+}
+
+// Deactivate ikut mengosongkan tirai, seperti SQL-nya (aturan 5).
+func (f *fakeDeskTerminals) Deactivate(_ context.Context, _ string, _ time.Time) (bool, error) {
+	f.deactivateCalls++
+	if f.t.Status == TerminalOffline {
+		return false, nil
+	}
+	f.t.Status = TerminalOffline
+	f.t.ActiveAgentID = ""
+	f.t.ActivatedAt = nil
+	f.t.LockedAt = nil
+	f.t.LockedReason = ""
+	return true, nil
+}
+
+func (f *fakeDeskTerminals) SetStatus(_ context.Context, _ string, status TerminalStatus, _ time.Time) error {
+	f.setStatusCalls++
+	f.t.Status = status
+	return nil
+}
+
+func (f *fakeDeskTerminals) UpsertGate(context.Context, *GateRecord) error { return nil }
+
+func (f *fakeDeskTerminals) ListGates(context.Context, uuid.UUID) ([]GateRecord, error) {
+	return f.gates, nil
+}
+
+func (f *fakeDeskTerminals) Lock(_ context.Context, _, employeeID string, reason LockReason, at time.Time) (bool, error) {
+	if f.t.Status != TerminalOnline || f.t.ActiveAgentID != employeeID {
+		return false, nil
+	}
+	f.t.Status = TerminalLocked
+	f.t.LockedAt = &at
+	f.t.LockedReason = reason
+	return true, nil
+}
+
+func (f *fakeDeskTerminals) Unlock(_ context.Context, _, employeeID string, _ time.Time) (bool, error) {
+	if f.t.Status != TerminalLocked || f.t.ActiveAgentID != employeeID {
+		return false, nil
+	}
+	f.t.Status = TerminalOnline
+	f.t.LockedAt = nil
+	f.t.LockedReason = ""
+	return true, nil
+}
+
+func (f *fakeDeskTerminals) FreezeLock(context.Context, string, time.Time) error {
+	f.t.LockedReason = LockReasonFailedUnlock
+	return nil
+}
+
+type fakeDeskCreds struct {
+	login   *AgentLoginRecord
+	pinHash string
+	failed  int
+
+	setPINCalls  int
+	loginFailure int
+}
+
+func (f *fakeDeskCreds) FindForLogin(context.Context, string) (*AgentLoginRecord, error) {
+	return f.login, nil
+}
+
+func (f *fakeDeskCreds) SetPassword(context.Context, string, string, time.Time) error { return nil }
+
+func (f *fakeDeskCreds) RecordLoginFailure(_ context.Context, _ string, max int, lockFor time.Duration, now time.Time) (*time.Time, error) {
+	f.loginFailure++
+	if f.loginFailure >= max {
+		until := now.Add(lockFor)
+		if f.login != nil {
+			f.login.LockedUntil = &until
+		}
+		return &until, nil
+	}
+	return nil, nil
+}
+
+func (f *fakeDeskCreds) ClearLoginFailures(context.Context, string) error {
+	f.loginFailure = 0
+	return nil
+}
+
+func (f *fakeDeskCreds) FindDeskPIN(_ context.Context, employeeID string) (*AgentDeskPINRecord, error) {
+	return &AgentDeskPINRecord{
+		EmployeeID:           employeeID,
+		DeskPINHash:          f.pinHash,
+		FailedUnlockAttempts: f.failed,
+	}, nil
+}
+
+func (f *fakeDeskCreds) SetDeskPIN(_ context.Context, _, pinHash string, _ time.Time) error {
+	f.setPINCalls++
+	f.pinHash = pinHash
+	f.failed = 0
+	return nil
+}
+
+func (f *fakeDeskCreds) RecordUnlockFailure(context.Context, string, time.Time) (int, error) {
+	f.failed++
+	return f.failed, nil
+}
+
+func (f *fakeDeskCreds) ClearUnlockFailures(context.Context, string) error {
+	f.failed = 0
+	return nil
+}
+
+// recordingSessions membuktikan aturan 3 dan 4: sesinya tidak disentuh sama sekali.
+type recordingSessions struct {
+	endCalls   int
+	touchCalls int
+}
+
+func (r *recordingSessions) Create(context.Context, *AgentSession, string) error { return nil }
+func (r *recordingSessions) FindByToken(context.Context, string) (*SessionContext, error) {
+	return nil, nil
+}
+func (r *recordingSessions) FindLiveByEmployee(context.Context, string) (*AgentSession, error) {
+	return nil, nil
+}
+func (r *recordingSessions) End(context.Context, uuid.UUID, string, time.Time) (bool, error) {
+	r.endCalls++
+	return true, nil
+}
+func (r *recordingSessions) Touch(context.Context, uuid.UUID, time.Time) error {
+	r.touchCalls++
+	return nil
+}
+
+type deskFixture struct {
+	svc       *TerminalService
+	terminals *fakeDeskTerminals
+	creds     *fakeDeskCreds
+	sessions  *recordingSessions
+	audit     *mockAuditEvents
+	sess      *SessionContext
+	now       time.Time
+}
+
+// newDeskFixture menyiapkan petugas yang sudah ONLINE dengan PIN meja "730514".
+func newDeskFixture(t *testing.T) *deskFixture {
+	t.Helper()
+
+	clock := clockAt("2026-10-14 09:45:00")
+	now := clock()
+	activated := now.Add(-2 * time.Hour)
+
+	terminals := &fakeDeskTerminals{t: &Terminal{
+		TerminalID:    "CS-FL-04",
+		Workstation:   "Loket 4",
+		Location:      "KCU Semarang",
+		Status:        TerminalOnline,
+		ActiveAgentID: "CS-1042",
+		ActivatedAt:   &activated,
+	}}
+	creds := &fakeDeskCreds{
+		pinHash: "argon2:730514",
+		login:   &AgentLoginRecord{EmployeeID: "CS-1042", Name: "Sarah", PasswordHash: "argon2:kata-sandi-panjang"},
+	}
+	sessions := &recordingSessions{}
+	audit := &mockAuditEvents{}
+
+	return &deskFixture{
+		svc: NewTerminalService(TerminalServiceConfig{
+			Terminals: terminals,
+			Sessions:  sessions,
+			Audit:     audit,
+			Creds:     creds,
+			Hasher:    stubPasswordHasher{},
+			Clock:     clock,
+		}),
+		terminals: terminals,
+		creds:     creds,
+		sessions:  sessions,
+		audit:     audit,
+		sess: &SessionContext{
+			SessionID:  uuid.New(),
+			EmployeeID: "CS-1042",
+			Name:       "Sarah",
+			TerminalID: "CS-FL-04",
+			ExpiresAt:  now.Add(7 * time.Hour),
+		},
+		now: now,
+	}
+}
+
+func (f *deskFixture) lock(t *testing.T) *DeskLockState {
+	t.Helper()
+	state, err := f.svc.LockDesk(context.Background(), f.sess, LockDeskRequest{}, "10.0.0.1", "cs-desktop")
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	return state
+}
+
+func (f *deskFixture) hasEvent(eventType string) bool {
+	for _, ev := range f.audit.inserted {
+		if ev.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func codeOf(err error) string { return apperr.From(err).Code }
+
+// Mengunci memindahkan terminal ke LOCKED tanpa melepas pemegangnya.
+//
+// active_agent_id harus tetap terisi: melepasnya akan membuat unlock tidak tahu siapa
+// yang berhak membuka, dan loket terkunci jadi loket yang tidak bisa dibuka siapa pun.
+func TestLockDesk_MovesTerminalToLockedAndKeepsAgent(t *testing.T) {
+	f := newDeskFixture(t)
+
+	state := f.lock(t)
+
+	if state.Status != TerminalLocked || !state.Locked {
+		t.Fatalf("status = %s locked = %v, mau LOCKED/true", state.Status, state.Locked)
+	}
+	if state.LockedReason != LockReasonAgent {
+		t.Errorf("reason = %q, mau AGENT (default saat body kosong)", state.LockedReason)
+	}
+	if f.terminals.t.ActiveAgentID != "CS-1042" {
+		t.Error("active_agent_id tidak boleh dilepas saat mengunci")
+	}
+	if state.AttemptsRemaining != MaxUnlockAttempts {
+		t.Errorf("attempts_remaining = %d, mau %d", state.AttemptsRemaining, MaxUnlockAttempts)
+	}
+	if !f.hasEvent(EventDeskLocked) {
+		t.Error("DESK_LOCKED harus tercatat")
+	}
+}
+
+// Aturan 1, 3, dan 4 sekaligus: mengunci TIDAK menyentuh sesi petugas.
+//
+// Panggilan video yang sedang berjalan juga tidak diputus — dibuktikan secara struktural:
+// TerminalService tidak memegang satu pun repository panggilan atau hub signaling, jadi
+// tidak ada jalan baginya memutus apa pun. Yang bisa diuji di sini adalah sisanya: sesi
+// tidak ditutup (aturan 3) dan last_seen_at tidak disentuh (aturan 4).
+func TestLockDesk_DoesNotTouchSession(t *testing.T) {
+	f := newDeskFixture(t)
+	before := f.sess.ExpiresAt
+
+	f.lock(t)
+
+	if f.sessions.endCalls != 0 {
+		t.Error("mengunci layar tidak boleh menutup sesi petugas")
+	}
+	if f.sessions.touchCalls != 0 {
+		t.Error("last_seen_at tidak boleh disentuh: loket terkunci adalah loket yang tidak ditunggui")
+	}
+	if !f.sess.ExpiresAt.Equal(before) {
+		t.Error("tenggat sesi tidak boleh diperpanjang oleh penguncian")
+	}
+	if f.terminals.deactivateCalls != 0 {
+		t.Error("mengunci bukan menonaktifkan: terminal tidak boleh jatuh ke OFFLINE")
+	}
+}
+
+// Aturan 2: antrean berhenti mengalir. AssertOnline adalah penjaga Rule 4 yang dipanggil
+// `agent-token`, dan ia menuntut ONLINE persis.
+func TestLockDesk_StopsQueueAssignment(t *testing.T) {
+	f := newDeskFixture(t)
+	ctx := context.Background()
+
+	if err := f.svc.AssertOnline(ctx, "CS-FL-04", "CS-1042"); err != nil {
+		t.Fatalf("prasyarat: loket harus bisa menerima panggilan sebelum dikunci: %v", err)
+	}
+
+	f.lock(t)
+
+	err := f.svc.AssertOnline(ctx, "CS-FL-04", "CS-1042")
+	if codeOf(err) != apperr.TerminalNotOnline.Code {
+		t.Fatalf("setelah terkunci AssertOnline = %v, mau TERMINAL_NOT_ONLINE", err)
+	}
+}
+
+// Idempoten. Klien memanggil ini dari tombol DAN pintasan papan tik; balapan di antara
+// keduanya bukan galat.
+func TestLockDesk_IsIdempotent(t *testing.T) {
+	f := newDeskFixture(t)
+
+	first := f.lock(t)
+	second := f.lock(t)
+
+	if second.Status != TerminalLocked {
+		t.Fatalf("kunci kedua = %s, mau tetap LOCKED", second.Status)
+	}
+	if first.LockedAt == nil || second.LockedAt == nil || !first.LockedAt.Equal(*second.LockedAt) {
+		t.Error("locked_at tidak boleh berubah oleh penguncian kedua")
+	}
+}
+
+// Mengunci tanpa pernah menyetel PIN berarti mengunci diri sendiri di luar.
+func TestLockDesk_RefusesWithoutDeskPIN(t *testing.T) {
+	f := newDeskFixture(t)
+	f.creds.pinHash = ""
+
+	_, err := f.svc.LockDesk(context.Background(), f.sess, LockDeskRequest{}, "", "")
+	if codeOf(err) != apperr.AgentDeskPINNotSet.Code {
+		t.Fatalf("err = %v, mau AGENT_DESK_PIN_NOT_SET", err)
+	}
+	if f.terminals.t.Status != TerminalOnline {
+		t.Error("loket tidak boleh berubah saat penguncian ditolak")
+	}
+}
+
+// Hanya ONLINE yang bisa dikunci. Loket READY belum menerima nasabah, jadi tidak ada
+// yang perlu ditutupi.
+func TestLockDesk_RefusesWhenNotOnline(t *testing.T) {
+	f := newDeskFixture(t)
+	f.terminals.t.Status = TerminalReady
+
+	_, err := f.svc.LockDesk(context.Background(), f.sess, LockDeskRequest{}, "", "")
+	if codeOf(err) != apperr.TerminalNotOnline.Code {
+		t.Fatalf("err = %v, mau TERMINAL_NOT_ONLINE", err)
+	}
+}
+
+// FAILED_UNLOCK tidak boleh datang dari klien: loket yang bisa menyatakan dirinya beku
+// atas permintaan sendiri adalah loket yang bisa memanggil supervisor tanpa pernah salah.
+func TestLockDesk_RejectsFailedUnlockReasonFromClient(t *testing.T) {
+	f := newDeskFixture(t)
+
+	_, err := f.svc.LockDesk(context.Background(), f.sess,
+		LockDeskRequest{Reason: LockReasonFailedUnlock}, "", "")
+	if codeOf(err) != apperr.ValidationError.Code {
+		t.Fatalf("err = %v, mau VALIDATION_ERROR", err)
+	}
+}
+
+// Membuka dengan PIN benar mengembalikan loket ke ONLINE — bukan READY, karena gerbang
+// kesiapannya tidak pernah batal — dan melaporkan berapa lama ia ditinggalkan.
+func TestUnlockDesk_RestoresOnlineAndReportsDuration(t *testing.T) {
+	f := newDeskFixture(t)
+	f.lock(t)
+
+	// Tiga menit berlalu di balik tirai.
+	locked := f.now
+	f.svc.clock = func() time.Time { return locked.Add(184 * time.Second) }
+
+	state, err := f.svc.UnlockDesk(context.Background(), f.sess,
+		UnlockDeskRequest{PIN: "730514"}, "10.0.0.1", "cs-desktop")
+	if err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+
+	if state.Status != TerminalOnline || state.Locked {
+		t.Fatalf("status = %s locked = %v, mau ONLINE/false", state.Status, state.Locked)
+	}
+	if state.LockedDurationSeconds == nil || *state.LockedDurationSeconds != 184 {
+		t.Errorf("locked_duration_seconds = %v, mau 184", state.LockedDurationSeconds)
+	}
+	if f.creds.failed != 0 {
+		t.Errorf("failed_unlock_attempts = %d, mau 0 setelah berhasil", f.creds.failed)
+	}
+	if !f.hasEvent(EventDeskUnlocked) {
+		t.Error("DESK_UNLOCKED harus tercatat")
+	}
+}
+
+// Setiap kegagalan dicatat, bukan hanya yang ketiga: pola percobaan yang berhenti di dua,
+// berulang tiap hari, di loket yang sama, adalah justru yang dicari pemeriksa.
+func TestUnlockDesk_CountsDownAndFreezesOnThirdFailure(t *testing.T) {
+	f := newDeskFixture(t)
+	f.lock(t)
+	ctx := context.Background()
+
+	for _, want := range []int{2, 1} {
+		_, uerr := f.svc.UnlockDesk(ctx, f.sess, UnlockDeskRequest{PIN: "000000"}, "", "")
+		if codeOf(uerr) != apperr.AgentDeskPINInvalid.Code {
+			t.Fatalf("err = %v, mau AGENT_DESK_PIN_INVALID", uerr)
+		}
+		details, _ := apperr.From(uerr).Details.(map[string]any)
+		if details["attempts_remaining"] != want {
+			t.Errorf("attempts_remaining = %v, mau %d", details["attempts_remaining"], want)
+		}
+		if f.terminals.t.Status != TerminalLocked {
+			t.Fatal("loket harus tetap terkunci setelah PIN salah")
+		}
+	}
+
+	_, err := f.svc.UnlockDesk(ctx, f.sess, UnlockDeskRequest{PIN: "000000"}, "", "")
+	if codeOf(err) != apperr.TerminalDeskFrozen.Code {
+		t.Fatalf("percobaan ketiga = %v, mau TERMINAL_DESK_FROZEN", err)
+	}
+	// Beku adalah ALASAN terkunci, bukan status keenam.
+	if f.terminals.t.Status != TerminalLocked {
+		t.Errorf("status = %s, mau tetap LOCKED", f.terminals.t.Status)
+	}
+	if f.terminals.t.LockedReason != LockReasonFailedUnlock {
+		t.Errorf("locked_reason = %q, mau FAILED_UNLOCK", f.terminals.t.LockedReason)
+	}
+
+	// PIN yang BENAR pun tidak lagi membuka: hanya supervisor yang bisa.
+	_, err = f.svc.UnlockDesk(ctx, f.sess, UnlockDeskRequest{PIN: "730514"}, "", "")
+	if codeOf(err) != apperr.TerminalDeskFrozen.Code {
+		t.Fatalf("loket beku = %v, mau TERMINAL_DESK_FROZEN", err)
+	}
+
+	var failed int
+	for _, ev := range f.audit.inserted {
+		if ev.EventType == EventDeskUnlockFailed {
+			failed++
+		}
+	}
+	if failed != 3 {
+		t.Errorf("DESK_UNLOCK_FAILED tercatat %d kali, mau 3 — setiap kegagalan, bukan hanya yang ketiga", failed)
+	}
+}
+
+// Body kosong karena bug klien tidak boleh bisa membekukan loket dalam tiga permintaan.
+func TestUnlockDesk_EmptyPINIsNotAnAttempt(t *testing.T) {
+	f := newDeskFixture(t)
+	f.lock(t)
+
+	_, err := f.svc.UnlockDesk(context.Background(), f.sess, UnlockDeskRequest{PIN: "  "}, "", "")
+	if codeOf(err) != apperr.ValidationError.Code {
+		t.Fatalf("err = %v, mau VALIDATION_ERROR", err)
+	}
+	if f.creds.failed != 0 {
+		t.Errorf("failed_unlock_attempts = %d, mau 0", f.creds.failed)
+	}
+}
+
+func TestUnlockDesk_RefusesWhenNotLocked(t *testing.T) {
+	f := newDeskFixture(t)
+
+	_, err := f.svc.UnlockDesk(context.Background(), f.sess, UnlockDeskRequest{PIN: "730514"}, "", "")
+	if codeOf(err) != apperr.TerminalNotLocked.Code {
+		t.Fatalf("err = %v, mau TERMINAL_NOT_LOCKED", err)
+	}
+}
+
+// Dual-control membuka loket beku, dan sekalian menyetel PIN baru selagi supervisor
+// masih berdiri di sampingnya.
+func TestUnlockOverride_OpensFrozenDeskAndResetsPIN(t *testing.T) {
+	f := newDeskFixture(t)
+	f.lock(t)
+	f.creds.failed = MaxUnlockAttempts
+	f.terminals.t.LockedReason = LockReasonFailedUnlock
+	f.terminals.gates = []GateRecord{{
+		SessionID:        f.sess.SessionID,
+		Gate:             GateSupervisorAuth,
+		PassedAt:         f.now.Add(-time.Hour),
+		ExpiresAt:        f.now.Add(GateTTL),
+		AuthorizationRef: "BCA-AUTH-7F3A11",
+		SupervisorID:     "SPV-002",
+	}}
+
+	state, err := f.svc.UnlockOverride(context.Background(), f.sess, UnlockOverrideRequest{
+		AuthorizationRef: "BCA-AUTH-7F3A11",
+		Password:         "kata-sandi-panjang",
+		NewPIN:           "204817",
+	}, "10.0.0.1", "cs-desktop")
+	if err != nil {
+		t.Fatalf("override: %v", err)
+	}
+
+	if state.Status != TerminalOnline || state.Frozen {
+		t.Fatalf("status = %s frozen = %v, mau ONLINE/false", state.Status, state.Frozen)
+	}
+	if f.creds.pinHash != "argon2:204817" {
+		t.Errorf("PIN baru tidak tersimpan: %q", f.creds.pinHash)
+	}
+	if f.creds.failed != 0 {
+		t.Errorf("failed_unlock_attempts = %d, mau 0", f.creds.failed)
+	}
+
+	// Jejaknya harus menyebut override DAN rujukan otorisasinya — tanpa keduanya,
+	// pembukaan dual-control tidak bisa dibedakan dari pembukaan biasa.
+	var found bool
+	for _, ev := range f.audit.inserted {
+		if ev.EventType == EventDeskUnlocked && ev.Details["override"] == true {
+			found = true
+			if ev.Details["authorization_ref"] != "BCA-AUTH-7F3A11" {
+				t.Errorf("authorization_ref = %v", ev.Details["authorization_ref"])
+			}
+			if ev.Details["supervisor_id"] != "SPV-002" {
+				t.Errorf("supervisor_id = %v", ev.Details["supervisor_id"])
+			}
+		}
+	}
+	if !found {
+		t.Error("DESK_UNLOCKED dengan override=true harus tercatat")
+	}
+}
+
+// Dua bukti, dan keduanya perlu. Supervisor sendirian tidak cukup.
+func TestUnlockOverride_NeedsBothProofs(t *testing.T) {
+	gate := func(f *deskFixture) {
+		f.terminals.gates = []GateRecord{{
+			SessionID: f.sess.SessionID, Gate: GateSupervisorAuth,
+			PassedAt: f.now.Add(-time.Hour), ExpiresAt: f.now.Add(GateTTL),
+			AuthorizationRef: "BCA-AUTH-7F3A11", SupervisorID: "SPV-002",
+		}}
+	}
+
+	cases := []struct {
+		name     string
+		setup    func(*deskFixture)
+		req      UnlockOverrideRequest
+		wantCode string
+	}{
+		{
+			name:     "rujukan otorisasi tidak dikenal",
+			setup:    gate,
+			req:      UnlockOverrideRequest{AuthorizationRef: "BCA-AUTH-PALSU", Password: "kata-sandi-panjang"},
+			wantCode: apperr.SupervisorTokenInvalid.Code,
+		},
+		{
+			name: "otorisasi supervisor kedaluwarsa",
+			setup: func(f *deskFixture) {
+				f.terminals.gates = []GateRecord{{
+					SessionID: f.sess.SessionID, Gate: GateSupervisorAuth,
+					PassedAt: f.now.Add(-9 * time.Hour), ExpiresAt: f.now.Add(-time.Hour),
+					AuthorizationRef: "BCA-AUTH-7F3A11", SupervisorID: "SPV-002",
+				}}
+			},
+			req:      UnlockOverrideRequest{AuthorizationRef: "BCA-AUTH-7F3A11", Password: "kata-sandi-panjang"},
+			wantCode: apperr.SupervisorTokenInvalid.Code,
+		},
+		{
+			name:     "kata sandi petugas salah",
+			setup:    gate,
+			req:      UnlockOverrideRequest{AuthorizationRef: "BCA-AUTH-7F3A11", Password: "salah"},
+			wantCode: apperr.AgentCredentialInvalid.Code,
+		},
+		{
+			name:     "PIN baru lemah",
+			setup:    gate,
+			req:      UnlockOverrideRequest{AuthorizationRef: "BCA-AUTH-7F3A11", Password: "kata-sandi-panjang", NewPIN: "123456"},
+			wantCode: apperr.CredWeakPIN.Code,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeskFixture(t)
+			f.lock(t)
+			f.creds.failed = MaxUnlockAttempts
+			tc.setup(f)
+
+			_, err := f.svc.UnlockOverride(context.Background(), f.sess, tc.req, "", "")
+			if codeOf(err) != tc.wantCode {
+				t.Fatalf("err = %v, mau %s", err, tc.wantCode)
+			}
+			if f.terminals.t.Status != TerminalLocked {
+				t.Error("loket harus tetap terkunci saat override ditolak")
+			}
+		})
+	}
+}
+
+// Aturan 5: logout saat terkunci tetap boleh, dan mengakhiri segalanya. Petugas yang baru
+// ingat PIN-nya setelah pulang tidak boleh meninggalkan loket beku untuk giliran
+// berikutnya.
+func TestLogout_WhileLockedClosesEverything(t *testing.T) {
+	f := newDeskFixture(t)
+	f.lock(t)
+	f.creds.failed = MaxUnlockAttempts
+
+	sessionSvc := NewAgentSessionService(AgentSessionServiceConfig{
+		Creds:     f.creds,
+		Sessions:  f.sessions,
+		Terminals: f.terminals,
+		Audit:     f.audit,
+		Hasher:    stubPasswordHasher{},
+		Clock:     func() time.Time { return f.now },
+	})
+
+	err := sessionSvc.Logout(context.Background(), f.sess.SessionID, "CS-1042", "CS-FL-04", "", "")
+	if err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+
+	if f.terminals.t.Status != TerminalOffline {
+		t.Errorf("status = %s, mau OFFLINE", f.terminals.t.Status)
+	}
+	if f.terminals.t.LockedAt != nil || f.terminals.t.LockedReason != "" {
+		t.Error("tirai harus ikut dibersihkan saat logout")
+	}
+}
+
+// Aturan 6: loket beku tidak menghalangi petugas LAIN membuka giliran di situ.
+//
+// Yang beku adalah tirai milik petugas sebelumnya — failed_unlock_attempts menempel di
+// PETUGAS, bukan di terminal — dan ia ikut selesai saat sesinya ditutup.
+func TestFrozenDesk_DoesNotBlockAnotherAgent(t *testing.T) {
+	f := newDeskFixture(t)
+	f.lock(t)
+	f.creds.failed = MaxUnlockAttempts
+	f.terminals.t.LockedReason = LockReasonFailedUnlock
+
+	// Petugas pengganti: kredensialnya sendiri, penghitungnya sendiri (nol).
+	replacement := &fakeDeskCreds{pinHash: "argon2:884210"}
+	svc := NewTerminalService(TerminalServiceConfig{
+		Terminals: f.terminals,
+		Sessions:  f.sessions,
+		Audit:     f.audit,
+		Creds:     replacement,
+		Hasher:    stubPasswordHasher{},
+		Clock:     func() time.Time { return f.now },
+	})
+	ctx := context.Background()
+
+	if err := f.terminals.Activate(ctx, "CS-FL-04", "CS-2099", f.now); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	sess := &SessionContext{
+		SessionID: uuid.New(), EmployeeID: "CS-2099", TerminalID: "CS-FL-04",
+		ExpiresAt: f.now.Add(SessionTTL),
+	}
+	state, err := svc.DeskLockState(ctx, sess)
+	if err != nil {
+		t.Fatalf("lock-state: %v", err)
+	}
+
+	if state.Locked || state.Frozen {
+		t.Fatalf("petugas pengganti mendapat locked=%v frozen=%v, mau loket bersih", state.Locked, state.Frozen)
+	}
+	if state.AttemptsRemaining != MaxUnlockAttempts {
+		t.Errorf("attempts_remaining = %d, mau %d", state.AttemptsRemaining, MaxUnlockAttempts)
+	}
+	if err := svc.AssertOnline(ctx, "CS-FL-04", "CS-2099"); err != nil {
+		t.Errorf("petugas pengganti harus bisa menerima panggilan: %v", err)
+	}
+}
+
+// PIN meja tunduk pada aturan kekuatan yang SAMA dengan PIN transaksi nasabah. Kredensial
+// yang membuka lebih sedikit boleh lebih murah; "lebih murah" bukan berarti 123456 boleh.
+func TestSetDeskPIN_EnforcesSharedStrengthRules(t *testing.T) {
+	ctx := context.Background()
+
+	for _, pin := range []string{"123456", "111111", "12345", "abcdef", "654321"} {
+		f := newDeskFixture(t)
+		f.creds.pinHash = ""
+		svc := NewAgentSessionService(AgentSessionServiceConfig{
+			Creds: f.creds, Sessions: f.sessions, Terminals: f.terminals,
+			Audit: f.audit, Hasher: stubPasswordHasher{},
+			Clock: func() time.Time { return f.now },
+		})
+
+		if _, err := svc.SetDeskPIN(ctx, f.sess, SetDeskPINRequest{NewPIN: pin}, "", ""); err == nil {
+			t.Errorf("PIN %q harus ditolak", pin)
+		}
+		if f.creds.setPINCalls != 0 {
+			t.Errorf("PIN %q: tidak boleh tersimpan", pin)
+		}
+	}
+}
+
+// Penggantian menuntut PIN lama; penyetelan PERTAMA tidak.
+func TestSetDeskPIN_RequiresCurrentPINOnlyWhenSet(t *testing.T) {
+	ctx := context.Background()
+
+	f := newDeskFixture(t)
+	f.creds.pinHash = ""
+	svc := NewAgentSessionService(AgentSessionServiceConfig{
+		Creds: f.creds, Sessions: f.sessions, Terminals: f.terminals,
+		Audit: f.audit, Hasher: stubPasswordHasher{},
+		Clock: func() time.Time { return f.now },
+	})
+
+	if _, err := svc.SetDeskPIN(ctx, f.sess, SetDeskPINRequest{NewPIN: "730514"}, "", ""); err != nil {
+		t.Fatalf("penyetelan pertama: %v", err)
+	}
+	if f.creds.pinHash != "argon2:730514" {
+		t.Fatalf("PIN tidak tersimpan: %q", f.creds.pinHash)
+	}
+
+	if _, err := svc.SetDeskPIN(ctx, f.sess, SetDeskPINRequest{NewPIN: "204817"}, "", ""); codeOf(err) != apperr.AgentDeskPINInvalid.Code {
+		t.Fatalf("ganti tanpa PIN lama = %v, mau AGENT_DESK_PIN_INVALID", err)
+	}
+	if _, err := svc.SetDeskPIN(ctx, f.sess, SetDeskPINRequest{CurrentPIN: "730514", NewPIN: "204817"}, "", ""); err != nil {
+		t.Fatalf("ganti dengan PIN lama benar: %v", err)
+	}
+}
+
+// lock-state adalah yang membuat tirai selamat dari proses yang mati.
+func TestDeskLockState_SurvivesProcessRestart(t *testing.T) {
+	f := newDeskFixture(t)
+	f.lock(t)
+
+	// Aplikasi desktop dimulai ulang: tidak ada keadaan klien yang tersisa.
+	state, err := f.svc.DeskLockState(context.Background(), f.sess)
+	if err != nil {
+		t.Fatalf("lock-state: %v", err)
+	}
+	if !state.Locked || state.Status != TerminalLocked {
+		t.Fatalf("locked = %v status = %s, mau true/LOCKED", state.Locked, state.Status)
+	}
+	if !state.DeskPINSet {
+		t.Error("desk_pin_set harus true")
+	}
+	if state.LockedAt == nil {
+		t.Error("locked_at harus terisi supaya layar bisa menampilkan sejak kapan")
 	}
 }

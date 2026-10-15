@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/holis12821/bca-mobile-api/internal/pkg/apperr"
+	"github.com/holis12821/bca-mobile-api/internal/pkg/pinrule"
 )
 
 // PasswordHasher memverifikasi dan membuat hash kata sandi.
@@ -277,6 +278,73 @@ func (s *AgentSessionService) SetPassword(ctx context.Context, employeeID string
 		"first_time": rec.PasswordHash == "",
 	}, ip, userAgent)
 	return nil
+}
+
+// SetDeskPIN menyetel atau mengganti PIN meja petugas (clean desk policy).
+//
+// Di belakang AgentSession, BUKAN AgentIdentity seperti `auth/password`: PIN meja hanya
+// berguna bagi petugas yang sedang bertugas, dan menyetelnya dari kunci API saja akan
+// membuat siapa pun yang pernah melihat kunci itu bisa menimpa PIN orang lain di luar
+// jam kerjanya.
+//
+// Yang disetel milik PETUGAS, bukan milik loket — itu sebabnya ia di grup `/auth`
+// bersama `/password`, dan itu sebabnya ia ikut pindah saat petugasnya pindah meja.
+//
+// Aturan kekuatannya dibagi dengan PIN transaksi nasabah lewat internal/pkg/pinrule:
+// PIN meja memang kredensial yang lebih murah, tapi "lebih murah" berarti ia membuka
+// lebih sedikit — bukan bahwa 123456 boleh.
+func (s *AgentSessionService) SetDeskPIN(
+	ctx context.Context, sess *SessionContext, req SetDeskPINRequest, ip, userAgent string,
+) (time.Time, error) {
+	if err := pinrule.ValidatePIN(req.NewPIN); err != nil {
+		return time.Time{}, err
+	}
+
+	rec, err := s.creds.FindDeskPIN(ctx, sess.EmployeeID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if rec == nil {
+		return time.Time{}, apperr.AgentCredentialInvalid
+	}
+
+	if rec.DeskPINHash != "" {
+		// Penggantian menuntut PIN lama. TIDAK menaikkan failed_unlock_attempts kalau
+		// salah, dan itu bukan kelalaian: pemanggilnya sudah memegang sesi hidup, jadi
+		// tirainya sudah terangkat dan tidak ada yang bisa direbut dengan menebak. Yang
+		// membekukan loket adalah tebakan di layar TERKUNCI, dan membiarkan jalur ini
+		// ikut membekukan akan memberi cara membekukan loket sendiri tanpa sengaja.
+		if req.CurrentPIN == "" {
+			return time.Time{}, apperr.AgentDeskPINInvalid
+		}
+		ok, err := s.hasher.Verify(ctx, req.CurrentPIN, rec.DeskPINHash)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("verify current desk pin: %w", err)
+		}
+		if !ok {
+			return time.Time{}, apperr.AgentDeskPINInvalid
+		}
+	}
+
+	// PasswordHasher yang SAMA (Argon2id), bukan hasher kedua yang lebih murah. Enam
+	// digit memang ruang tebak kecil; yang menjaganya adalah pembekuan setelah tiga kali
+	// gagal, bukan biaya hash-nya — tapi hash yang murah membuat tabel yang bocor bisa
+	// dipecahkan seluruhnya dalam hitungan detik.
+	hash, err := s.hasher.Hash(ctx, req.NewPIN)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("hash desk pin: %w", err)
+	}
+
+	now := s.clock()
+	if err := s.creds.SetDeskPIN(ctx, sess.EmployeeID, hash, now); err != nil {
+		return time.Time{}, err
+	}
+
+	// Isi PIN-nya TIDAK pernah masuk details — bukan angkanya, bukan petunjuknya.
+	s.writeAudit(ctx, EventDeskPINSet, sess.EmployeeID, sess.TerminalID, &sess.SessionID,
+		map[string]any{"first_time": rec.DeskPINHash == ""}, ip, userAgent)
+
+	return now, nil
 }
 
 // Resolve mengembalikan identitas pembawa token sesi, atau error 401.
