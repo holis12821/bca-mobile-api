@@ -54,6 +54,7 @@ untuk pekerjaan mendalam:
 | `twilio-sms-otp` | setup & integrasi provider SMS: kredensial Twilio, `SMS_*`, `internal/pkg/sms`, normalisasi E.164, menelusuri OTP yang tidak sampai |
 | `cs-desktop-api-integration` | kontrak 14 endpoint CS yang **sudah terbit** — auth tiga lapis, cakupan petugas, signaling, penyamaran PII |
 | `cs-desktop-workflow-backend` | **analisis selisih** untuk alur desktop CS 19 layar: identitas petugas, siklus hidup terminal, gerbang kesiapan, KPI, `NEED_REVIEW` — apa yang belum ada dan kontraknya |
+| `pr-review-backend` | rulebook review PR — hang & pool, konstanta/TTL/umur token, validasi DB vs masukan, verifikasi Redis, verdict auto-merge |
 
 File ini hanya memuat yang **tidak** ada di skill: workflow harian, jebakan
 nyata di repo ini, dan aturan di atas.

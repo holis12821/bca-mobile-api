@@ -2,7 +2,7 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    types: [opened, synchronize, ready_for_review, reopened, labeled]
 
 # One review per PR at a time: a new push supersedes the review still running
 # on the previous commit, so reviewers never read findings for stale code.
@@ -11,6 +11,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Gerbang mesin. Dijalankan sejajar dengan review, bukan sesudahnya: review AI dan
+  # test menjawab pertanyaan berbeda, dan yang gagal lebih dulu tidak perlu menunggu
+  # yang lain. Auto-merge menuntut KEDUANYA hijau.
+  #
+  # Ini juga satu-satunya tempat `make check` dijalankan di CI. Sebelum ini tidak ada,
+  # jadi satu-satunya yang memastikan test hijau adalah ingatan orang yang mengirim PR.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Lint lewat action resminya, bukan `go install`: versinya terpasang di sini,
+      # jadi lint lokal dan lint CI tidak menemukan hal yang berbeda setelah rilis
+      # golangci-lint berikutnya.
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          args: --timeout=5m
+
+      - run: go build ./...
+
+      - run: go vet ./...
+
+      # -race wajib: jalur uang punya test konkurensi, dan balapan yang lolos di sini
+      # muncul di produksi sebagai saldo yang salah, bukan sebagai test yang gagal.
+      # Test Redis/idempotency memakai testcontainers — Docker sudah ada di runner ini.
+      - run: go test -race -cover ./...
+
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -19,6 +54,8 @@ jobs:
       pull-requests: read
       issues: read
       id-token: write # required by the action's default GitHub App auth
+    outputs:
+      verdict: ${{ steps.verdict.outputs.value }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,6 +70,97 @@ jobs:
           # --allowedTools must name the inline-comment tool even though the skill's
           # own frontmatter does: the action starts that MCP server only when this
           # flag asks for it, and without it the review lands in the run log only.
+          #
+          # Write ada di daftar karena §6 rulebook menuntut berkas verdict; tanpa itu
+          # job auto-merge tidak punya apa pun untuk dibaca.
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment"
-            --append-system-prompt "Repo ini backend perbankan m-BCA (Go, chi, pgx, Redis). Tulis semua temuan dalam bahasa Indonesia. Prioritaskan berurutan: (1) jalur uang - setiap debet/kredit wajib cek kepemilikan lewat accounts.FindOwnedByID sebelum menyentuh saldo, saldo tersedia = balance - hold_amount bukan balance, baris limit yang hilang berarti NOL (tolak) bukan tak terbatas, tanggal WIB dihitung di aplikasi bukan CURRENT_DATE, transaksi uang pakai SERIALIZABLE + kunci rekening urut UUID + retry 40001; (2) auth - access token wajib divalidasi ke sesi bukan cuma tanda tangan, kode akses bukan PIN, operasi yang mengubah keamanan wajib lewat verification_token atau OTP asli dan mencabut sesi lain, setiap cek PIN wajib rate limit + lockout + nonce; (3) cache - cek kepemilikan dulu baru baca cache, invalidasi cache semua pihak terdampak bukan hanya pengirim; (4) lapisan - domain tidak boleh mengimpor repository atau handler, handler tidak boleh mengimpor repository, interface repository didefinisikan di domain; (5) skema - setiap kolom yang ditulis kode harus ada di migrations/ dan migrasi wajib berpasangan up/down; (6) environment - integrasi eksternal mock wajib digerbangi APP_ENV, otp_debug hanya saat APP_ENV=development; (7) kebocoran - jangan pernah log PIN, OTP, token, atau PII. Perubahan bentuk response tanpa memperbarui docs/01-API-SPECIFICATION.md dan docs/postman/ adalah temuan karena memecah build Android."
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Write"
+            --append-system-prompt "Repo ini backend perbankan m-BCA (Go, chi, pgx, Redis) yang melayani aplikasi Android. Baca dan ikuti skill .claude/skills/pr-review-backend/SKILL.md sebagai rulebook review — ia memuat urutan prioritas, apa yang dihitung sebagai temuan, dan kontrak verdict. Tulis semua temuan dalam bahasa Indonesia. Setelah selesai melaporkan temuan, tulis berkas review-verdict.txt di akar workspace berisi tepat satu kata sesuai §6 rulebook: BLOCK atau ALLOW. Berkas itu adalah gerbang auto-merge; kalau ragu, tulis BLOCK."
+
+      # Dibaca di luar action supaya hasilnya jadi output job yang bisa dipakai
+      # job lain. Berkasnya tidak ada = BLOCK, bukan ALLOW: review yang gagal di tengah
+      # tidak boleh terbaca sebagai review yang lolos.
+      - id: verdict
+        if: always()
+        run: |
+          if [ -f review-verdict.txt ]; then
+            value="$(tr -d '[:space:]' < review-verdict.txt | tr '[:lower:]' '[:upper:]')"
+          else
+            value="BLOCK"
+          fi
+          case "$value" in
+            ALLOW|BLOCK) ;;
+            *) value="BLOCK" ;;
+          esac
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+          echo "Verdict: $value"
+
+  # Auto-merge. Sengaja BUKAN jalan default — lihat daftar gerbangnya di bawah.
+  #
+  # Kenapa berjaga-jaga sebanyak ini: review AI bisa dibelokkan oleh PR yang mengubah
+  # rulebook atau workflow-nya sendiri, dan hasilnya adalah PR yang meluluskan dirinya
+  # lalu ter-merge ke main tanpa satu pun manusia membacanya. Di repo yang memegang uang
+  # nasabah, itu bukan risiko yang dibayar oleh kenyamanan.
+  auto-merge:
+    needs: [check, review]
+    if: |
+      github.event.pull_request.draft == false &&
+      needs.review.outputs.verdict == 'ALLOW' &&
+      contains(github.event.pull_request.labels.*.name, 'auto-merge')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Gerbang jalur sensitif. Berkas di daftar ini SELALU menuntut manusia, berapa pun
+      # bersihnya review-nya:
+      #
+      #   .github/**      PR yang bisa mengubah gerbangnya sendiri
+      #   skills/pr-review-backend/**  PR yang bisa mengubah aturan yang menilainya
+      #   migrations/**   ada yang harus dijalankan di database sebelum ini naik
+      #   domain/transaction, domain/account, pkg/crypto   jalur uang & kripto
+      #   domain/auth, middleware/auth.go, middleware/ratelimit.go   identitas & gerbang
+      #   go.mod / go.sum  dependency baru = permukaan serang baru
+      - id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          files="$(gh pr diff ${{ github.event.pull_request.number }} --name-only)"
+          echo "$files"
+          blocked="$(printf '%s\n' "$files" | grep -E \
+            -e '^\.github/' \
+            -e '^\.claude/skills/pr-review-backend/' \
+            -e '^migrations/' \
+            -e '^internal/domain/(transaction|account|auth)/' \
+            -e '^internal/middleware/(auth|ratelimit)\.go$' \
+            -e '^internal/pkg/crypto/' \
+            -e '^go\.(mod|sum)$' || true)"
+          if [ -n "$blocked" ]; then
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Auto-merge dilewati"
+              echo
+              echo "PR ini menyentuh jalur yang selalu menuntut pembaca manusia:"
+              echo
+              printf '%s\n' "$blocked" | sed 's/^/- `/; s/$/`/'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "blocked=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # `--auto` menyerahkan keputusan akhir ke branch protection: kalau ada required
+      # check yang belum hijau, GitHub menahan merge-nya sampai hijau, bukan memaksa.
+      # Squash supaya satu PR jadi satu commit di main.
+      - if: steps.guard.outputs.blocked == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --squash --auto --delete-branch
+          gh pr comment ${{ github.event.pull_request.number }} --body \
+            "Auto-merge diaktifkan: \`make check\` hijau dan review AI memberi verdict ALLOW. Merge-nya tetap menunggu required check branch protection."
