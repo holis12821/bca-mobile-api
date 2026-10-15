@@ -1,6 +1,6 @@
 ---
 name: git-branch-workflow
-description: Alur branch, commit, push, dan pull request wajib untuk bca-mobile-api — menentukan branch mana yang dibuat sebelum satu baris kode pun ditulis, dari mana ia bercabang, dan lewat mana ia sampai ke `main`. PR PERTAMA selalu ke `dev`, tidak pernah ke `main`: `main` hanya menerima PR dari `feature/` yang sudah lolos uji di `dev`, dan `dev` sendiri tidak pernah di-PR ke `main`. Gunakan SEBELUM mulai mengerjakan endpoint baru, migrasi, perbaikan bug, atau fase lanjutan dari pekerjaan besar, dan saat diminta commit, push, membuka PR, merge, atau menyiapkan rilis. Trigger juga pada "tambah endpoint", "kerjakan fitur", "fitur baru", "fix bug ini", "bikin branch", "branch apa", "commit ini", "push ya", "buka PR", "pull request", "merge ke main", "siap rilis", "mulai fase berikutnya", "pengerjaan panjang", "working branch", "feature branch", "branch dev", "branch development", "staging", "PR ke dev", "base dev", "kenapa tidak langsung ke main", "langsung di main saja", "hotfix", "urgent", "mendesak", "production bermasalah", "perbaiki yang sudah rilis", dan setiap permintaan yang akan menghasilkan commit. `main` tidak boleh disentuh langsung untuk alasan apa pun — termasuk perbaikan satu baris dan keadaan mendesak — jadi baca skill ini lebih dulu bahkan saat permintaannya terdengar sepele atau terburu-buru. Berlaku juga saat pengguna tidak menyebut git sama sekali — kalau hasil pekerjaannya berupa commit, alur ini yang menentukan tempatnya. JANGAN dipakai untuk memilih lapisan kode atau desain endpoint (itu `bca-mobile-backend` dan skill domain lainnya), isi pesan rilis ke nasabah, atau konfigurasi CI.
+description: Alur branch, commit, push, dan pull request wajib untuk bca-mobile-api — menentukan branch mana yang dibuat sebelum satu baris kode pun ditulis, dari mana ia bercabang, dan lewat mana ia sampai ke `main`. PR PERTAMA selalu ke `dev`, tidak pernah ke `main`: `main` hanya menerima PR dari `feature/` yang sudah lolos uji di `dev`, dan `dev` sendiri tidak pernah di-PR ke `main`. Gunakan SEBELUM mulai mengerjakan endpoint baru, migrasi, perbaikan bug, atau fase lanjutan dari pekerjaan besar, dan saat diminta commit, push, membuka PR, merge, atau menyiapkan rilis. Trigger juga pada "tambah endpoint", "kerjakan fitur", "fitur baru", "fix bug ini", "bikin branch", "branch apa", "commit ini", "push ya", "buka PR", "pull request", "merge ke main", "siap rilis", "mulai fase berikutnya", "pengerjaan panjang", "working branch", "feature branch", "branch dev", "branch development", "staging", "PR ke dev", "base dev", "kenapa tidak langsung ke main", "langsung di main saja", "hotfix", "urgent", "mendesak", "production bermasalah", "perbaiki yang sudah rilis", "merge conflict", "konflik merge", "resolve conflict", "branch resolve", "nomor migrasi bertabrakan", "konflik Postman", dan setiap permintaan yang akan menghasilkan commit. `main` tidak boleh disentuh langsung untuk alasan apa pun — termasuk perbaikan satu baris dan keadaan mendesak — jadi baca skill ini lebih dulu bahkan saat permintaannya terdengar sepele atau terburu-buru. Berlaku juga saat pengguna tidak menyebut git sama sekali — kalau hasil pekerjaannya berupa commit, alur ini yang menentukan tempatnya. JANGAN dipakai untuk memilih lapisan kode atau desain endpoint (itu `bca-mobile-backend` dan skill domain lainnya), isi pesan rilis ke nasabah, atau konfigurasi CI.
 ---
 
 # Alur Branch, Commit & PR — bca-mobile-api
@@ -346,3 +346,108 @@ di-commit yang bercampur, selamatkan dulu dengan `git stash` sebelum reset.
 pernah menawarkan `push --force` ke `main`: orang lain mungkin sudah menariknya, dan
 menulis ulang riwayat bersama merusak salinan mereka. Perbaikannya maju ke depan
 lewat `hotfix/`, bukan dengan menghapus jejak.
+
+## Menyelesaikan konflik merge
+
+Konflik muncul di dua tempat, karena satu pekerjaan ber-PR dua kali: saat
+`feature/` masuk `dev`, dan saat `feature/` yang sama masuk `main` berminggu-minggu
+kemudian. Yang kedua hampir selalu lebih besar — `main` sudah maju oleh rilis lain.
+
+**Jangan menyelesaikannya di branch target, dan jangan di branch pekerjaan.** Buat
+branch `resolve/` **dari target**, lalu merge branch pekerjaan ke dalamnya:
+
+```bash
+git fetch origin
+
+# 1. Branch resolve DIBUAT DARI TARGET, bukan dari branch pekerjaan.
+git switch -c resolve/kunci-meja-petugas-to-dev origin/dev
+
+# 2. Merge branch pekerjaan ke dalamnya — di sini konfliknya muncul.
+git merge origin/working/kunci-meja-petugas
+
+# 3. Selesaikan tiap berkas, lalu tandai satu per satu.
+git add <berkas>
+
+# 4. Commit resolusinya. JANGAN --no-edit kalau ada berkas dari daftar
+#    "konflik yang berbahaya" di bawah — tulis apa yang dipilih dan kenapa.
+git commit
+
+# 5. Push, lalu PR ke target yang sama dengan asal branch ini.
+git push -u origin resolve/kunci-meja-petugas-to-dev
+gh pr create --base dev --head resolve/kunci-meja-petugas-to-dev
+```
+
+Penamaannya `resolve/<nama-pekerjaan>-to-<target>`. Akhiran targetnya perlu karena
+pekerjaan yang sama akan butuh dua branch resolve berbeda: `-to-dev` lebih dulu, lalu
+`-to-main` saat rilis.
+
+Tiga alasan bentuk ini, dan ketiganya praktis:
+
+1. **Target tidak pernah tersentuh.** `dev` dan `main` tetap hanya menerima merge
+   lewat PR, sama seperti aturan di §Aturan yang tidak berubah.
+2. **Resolusinya bisa di-review.** Konflik yang diselesaikan salah adalah cara paling
+   sunyi menghilangkan kode orang lain — ia tidak muncul sebagai berkas yang berubah di
+   PR aslinya. Sebagai PR tersendiri, pilihannya terbaca.
+3. **Branch pekerjaannya tetap utuh.** PR aslinya masih bisa dibaca apa adanya, dan
+   komentar reviewer di sana tidak bergeser.
+
+Untuk konflik sepele — satu berkas, beberapa baris yang jelas keduanya ikut — merge
+target ke branch pekerjaan sendiri sudah cukup. Begitu yang konflik ada di daftar di
+bawah, pakai branch `resolve/`.
+
+### Konflik yang berbahaya di repo ini
+
+Untuk berkas-berkas ini, **jangan pernah** memilih satu sisi dengan
+`git checkout --ours/--theirs`. Memilih satu sisi berarti membuang pekerjaan sisi lain
+tanpa jejak, dan semua berkas di bawah adalah berkas yang **kedua sisi menambah
+sesuatu** ke dalamnya.
+
+| Berkas | Konfliknya | Cara benarnya |
+|---|---|---|
+| `migrations/0000NN_*.sql` | Dua branch mengambil nomor yang sama | **Nomor ulang yang lebih baru**, `.up.sql` dan `.down.sql` sekaligus. Lihat §Migrasi yang bertabrakan |
+| `docs/postman/*.json` | JSON raksasa, penanda konflik di tengah array | Gabungkan **entri**-nya, jangan sisinya. Pilih satu sisi = seluruh request fitur lain hilang dari koleksi |
+| `docs/01-API-SPECIFICATION.md` | Dua endpoint baru di bagian yang sama | Keduanya ikut, urut sesuai urutan route |
+| `internal/router/router.go` | Dua pendaftaran route di grup yang sama | Keduanya ikut — lalu **periksa urutannya**: pola statis (`/lock`) harus di atas `/{param}`, atau yang statis terbaca sebagai nilai parameter |
+| `internal/pkg/apperr/apperr.go` | Dua kode galat baru | Keduanya ikut, lalu cari string kode yang kembar — dua `Error` dengan `Code` sama akan membuat klien menangani yang salah |
+| `CLAUDE.md` (tabel skill) | Dua baris skill baru | Kedua baris ikut |
+| `*_test.go` (mock repository) | Dua method baru di interface yang sama | **Semua** method dari kedua sisi ikut, atau paket test-nya tidak bisa dikompilasi |
+| `go.sum` | Hash dependency | Jangan disunting tangan: `git checkout --theirs go.mod` lalu `go mod tidy` |
+
+### Migrasi yang bertabrakan
+
+Ini satu-satunya konflik yang tidak selesai di editor, karena akibatnya sudah ada di
+database orang.
+
+```bash
+ls migrations/ | tail -5          # nomor mana yang sudah terpakai di TARGET
+git mv migrations/000044_fitur_b.up.sql   migrations/000045_fitur_b.up.sql
+git mv migrations/000044_fitur_b.down.sql migrations/000045_fitur_b.down.sql
+grep -rn "000044" migrations/ docs/ .claude/   # rujukan yang ikut berubah
+```
+
+Yang di-nomor-ulang adalah yang **belum masuk target**. Yang sudah ada di `dev` atau
+`main` tidak boleh diganggu — orang lain sudah menjalankannya.
+
+Lalu, dan ini bagian yang sering terlupa: **database yang sudah menjalankan nomor
+lamanya tidak tahu ia berganti nama.** Di database dev sendiri, turunkan migrasi lama
+sebelum menukar namanya (`make migrate-down`), atau bereskan setelahnya dengan
+`migrate force <versi>` lalu `make migrate-up` dan periksa `make migrate-status`.
+Database tester yang sudah telanjur memakai nomor lama butuh pemberitahuan — sebut ini
+di PR resolve-nya.
+
+### Sebelum PR resolve dibuka
+
+Konflik yang "sudah tidak ada penanda `<<<<<<<`" bukan konflik yang selesai. Gerbang
+§Sebelum merge berlaku penuh di branch `resolve/`, dan dijalankan **di sana** — bukan
+hasil dari branch pekerjaan sebelum merge:
+
+```bash
+grep -rn "<<<<<<<\|>>>>>>>\|=======" --include="*.go" --include="*.sql" --include="*.md" . | grep -v "^./.git/"
+make check
+make migrate-status      # kalau ada migrasi yang di-nomor-ulang
+make ledger-check        # kalau yang konflik menyentuh jalur uang
+```
+
+Isi PR resolve menyebut **satu hal yang tidak ada di PR lain**: untuk tiap berkas dari
+daftar berbahaya, apa yang dipilih. "Konflik diselesaikan" bukan keterangan; "migrasi
+fitur B di-nomor-ulang 000044 → 000045, koleksi Postman digabung keduanya" adalah.
