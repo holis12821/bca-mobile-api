@@ -261,6 +261,11 @@ BLOCK
 **`ALLOW`** hanya kalau tidak ada satu pun di atas. Temuan ringan — angka ajaib,
 komentar yang kurang, penyederhanaan — tetap dilaporkan tapi **tidak** memblokir.
 
-Kalau Anda tidak yakin antara keduanya, tulis `BLOCK`. Gerbang ini memutuskan apakah
-kode masuk `main` tanpa dibaca manusia; ragu-ragu di sini harganya satu orang membaca
-PR, sementara salah di sisi `ALLOW` harganya uang nasabah.
+Kalau Anda tidak yakin antara keduanya, tulis `BLOCK`.
+
+Yang diputuskan gerbang ini hanyalah apakah PR boleh masuk **`dev`** tanpa dibaca
+manusia — PR rilis ke `main` tidak pernah di-auto-merge, berapa pun bersihnya verdict.
+Tapi itu bukan alasan bersikap longgar: apa pun yang masuk `dev` tanpa dibaca akan ikut
+terbawa ke PR rilis berikutnya, dan di titik itu orang yang memeriksanya sudah
+menganggapnya "sudah lewat review". Ragu-ragu di sini harganya satu orang membaca PR;
+salah di sisi `ALLOW` harganya uang nasabah.

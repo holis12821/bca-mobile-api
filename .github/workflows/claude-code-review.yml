@@ -95,16 +95,26 @@ jobs:
           echo "value=$value" >> "$GITHUB_OUTPUT"
           echo "Verdict: $value"
 
-  # Auto-merge. Sengaja BUKAN jalan default — lihat daftar gerbangnya di bawah.
+  # Auto-merge, dan HANYA ke dev. Sengaja bukan jalan default — lihat gerbangnya di
+  # bawah.
   #
-  # Kenapa berjaga-jaga sebanyak ini: review AI bisa dibelokkan oleh PR yang mengubah
-  # rulebook atau workflow-nya sendiri, dan hasilnya adalah PR yang meluluskan dirinya
-  # lalu ter-merge ke main tanpa satu pun manusia membacanya. Di repo yang memegang uang
-  # nasabah, itu bukan risiko yang dibayar oleh kenyamanan.
+  # Pembagiannya mengikuti alur repo ini (skill git-branch-workflow): satu pekerjaan
+  # ber-PR dua kali, ke dev lebih dulu untuk diuji, lalu ke main untuk rilis. Yang
+  # pantas diotomatiskan hanya yang pertama. Me-merge ke dev berarti "masukkan ini ke
+  # staging supaya diuji bersama yang lain" — kalau ternyata salah, yang rusak adalah
+  # tempat pengujian, dan itu memang gunanya. Me-merge ke main berarti "rilis ini ke
+  # nasabah", dan tidak ada verdict AI yang pantas memutuskan itu sendirian.
+  #
+  # Kenapa berjaga-jaga sebanyak ini meski targetnya cuma dev: review AI bisa
+  # dibelokkan oleh PR yang mengubah rulebook atau workflow-nya sendiri. PR seperti itu
+  # meluluskan dirinya, masuk dev tanpa dibaca, lalu ikut terbawa ke PR rilis
+  # berikutnya — dan di titik itu yang memeriksanya sudah menganggapnya "sudah lewat
+  # review".
   auto-merge:
     needs: [check, review]
     if: |
       github.event.pull_request.draft == false &&
+      github.event.pull_request.base.ref == 'dev' &&
       needs.review.outputs.verdict == 'ALLOW' &&
       contains(github.event.pull_request.labels.*.name, 'auto-merge')
     runs-on: ubuntu-latest
@@ -118,10 +128,12 @@ jobs:
           fetch-depth: 0
 
       # Gerbang jalur sensitif. Berkas di daftar ini SELALU menuntut manusia, berapa pun
-      # bersihnya review-nya:
+      # bersihnya review-nya — dan tetap begitu meski targetnya hanya dev, karena apa
+      # pun yang masuk dev ikut terbawa ke PR rilis berikutnya:
       #
       #   .github/**      PR yang bisa mengubah gerbangnya sendiri
-      #   skills/pr-review-backend/**  PR yang bisa mengubah aturan yang menilainya
+      #   skills/pr-review-backend/**    aturan yang MENILAI PR itu
+      #   skills/git-branch-workflow/**  aturan yang menentukan ke mana PR itu boleh pergi
       #   migrations/**   ada yang harus dijalankan di database sebelum ini naik
       #   domain/transaction, domain/account, pkg/crypto   jalur uang & kripto
       #   domain/auth, middleware/auth.go, middleware/ratelimit.go   identitas & gerbang
@@ -135,6 +147,7 @@ jobs:
           blocked="$(printf '%s\n' "$files" | grep -E \
             -e '^\.github/' \
             -e '^\.claude/skills/pr-review-backend/' \
+            -e '^\.claude/skills/git-branch-workflow/' \
             -e '^migrations/' \
             -e '^internal/domain/(transaction|account|auth)/' \
             -e '^internal/middleware/(auth|ratelimit)\.go$' \
@@ -155,12 +168,16 @@ jobs:
 
       # `--auto` menyerahkan keputusan akhir ke branch protection: kalau ada required
       # check yang belum hijau, GitHub menahan merge-nya sampai hijau, bukan memaksa.
-      # Squash supaya satu PR jadi satu commit di main.
+      # Squash supaya satu PR jadi satu commit di dev.
+      #
+      # TANPA --delete-branch, dan itu bukan kelalaian: PR rilis ke main dibuka dari
+      # branch yang SAMA dengan PR ke dev ini. Menghapusnya di sini membuang satu-satunya
+      # cara pekerjaan ini sampai ke main, dan orangnya harus membuat ulang branch-nya
+      # dari commit yang sudah ter-squash.
       - if: steps.guard.outputs.blocked == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr merge ${{ github.event.pull_request.number }} \
-            --squash --auto --delete-branch
+          gh pr merge ${{ github.event.pull_request.number }} --squash --auto
           gh pr comment ${{ github.event.pull_request.number }} --body \
-            "Auto-merge diaktifkan: \`make check\` hijau dan review AI memberi verdict ALLOW. Merge-nya tetap menunggu required check branch protection."
+            "Auto-merge ke \`dev\` diaktifkan: \`make check\` hijau dan review AI memberi verdict ALLOW. Merge-nya tetap menunggu required check branch protection. Branch ini **tidak** dihapus — PR rilis ke \`main\` dibuka dari branch yang sama setelah pengujian di \`dev\` lulus."
