@@ -1,6 +1,6 @@
 ---
 name: git-branch-workflow
-description: Alur branch, commit, push, dan pull request wajib untuk bca-mobile-api — menentukan branch mana yang dibuat sebelum satu baris kode pun ditulis, dari mana ia bercabang, dan lewat mana ia sampai ke `main`. Gunakan SEBELUM mulai mengerjakan endpoint baru, migrasi, perbaikan bug, atau fase lanjutan dari pekerjaan besar, dan saat diminta commit, push, membuka PR, merge, atau menyiapkan rilis. Trigger juga pada "tambah endpoint", "kerjakan fitur", "fitur baru", "fix bug ini", "bikin branch", "branch apa", "commit ini", "push ya", "buka PR", "pull request", "merge ke main", "siap rilis", "mulai fase berikutnya", "pengerjaan panjang", "working branch", "feature branch", "branch development", "staging", "langsung di main saja", "hotfix", "urgent", "mendesak", "production bermasalah", "perbaiki yang sudah rilis", dan setiap permintaan yang akan menghasilkan commit. `main` tidak boleh disentuh langsung untuk alasan apa pun — termasuk perbaikan satu baris dan keadaan mendesak — jadi baca skill ini lebih dulu bahkan saat permintaannya terdengar sepele atau terburu-buru. Berlaku juga saat pengguna tidak menyebut git sama sekali — kalau hasil pekerjaannya berupa commit, alur ini yang menentukan tempatnya. JANGAN dipakai untuk memilih lapisan kode atau desain endpoint (itu `bca-mobile-backend` dan skill domain lainnya), isi pesan rilis ke nasabah, atau konfigurasi CI.
+description: Alur branch, commit, push, dan pull request wajib untuk bca-mobile-api — menentukan branch mana yang dibuat sebelum satu baris kode pun ditulis, dari mana ia bercabang, dan lewat mana ia sampai ke `main`. PR PERTAMA selalu ke `dev`, tidak pernah ke `main`: `main` hanya menerima PR dari `feature/` yang sudah lolos uji di `dev`, dan `dev` sendiri tidak pernah di-PR ke `main`. Gunakan SEBELUM mulai mengerjakan endpoint baru, migrasi, perbaikan bug, atau fase lanjutan dari pekerjaan besar, dan saat diminta commit, push, membuka PR, merge, atau menyiapkan rilis. Trigger juga pada "tambah endpoint", "kerjakan fitur", "fitur baru", "fix bug ini", "bikin branch", "branch apa", "commit ini", "push ya", "buka PR", "pull request", "merge ke main", "siap rilis", "mulai fase berikutnya", "pengerjaan panjang", "working branch", "feature branch", "branch dev", "branch development", "staging", "PR ke dev", "base dev", "kenapa tidak langsung ke main", "langsung di main saja", "hotfix", "urgent", "mendesak", "production bermasalah", "perbaiki yang sudah rilis", dan setiap permintaan yang akan menghasilkan commit. `main` tidak boleh disentuh langsung untuk alasan apa pun — termasuk perbaikan satu baris dan keadaan mendesak — jadi baca skill ini lebih dulu bahkan saat permintaannya terdengar sepele atau terburu-buru. Berlaku juga saat pengguna tidak menyebut git sama sekali — kalau hasil pekerjaannya berupa commit, alur ini yang menentukan tempatnya. JANGAN dipakai untuk memilih lapisan kode atau desain endpoint (itu `bca-mobile-backend` dan skill domain lainnya), isi pesan rilis ke nasabah, atau konfigurasi CI.
 ---
 
 # Alur Branch, Commit & PR — bca-mobile-api
@@ -24,10 +24,17 @@ berlaku untuk **semua** berkas, bukan hanya kode: `CLAUDE.md`, isi `.claude/skil
 untuk dikecualikan, dan tidak ada keadaan yang cukup mendesak — yang mendesak dapat
 branch-nya sendiri, lihat §Hotfix.
 
+**Setiap pekerjaan dapat branch-nya sendiri, dibuat SEBELUM berkas pertama disentuh.**
+Bukan hanya kalau branch aktifnya `main`: pekerjaan baru yang tidak berhubungan dengan
+isi branch yang sedang aktif juga dapat branch sendiri. Dua pekerjaan yang tidak
+berhubungan di satu branch menghasilkan satu PR yang tidak bisa di-review sebagian dan
+tidak bisa dirilis sebagian — kalau salah satunya gagal uji, keduanya tertahan.
+
 Jadi sebelum mengedit berkas pertama, periksa:
 
 ```bash
-git branch --show-current      # kalau menjawab "main", berhenti dan buat branch
+git branch --show-current      # "main"? berhenti, buat branch.
+                               # branch lain berisi pekerjaan LAIN? berhenti juga.
 ```
 
 Satu-satunya hal yang boleh terjadi pada `main` adalah menerima merge dari
@@ -94,26 +101,51 @@ mengambil nomor sesudahnya.
 
 ## Jalan menuju main
 
-`development` adalah branch **berumur panjang** — staging tempat pengujian. Dibuat
-sekali dari `main`; kalau belum ada, buat dan katakan Anda membuatnya. Jangan
-membuat `development` baru per fitur.
+**`main` tidak pernah jadi tujuan PR yang pertama. Tidak pernah.** Setiap pekerjaan
+ber-PR ke `dev` lebih dulu dan diuji di sana; PR ke `main` baru boleh dibuka setelah
+pengujian di `dev` lulus. Aturan ini berlaku untuk perbaikan satu baris, perubahan
+dokumen, dan perubahan skill — bukan hanya untuk kode.
+
+`dev` adalah branch **berumur panjang** — staging tempat pengujian. Dibuat sekali dari
+`main`; kalau belum ada, katakan ke pengguna bahwa ia perlu dibuat dan tunggu
+persetujuan. Jangan membuat `dev` baru per fitur.
 
 ```text
-1. working/<fase>      --merge-->  feature/<nama>     (jalur panjang; jalur pendek lewati)
-2. feature/<nama>      --merge-->  development        ← diuji di sini
-3. feature/<nama>      --- PR --->  main              ← rilis, setelah pengujian lulus
+1. working/<fase>      --- PR --->  feature/<nama>   (jalur panjang; jalur pendek lewati)
+2. feature/<nama>      --- PR --->  dev              ← WAJIB, dan di sini diuji
+3. feature/<nama>      --- PR --->  main             ← rilis, HANYA setelah dev lulus
 ```
 
-Perhatikan langkah 3: yang masuk `main` adalah **`feature/`**, bukan `development`.
+Dua hal di urutan itu mudah tertukar, dan keduanya penting:
 
-Ini bagian yang paling sering salah, jadi alasannya perlu dipegang: `development`
-bercampur. Ia memuat beberapa pekerjaan sekaligus, termasuk yang pengujiannya gagal
-dan yang belum diputuskan ikut rilis. Me-merge `development` ke `main` berarti
-menyeret semuanya — termasuk yang belum siap. `feature/` memuat tepat satu pekerjaan
-yang batasnya jelas, jadi itulah yang pantas jadi isi rilis.
+**Langkah 2 tidak bisa dilewati.** Membuka PR ke `main` untuk pekerjaan yang belum
+pernah masuk `dev` berarti meminta orang merilis sesuatu yang belum pernah dijalankan
+bersama pekerjaan lain. Lolos `make check` di branch sendiri hanya membuktikan ia
+sehat **sendirian**; yang dibuktikan `dev` adalah ia sehat **bersama** yang lain —
+migrasi yang bertabrakan, dua perubahan response pada endpoint yang sama, dan key
+Redis yang dipakai dua fitur hanya terlihat di sana.
 
-`development` lulus uji membuktikan *pekerjaan itu* sehat bersama yang lain. Ia
-tidak membuat `development` jadi kandidat rilis.
+**Langkah 3 memakai `feature/`, bukan `dev`.** Sampai ke `main` yang di-PR adalah
+branch pekerjaannya sendiri. **`dev` tidak pernah di-PR ke `main`, dalam keadaan apa
+pun.**
+
+Alasannya, dan ini yang menentukan seluruh bentuk di atas: **`dev` pasti kotor, dan
+memang itu gunanya.** Ia tempat percobaan, perbaikan setengah jalan, revert, dan
+pekerjaan yang ternyata ditunda — seiring waktu isinya menumpuk dan tidak ada yang
+membersihkannya, karena membersihkannya bukan tujuannya. Me-merge `dev` ke `main`
+berarti memindahkan seluruh tumpukan itu ke branch yang dipakai rilis, dan sekali
+masuk ia tidak bisa dipisahkan lagi.
+
+`feature/` memuat tepat satu pekerjaan yang batasnya jelas. Itu sebabnya ia yang
+pantas jadi isi rilis, dan itu sebabnya `main` tetap bisa dibaca sebagai daftar
+pekerjaan yang benar-benar dirilis — bukan sebagai jejak semua yang pernah dicoba.
+
+Jadi `dev` lulus uji membuktikan *pekerjaan itu* sehat bersama yang lain. Ia tidak
+membuat `dev` sendiri jadi kandidat rilis.
+
+Satu akibat yang harus diterima: **PR ke `main` dibuka dari branch yang sama dengan
+PR ke `dev`**, jadi branch itu belum boleh dihapus setelah masuk `dev`. Jangan pakai
+`--delete-branch` pada merge ke `dev`.
 
 ## Penamaan
 
@@ -125,7 +157,7 @@ Prefix dengan garis miring, sisanya kebab-case, bahasa apa pun yang paling jelas
 | `working/` | Satu fase atau satu pekerjaan pendek | `working/fase-3-kunci-meja` |
 | `fix/` | Perbaikan bug yang tidak mendesak | `fix/cs-build-docs-tests` |
 | `hotfix/` | Perbaikan mendesak untuk yang sudah rilis | `hotfix/saldo-tersedia-abaikan-hold` |
-| `development` | Staging, tanpa akhiran | `development` |
+| `dev` | Staging tempat pengujian, tanpa akhiran | `dev` |
 
 Nama menyebut **apa yang dikerjakan**, bukan nomor tiket sendirian: `working/BCA-412`
 tidak memberi tahu siapa pun isinya saat daftar branch dibaca enam bulan kemudian.
@@ -139,28 +171,35 @@ pakai bentuk di atas.
 
 ## Hotfix
 
-Keadaan mendesak **bukan** izin menyentuh `main` langsung. Ia hanya memperpendek
-jalannya, dan jalannya tetap lewat branch.
+Keadaan mendesak **bukan** izin menyentuh `main` langsung, dan **bukan** izin
+melewati `dev`. Yang diperpendek oleh "mendesak" adalah **berapa lama ia menunggu di
+`dev`**, bukan jalannya.
 
 ```text
 main
- └── hotfix/<nama>   --- PR --->  main          (rilis perbaikan)
-                     --merge-->   development   (dan setiap feature/ yang masih hidup)
+ └── hotfix/<nama>   --- PR --->  dev    (diuji; boleh dipercepat, tidak boleh dilewati)
+                     --- PR --->  main   (rilis perbaikan, setelah dev hijau)
+                     --merge-->   setiap feature/ yang masih hidup
 ```
 
-Bercabang dari **`main`**, bukan dari `development` atau `feature/`: yang diperbaiki
-adalah keadaan yang sudah ada di tangan nasabah, dan itulah yang ada di `main`.
-Bercabang dari `development` akan menyeret pekerjaan yang belum dirilis ke dalam
-perbaikan mendesak — tepat yang paling tidak diinginkan saat sedang terdesak.
+Bercabang dari **`main`**, bukan dari `dev` atau `feature/`: yang diperbaiki adalah
+keadaan yang sudah ada di tangan nasabah, dan itulah yang ada di `main`. Bercabang
+dari `dev` akan menyeret pekerjaan yang belum dirilis ke dalam perbaikan mendesak —
+tepat yang paling tidak diinginkan saat sedang terdesak.
 
-Boleh melewati singgah di `development` sebelum masuk `main`; itu makna "mendesak" di
-sini. Tapi **gerbang di bawah tidak boleh dilewati** — justru saat terdesak,
-perbaikan yang merusak hal lain paling mahal harganya.
+Kenapa `dev` tetap wajib justru saat terdesak: perbaikan tergesa adalah perbaikan yang
+paling sering merusak hal lain, dan satu putaran `dev` adalah satu-satunya tempat
+kerusakan itu terlihat sebelum nasabah yang menemukannya. Yang boleh dipercepat adalah
+antre-nya — hotfix lewat lebih dulu dari pekerjaan lain di `dev`, dan pengujiannya
+boleh dibatasi pada jalur yang terdampak alih-alih seluruh regresi. Yang tidak boleh
+adalah PR ke `main` tanpa `dev` pernah melihatnya.
 
-Setelah masuk `main`, **merge balik** `hotfix/` ke `development` dan ke setiap
-`feature/` yang masih berjalan. Tanpa ini perbaikannya hilang dari pekerjaan yang
-sedang jalan, lalu kambuh begitu pekerjaan berikutnya dirilis — dan kambuhnya sulit
-dipercaya, karena semua orang ingat bug itu sudah pernah ditutup.
+**Gerbang di §Sebelum merge tidak boleh dilewati** dalam keadaan apa pun.
+
+Setelah masuk `main`, **merge balik** `hotfix/` ke setiap `feature/` yang masih
+berjalan (`dev` sudah memuatnya dari langkah pertama). Tanpa ini perbaikannya hilang
+dari pekerjaan yang sedang jalan, lalu kambuh begitu pekerjaan berikutnya dirilis —
+dan kambuhnya sulit dipercaya, karena semua orang ingat bug itu sudah pernah ditutup.
 
 ## Sebelum merge atau membuka PR ke mana pun
 
@@ -234,12 +273,28 @@ Ini jebakan terbesar repo ini, dan `CLAUDE.md` §Dokumen mengikatnya:
 ## Pull request
 
 PR adalah satu-satunya jalan masuk ke `main` (riwayat repo ini sudah memakainya:
-`Merge pull request #1`). Yang di-push lebih dulu, PR-nya menyusul:
+`Merge pull request #1`). Yang di-push lebih dulu, PR-nya menyusul.
+
+**`--base` yang pertama selalu `dev`.** Satu pekerjaan menghasilkan **dua** PR, dan
+urutannya tidak bisa dibalik:
 
 ```bash
 git push -u origin working/<nama>
-gh pr create --base main --title "<satu kalimat>" --body "<isi>"
+
+# PR 1 — wajib, dan ini yang dibuka lebih dulu.
+gh pr create --base dev  --title "<satu kalimat>" --body "<isi>"
+
+# PR 2 — rilis. HANYA setelah PR 1 masuk dan pengujian di dev lulus.
+gh pr create --base main --title "<satu kalimat>" --body "<isi + hasil uji di dev>"
 ```
+
+`gh pr create` tanpa `--base` memakai branch default repo, yang di sini `main` — jadi
+**selalu tulis `--base` secara eksplisit.** Lupa menulisnya adalah cara paling mudah
+membuka PR ke `main` tanpa sengaja, tepat yang dilarang §Jalan menuju main.
+
+Kalau Anda sudah membuka PR ke `main` sebelum `dev`, jangan ditutup dan dibuka ulang —
+komentar yang sudah ada akan hilang. Ubah basisnya:
+`gh pr edit <nomor> --base dev`.
 
 Isi PR menjawab tiga hal, dan tidak lebih: **apa yang berubah bagi pemanggil API**,
 **kenapa**, dan **apa yang sudah dijalankan untuk membuktikannya** — sebutkan
